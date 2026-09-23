@@ -132,7 +132,7 @@
 
 ### 2.11 控制机 `CFG_*` → 容器运行时变量映射（`deploy.sh` 渲染 `.env`）
 
-控制机 `/root/.env.papafeiji` 使用 `CFG_*` 命名；部署时由 `deploy.sh` 映射为容器运行时变量。同名直传项不列。
+控制机 `/root/DeployOps/env/.env.papafeiji` 使用 `CFG_*` 命名；部署时由 `deploy.sh` 映射为容器运行时变量。同名直传项不列。
 
 | 控制机变量 | 容器运行时变量 | 备注 |
 |------------|----------------|------|
@@ -175,7 +175,7 @@
 
 ## 5. 备份与恢复
 
-- 部署前：`deploy.sh` 每次部署前对生产库做 `pg_dump -Fc`，保存到控制机 `/root/papafeiji-db-backups/`（按 mtime 保留 7 天；postgres 未运行时跳过备份继续部署；备份产出 `pg_restore -l` 校验失败则中止部署）。
+- 部署前：`deploy.sh` 每次部署前对生产库做 `pg_dump -Fc`，保存到控制机 `/root/DeployOps/papafeiji-db-backups/`（按 mtime 保留 7 天；postgres 未运行时跳过备份继续部署；备份产出 `pg_restore -l` 校验失败则中止部署）。
 - 连续备份：`backup` 容器每 6 小时 `pg_dump` + `uploads` 打包到部署目录 `backups/`，保留最近 7 份。
 - schema 级恢复：`scripts/restore-backup.sh <备份文件> --yes`（支持 `.dump` / `.sql.gz` / `.sql`；恢复前自动安全备份并停启应用容器）。恢复失败时保留 restore-safety 备份并**保持 app/sse 停止**，需人工介入排查。
 - 迁移回滚（部署失败自动）：`_rollback_and_exit` 先回滚迁移到部署前版本（`migrate goto <prev>`；部署前无迁移则逐条 `migrate down 1`。注意该迁移在 postgres 容器内对 `/tmp/migrations` 执行，与常规迁移路径不同），再恢复 `.env`/nginx/override/migrations/compose 的 `.prev` 快照并重建旧容器，脚本以非零码退出（不重试健康检查，异常容器由 watchdog 兜底）。仅保当次部署；更早版本需 `git checkout <旧 commit>` 重新部署。

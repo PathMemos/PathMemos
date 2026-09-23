@@ -12,7 +12,7 @@ set -euo pipefail
 #
 # 在部署目录（含 docker compose 与 postgres 容器）所在机器执行：
 #   - 生产服务器：/opt/papafeiji/backups/pre-squash-*.sql.gz（deploy.sh 自动生成）
-#   - 控制机本地：/root/papafeiji-db-backups/*.dump（deploy.sh 每次部署前自动备份）
+#   - 控制机本地：/root/DeployOps/papafeiji-db-backups/*.dump（deploy.sh 每次部署前自动备份）
 #
 # 安全措施：恢复前自动再做一次安全备份；默认需要 --yes 确认。
 

@@ -32,7 +32,7 @@
 ### 3.1 执行顺序（骨架）
 
 1. 本地：环境变量校验（含可选代码 lint 检查，`--skip-checks` 跳过）。
-2. 迁移前全库 `pg_dump` 备份（远端容器执行、拉回控制机 `/root/papafeiji-db-backups/`）。
+2. 迁移前全库 `pg_dump` 备份（远端容器执行、拉回控制机 `/root/DeployOps/papafeiji-db-backups/`）。
 3. 代码同步到远端（`rsync` 源码，`scp` 生成物）。
 4. 快照远端将被覆盖的 `.env/nginx.conf/docker-compose.*/migrations`（供回滚）。
 5. 远端：数据层（postgres/redis）未就绪时先启动（仅首次部署）。
@@ -58,11 +58,11 @@
 | `backup` | 仅 `DB_PASSWORD` | 备份任务连库 |
 | `nginx` / `redis` | 无（redis 仅自身密码） | 不持有可伪造 token 的密钥 |
 
-硬约束：`.env` 权限 600；密钥只存控制机 `/root/.env.papafeiji`（不入仓库）；部署输出不回显口令；`WORKER_SECRET` 为 SaaS 必填（空则启动校验失败），open 模式必须留空。
+硬约束：`.env` 权限 600；密钥只存控制机 `/root/DeployOps/env/.env.papafeiji`（不入仓库）；部署输出不回显口令；`WORKER_SECRET` 为 SaaS 必填（空则启动校验失败），open 模式必须留空。
 
 ### 3.4 备份与恢复
 
-- 备份：每次部署迁移前 `pg_dump -Fc` 到控制机 `/root/papafeiji-db-backups/`；部署机保留 `.prev` 快照。
+- 备份：每次部署迁移前 `pg_dump -Fc` 到控制机 `/root/DeployOps/papafeiji-db-backups/`；部署机保留 `.prev` 快照。
 - 连续备份：SaaS 生成 compose 内含 `backup` 容器（postgres:15-alpine），每 6 小时 `pg_dump` + uploads 打包到部署目录 `./backups`，默认保留 7 份（`BACKUP_KEEP` 可调）。
 - 恢复：统一走 `scripts/restore-backup.sh`（支持 .dump/.sql.gz/.sql，恢复前自动安全备份并停启应用容器，需 `--yes`）。
 - 迁移回滚仅限当次部署失败窗口：`_rollback_and_exit` 自动 `migrate goto <prev>`（部署前无迁移则逐条 down）；历史版本回退需 `git checkout <旧 commit>` 重新部署。数据级回滚统一走 `restore-backup.sh` + 部署前备份（04 §8.6、DEPLOYMENT §5）。
