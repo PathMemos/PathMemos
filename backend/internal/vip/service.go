@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"time"
 
@@ -39,8 +40,22 @@ type InfoProvider interface {
 
 var _ InfoProvider = (*Service)(nil)
 
+// IssueTrialVIPWithTx 注册事务内发放 trial。同一微信主体注销重注册时，openid 墓碑
+// （user_vip_claims 部分唯一索引，R-21）使 UpsertVIPClaim rowsAffected==0；此处静默
+// 跳过发放而不回滚注册（R-26）——否则注销用户将永久无法重新注册。
+// /vip/new-user 端点的 409 语义由 ClaimTrialVIP→ActivateVIPWithTx 独立承载，不受影响。
 func (s *Service) IssueTrialVIPWithTx(ctx context.Context, userID string, q *sqlc.Queries) error {
-	return s.ActivateVIPWithTx(ctx, userID, trialVIPID, q)
+	err := s.ActivateVIPWithTx(ctx, userID, trialVIPID, q)
+	if trialGrantSkipped(err) {
+		slog.InfoContext(ctx, "trial already claimed (openid tombstone), skip grant on registration", "user_id", userID)
+		return nil
+	}
+	return err
+}
+
+// trialGrantSkipped 报告注册路径的墓碑冲突是否应按「跳过发放」容忍。
+func trialGrantSkipped(err error) bool {
+	return errors.Is(err, ErrTrialVIPAlreadyClaimed)
 }
 
 func (s *Service) ClaimTrialVIP(ctx context.Context, userID string) error {
@@ -67,11 +82,31 @@ func (s *Service) ClaimFreeVIP(ctx context.Context, userID, vipID string) error 
 }
 
 func (s *Service) HasVIPClaim(ctx context.Context, userID, vipID string) (bool, error) {
+	return s.hasVIPClaimWithQ(ctx, s.pool.Queries(), userID, vipID)
+}
+
+func (s *Service) hasVIPClaimWithQ(ctx context.Context, q *sqlc.Queries, userID, vipID string) (bool, error) {
 	if userID == "" {
 		return false, fmt.Errorf("empty user id")
 	}
-	exists, err := s.pool.Queries().HasVIPClaim(ctx, sqlc.HasVIPClaimParams{
-		UserID: userID,
+	// R-21：优先按微信主体（openid）判重——注销重注册得到新 user_id 后仍能识别已领取；
+	// openid 缺失（异常数据）时回退 user_id 维度。
+	claimant, err := q.GetUserByID(ctx, userID)
+	if err != nil {
+		return false, fmt.Errorf("get claimant user: %w", err)
+	}
+	if claimant.OpenID != "" {
+		exists, err := q.HasVIPClaimByOpenID(ctx, sqlc.HasVIPClaimByOpenIDParams{
+			OpenID: pgtype.Text{String: claimant.OpenID, Valid: true},
+			VipID:  vipID,
+		})
+		if err != nil {
+			return false, err
+		}
+		return exists, nil
+	}
+	exists, err := q.HasVIPClaim(ctx, sqlc.HasVIPClaimParams{
+		UserID: pgtype.Text{String: userID, Valid: userID != ""},
 		VipID:  vipID,
 	})
 	if err != nil {
@@ -175,14 +210,25 @@ func (s *Service) activateVIPWithTx(ctx context.Context, userID string, vipRecor
 
 	now := timeutil.NowShanghai()
 
+	// R-21：冗余记录发放主体 openid——注销后领取墓碑行（user_id 置 NULL）仍凭 open_id 防重。
+	claimant, err := q.GetUserByID(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("get claimant user: %w", err)
+	}
+	openID := pgtype.Text{}
+	if claimant.OpenID != "" {
+		openID = pgtype.Text{String: claimant.OpenID, Valid: true}
+	}
+
 	claimID, err := util.NewUUID()
 	if err != nil {
 		return fmt.Errorf("generate vip claim id: %w", err)
 	}
 	rowsAffected, err := q.UpsertVIPClaim(ctx, sqlc.UpsertVIPClaimParams{
 		ID:     claimID,
-		UserID: userID,
+		UserID: pgtype.Text{String: userID, Valid: userID != ""},
 		VipID:  vipRecord.ID,
+		OpenID: openID,
 	})
 	if err != nil {
 		return fmt.Errorf("upsert vip claim: %w", err)

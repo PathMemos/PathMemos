@@ -578,9 +578,15 @@ func (s *Service) leaveToPersonalTx(ctx context.Context, q *sqlc.Queries, user s
 		}
 	}
 
+	// B-1：无个人家庭（open 模式默认用户/异常数据）时 current_family_id 置 NULL——
+	// 空串 Valid=true 会命中 families 外键返回 500（与下方 dissolveFamilyTx 的 NULL 写法一致）。
+	currentFamilyID := pgtype.Text{}
+	if user.PersonalFamilyID.Valid && user.PersonalFamilyID.String != "" {
+		currentFamilyID = pgtype.Text{String: user.PersonalFamilyID.String, Valid: true}
+	}
 	if err := q.UpdateUserCurrentFamily(ctx, sqlc.UpdateUserCurrentFamilyParams{
 		ID:              user.ID,
-		CurrentFamilyID: pgtype.Text{String: util.ToString(user.PersonalFamilyID), Valid: true},
+		CurrentFamilyID: currentFamilyID,
 	}); err != nil {
 		return fmt.Errorf("update current family: %w", err)
 	}

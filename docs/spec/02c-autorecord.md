@@ -25,12 +25,14 @@
 | D1 | 采集在前端、聚合在服务端：前端只识别「驻留点」（连续静止 ≥10 分钟且质心 300m 内），后端按 300m/30 分钟再聚类，聚类结果为直接成文单位 | 降低上报量和后端计算量；前端可省电 | 无 |
 | D2 | 逆地理编码按「用户 + 自然日」配额 200 次，Redis Lua 原子计数 | 防单个用户耗尽腾讯地图 key 影响全站交互接口 | 无 |
 | D3 | 常用地址命中时跳过逆地理编码；未命中才调用腾讯 API | 省配额与延迟；地图不可用时常用地址仍能成文 | 无 |
-| D4 | 同点去重只与「当天最后一条自动记录」比较（landmark 或 detail_address 任一相同即视为重复） | 简单、无需全量扫描；容忍漏去重 | 无 |
+| D4 | 同点去重与「当天全部自动条目的地址并集集合」比较（`autoAddressSet` 把每条自动条目的 address 与 detail_address 非空值并入同一集合；候选 landmark 或 detail_address 命中集合任一成员即视为重复——landmark 可命中历史条目的 detail_address，反之亦然；`ListAutoEntryAddressesByDate` 一次取集合，成文后并入内存集合） | 旧「只比最后一条」无法识别同日折返旧地点（家→公司→家）导致重复成文；并集成员判断实现最简（一个 set） | 无 |
 | D5 | 后台处理任务与用户级锁相互独立：后台 `lock:background:auto_record` 与用户级 `lock:auto_record:{userID}` 均为 PostgreSQL advisory lock（ADR-0005，无 TTL/续期） | 防多实例重复处理；连接断开自动释放，任务自身幂等 | 无 |
-| D6 | 逆地理失败保留轨迹点，不立即删除；由 7 天清理窗口统一回收 | 容忍暂时性上游故障，避免数据永久丢失 | 无 |
+| D6 | 逆地理失败保留轨迹点，不立即删除；达到 `maxGeocodeAttempts`(10) 后进入终态（`geocode_attempts >= 10`，SQL 排除），由 7 天清理窗口统一回收 | 容忍暂时性上游故障，避免数据永久丢失；同时防止脏轨迹每轮空转 | 无 |
 | D7 | 配额校验与轨迹处理均 fail-closed（Redis 不可用 = 拒绝/跳过） | 保核心库稳定，宁可漏记不耗尽外部配额 | 无 |
-| D8 | 自动记录为「尽力而为」：定位采集、聚类、逆地理编码、后台成文、推送、封面刷新、缓存失效等任一环节失败均只记日志、不阻塞重试，且**不得影响手动日记与其他核心业务**（后台任务失败同样如此） | 符合 AGENTS.md「简单优先、容忍小概率异常」 | 无 |
+| D8 | 自动记录为「尽力而为」：定位采集、逆地理编码、推送、封面刷新、缓存失效等环节失败只记日志；**成文事务失败不删轨迹**（轨迹保留，下轮自然重试，数据不丢）；轮次存在用户级失败时输出告警关键字 `alert=auto_record_failed`（alert-watch 捕获）。全部失败**不得影响手动日记与其他核心业务** | 符合 AGENTS.md「简单优先、容忍小概率异常」；数据路径靠轨迹保留兜底重试，可见性靠告警 | 无 |
 | D9 | 轨迹上报幂等以 DB 自然键 `(user_id, recorded_at, lat, lon)` 唯一索引 + `ON CONFLICT DO NOTHING` 实现；前端 `batchSeq` 仅入日志用于观测 | 幂等由 DB 唯一索引保证；重试整批重传不产生重复轨迹点 | 无 |
+| D10 | 候选用户按 `user_id` keyset 公平轮转（游标 Redis `job:cursor:auto_record`） | 防止用户数扩展后低频用户饥饿；游标丢失仅从头重扫，不影响正确性（I2） | 无 |
+| D11 | 逆地理达到 `maxGeocodeAttempts` 的轨迹为终态：候选 EXISTS 与逐用户查询均排除，跨过上限时记一次 `geocode_discarded` | 终态不再参与聚类与告警，仍保留至 7 天清理，不物理删除 | 无 |
 
 ## 3. 核心流程（用户故事 + 时序）
 
@@ -41,7 +43,7 @@
 - AC：
   1. 满足 `getVipInfo().isVip > 0` 后，前端依次执行 `PUT /auto-record/config {enabled:true}` → `wx.startLocationUpdateBackground` + `wx.onLocationChange`，全部成功后本地 storage 置 on（`frontend/miniapp/miniprogram/utils/autoRecord.ts`）。
   2. 后端在 `enabled=true` 时**严格校验 VIP**（`expire_time > 上海当前时间`，**无宽限期**），非 VIP 返回 HTTP 403、`code=4030`、`biz_code=NOT_VIP`。
-  3. 关闭时先上报积压驻留点再 `PUT /auto-record/config {enabled:false}`（顺序不可颠倒）。
+  3. 关闭时先上报积压驻留点再 `PUT /auto-record/config {enabled:false}`（顺序不可颠倒）；上报失败（含非 VIP 403 `NOT_VIP`）**不阻断关闭**，最后一批轨迹放弃（`closeAutoRecord` 吞上报错误后仍关后端开关，前后端状态保持一致）。
   4. 开启流程整体 30 秒超时；超时后查询后端真实 `enabled`，若后端已开启则保留本地开启并立即尝试恢复监听。
 
 ### AR-2 轨迹采集（前端，`autoRecord.ts`）
@@ -62,7 +64,7 @@
   3. 上报成功而清空 storage 失败时，用 `_reportedLeadingCount` 记录已上报前缀，后续只清空不重报。
   4. 后端一次最多 50 点（`maxBatchPoints`），body 最多 64 KiB（超限 413 `code=4130`），非 VIP 返回 403 `code=4030` + `biz_code=NOT_VIP`。
   5. 每点 `lat` / `lon` / `recordedAt`（RFC3339）必填；经纬度越界返回 400；缺字段返回 400。
-  6. 入库 `auto_record_trajectories`，每点一次 `unnest` 批量插入，`geocode_attempts=0`，`ON CONFLICT DO NOTHING`（唯一索引 `uq_auto_record_trajectories_point`，迁移 000005）；每次上传都 best-effort 刷新 `users.last_active_at`。
+  6. 入库 `auto_record_trajectories`，每次上传请求执行一条 `INSERT ... SELECT unnest(...)` 批量语句（`InsertTrajectories`，整批一次入库而非每点一条），`geocode_attempts=0`，`ON CONFLICT DO NOTHING`（唯一索引 `uq_auto_record_trajectories_point`，迁移 000005）；每次上传都 best-effort 刷新 `users.last_active_at`。
   7. 前端 `batchSeq` 被解析并随上传日志记录（`batch_seq`），仅用于观测；幂等不依赖它。
 
 ### AR-4 驻留点聚类（`autorecord/service.go mergeStayPoints`）
@@ -74,7 +76,7 @@
   4. 坐标 NaN 的点收入 invalid 集合被删除。
   5. 无任何 cluster 时删除本轮全部轨迹点。
   6. cluster 的 `record_date` 取代表时间（成员中最大 `recorded_at`）的上海日期，跨午夜时归入次日。
-  7. 候选用户由 `ListPendingAutoRecordUsers` 按轨迹数降序取前 100（`maxPendingPerUser`）。
+  7. 候选用户由 `ListAutoRecordCandidates` 按 `user_id ASC` keyset 游标取前 100（`maxPendingPerUser`）；游标存 Redis `job:cursor:auto_record`；**仅当本轮候选取满 100（满批）时**才统计候选总数，>1000 记 `auto_record_backlog_warn`；候选仅含 VIP 未过期用户（`JOIN user_vips` 且 `expire_time > now()`），VIP 过期用户的存量轨迹不再进入聚类成文（保留至 7 天清理）。
 
 ### AR-5 逆地理编码与地址生成
 - 故事：把 cluster 坐标翻译为地址。
@@ -82,8 +84,8 @@
   1. 先在该用户常用地址中按 300m 匹配；命中则 `landmark = 常用地址名`，**跳过**腾讯 API。
   2. 未命中则检查日配额；配额耗尽（或 Redis 不可用）跳过该 cluster，**不累加** `geocode_attempts`，轨迹保留。
   3. `location.Client.Reverse`：多 key 原子轮询，每次请求前全局限速 `WaitGeoCoder`（10 RPS token bucket），单次超时 3s，失败重试 1 次（切换 key、等待 100ms）。
-  4. 地址取值：`address = result.address`；`detailAddress` 优先 `formatted_addresses.recommend` → `rough` → `title`；`landmark` 优先 `title` → 第一个 POI 标题 → `detail`。
-  5. 上游返回 error 时跳过该 cluster；若该 cluster 任一点 `geocode_attempts >= 10` 则不再累加（保留待清理），否则对 cluster 内所有点 `geocode_attempts + 1`；**两种分支都不删除轨迹**。
+  4. 地址取值：`address = result.address`；`detailAddress` 优先 `formatted_addresses.recommend` → `rough` → `title`；`landmark` 优先 `title` → 第一个 POI 标题 → `detail`；autorecord 层再兜底：`landmark` 仍为空时回退 `address`。
+  5. 上游返回 error 时跳过该 cluster，对 cluster 内所有点统一 `geocode_attempts + 1`（`handleGeocodeRetry` 不做上限判断；终态由查询层 `geocode_attempts < maxGeocodeAttempts` 排除，跨过上限那一次记 `geocode_discarded`）；**不删除轨迹**。
   6. 空地址且空 landmark 时走与 5 相同的重试逻辑，仍保留轨迹。
 
 ### AR-6 常用地址替换
@@ -96,10 +98,10 @@
 ### AR-7 同点去重
 - 故事：同一地点一天内只生成一条自动记录。
 - AC：
-  1. 按 cluster 日（`recorded_at` 的上海时区日期，格式 `2006-01-02`）查询该用户当天最后一条 `text='（自动记录）'` 的 `diary_entries`（`record_time DESC NULLS LAST LIMIT 1`）。
-  2. 当前 `landmark` 与该条 `address` 相同，或当前 `address` 与该条 `detail_address` 相同 → 判重，删除本 cluster 全部轨迹，不成文。
+  1. 按 cluster 日（`recorded_at` 的上海时区日期，格式 `2006-01-02`）查询该用户当天全部 `text='（自动记录）'` 条目的地址集合（`ListAutoEntryAddressesByDate`，每日期缓存一次；landmark/detail_address 非空值并入集合）。
+  2. 候选的 `landmark` 与 `address` 分别对「当天全部自动条目的 address + detail_address 非空值」集合判重（`isDuplicateAutoAddress`：命中集合任一成员即重复，landmark 可命中历史条目的 detail_address，反之亦然）→ 判重，删除本 cluster 全部轨迹，不成文。
   3. 当天无自动记录时用零值哨兵缓存，不重复查库；成文成功后把新条目写回当天缓存，供后续 cluster 比较。
-  4. `POST /diary/details/auto`（手动首次成文）同样调用该去重；判重时直接返回已存在条目 id。
+  4. `POST /diary/details/auto`（手动首次成文）与后台共用同一集合判重（`ListAutoEntryAddressesByDate` + `FindDuplicateAutoEntry`，评审定稿统一）；判重时直接返回已存在条目 id（响应契约不变，ORDER BY record_time DESC 保证返回最新同址条目）。
 
 ### AR-8 自动成文（后台）
 - 故事：cluster 生成一条自动日记条目。
@@ -143,7 +145,7 @@
 - AC：
   1. 每天 03:00（上海）执行一次，`maxDuration=30m`。
   2. 只处理「昨日 00:00–24:00（上海）`diary_entries.updated_at` 有变动」的用户，keyset 游标分批 1000，固定 5 worker。
-  3. 单用户先过 `NeedsCommonAddressRefresh` 门控（日记最大 `updated_at` > 常用地址最大 `updated_at`，或常用地址为空而日记非空）；不需刷新直接跳过。
+  3. 单用户先过 `NeedsCommonAddressRefresh` 门控（日记最大 `updated_at` > 常用地址最大 `updated_at`，或常用地址非空而日记为空）；不需刷新直接跳过。
   4. 取该用户 `address` 非空的 top10（`COUNT(*) DESC, MAX(created_at) DESC`），批量取每个地址的最新坐标；无坐标的脏地址跳过。
   5. 同一事务内先 `DELETE` 旧记录再批量 `INSERT`；top 为空只删不插。
 
@@ -193,7 +195,7 @@
 | `GET /location/reverse` 上游失败 | 500 | 5001 | — | `location/handler.go` |
 | `POST /diary/details/auto` 非 VIP | 403 | 4030 | NOT_VIP | `diary/handler.go` |
 | `POST /diary/details/auto` 配额超限 | 429 | 4290 | RATE_LIMITED | `diary/handler.go` |
-| `POST /diary/details/auto` 自动记录用户锁被后台占用 | 429 | 4290 | OPERATION_IN_PROGRESS | `diary/handler.go`（409 → 429，与 family/diary 封面统一） |
+| `POST /diary/details/auto` 自动记录用户锁被后台占用 | 429 | 4290 | OPERATION_IN_PROGRESS | `diary/handler.go` |
 
 ## 6. 关键实现约束
 
@@ -218,7 +220,7 @@
 | `commonAddressSummaryWorkers` / `BatchSize` | 5 / 1000 | 同上 |
 | 轨迹清理窗口 | `created_at < now() - interval '7 days'` | `auto_record.sql` |
 
-> VIP 判定一律严格（`expire_time > now()`），`vipGraceDays` 宽限期常量已删除（D4）；分布式锁为 PG advisory lock，无 TTL/续期常量（ADR-0005）。
+> VIP 判定一律严格（`expire_time > now()`），无宽限期常量；分布式锁为 PG advisory lock，无 TTL/续期常量（ADR-0005）。
 
 ### 6.2 锁与幂等
 
@@ -241,7 +243,7 @@
 | Redis 缓存失效（`ai:family_summary`） | 仅 warn 日志，不影响成文 |
 | 推送（新地点 / 异常告警） | 仅记日志，不回滚已写数据/已占位告警 |
 
-### 6.4 环境变量（`backend/internal/config/config.go`）
+### 6.4 环境变量（`backend/internal/config/config.go`、`backend/internal/redis/redis.go`）
 
 | 变量 | 必填 | 默认 | 说明 |
 |------|------|------|------|
@@ -258,7 +260,7 @@
 ## 7. 前端接入
 
 - 文件：`frontend/miniapp/miniprogram/utils/autoRecord.ts`（采集/上报/恢复状态机）、`pages/index/index.ts`（开关入口）、`app.ts`（启动与前后台钩子）、`utils/concurrency.ts`（通用并发工具）。
-- `pages/index/index.ts`：`toggleAutoRecord()` 是唯一手动开关入口；非 VIP 弹窗引导到 VIP 页；开启成功后置 `showSubscribePrompt=true` 引导订阅；`_changing` 防重复触发，且不在 `onHide` 复位。
+- `pages/index/index.ts`：`toggleAutoRecord()` 是 index 页唯一手动开关入口（详情/编辑内另有 `components/AutoBtn/AutoBtn.ts` 的 `change`）；非 VIP 弹窗引导到 VIP 页；开启成功后置 `showSubscribePrompt=true` 引导订阅；`_changing` 防重复触发，且不在 `onHide` 复位。
 - `app.ts`：`onLaunch` 读 `STORAGE_KEY_ENABLED` 初始化 `globalData.openAutoRecorded`；登录失败也调用 `tryRestoreAutoRecord`；`onShow` 有 30 秒恢复冷却（仅成功才计时）；`onHide` 触发一次 flush+report。
 - 本地 storage key：`papafeiji:autoRecordEnabled`（开关）、`papafeiji:autoRecordStayPoints`（驻留点队列）。
 - 客户端审计日志：上报前后 `opsLog('auto_upload')` / `opsLogFail('auto_upload_fail')`；首次成文 `auto_entry_ok` / `auto_entry_fail`（写入 `client_ops_logs`，见 migration 000004）。
@@ -284,7 +286,7 @@
 | 恢复重试退避 | 60s→5min；看门狗 60s |
 | 开启超时 | 30s |
 
-- `utils/concurrency.ts` 的 `runWithConcurrency` 当前**仅被 `utils/http.ts`（图片上传并发 3）使用**，自动记录未使用它（`autoRecord.ts` 用单飞 Promise 串行）。如需在 spec 中引用，请按此事实描述。
+- `utils/concurrency.ts` 的 `runWithConcurrency` 当前**仅被 `utils/http.ts`（图片上传并发 3）使用**，自动记录未使用它（`autoRecord.ts` 用单飞 Promise 串行）。
 
 ## 8. 运维与任务
 
@@ -304,6 +306,7 @@
 | 客户端日志清理 | `lock:background:cleanup_client_ops_logs` | 默认 24h | 10m | 否 |
 
 - 停止：`Runner.Stop` 取消 ctx、停 ticker、等待 goroutine，30s 超时。
+- 任务观测：`recordJobSuccess`/`recordJobFailure` 写 Redis `job:last_success:{task}` / `job:last_failure:{task}` / `job:fail_streak:{task}`；`watchJobHealth` 每分钟检查 `now - last_success > 3× 周期` 输出 `job_stale`，并消费 `job:trigger:{task}` 做人工补跑（`KnownJobNames` 共 10 项）。
 - 后台用独立 `bgPool`（自动记录/后台任务），主 `pool` 服务请求。
 - Redis 客户端（`internal/redis/redis.go`）：PoolSize 默认 50（`REDIS_POOL_SIZE`，<10 取 10）、MinIdleConns 5、Dial 5s、Read/Write 3s；启动异步 Ping 失败仅 warn，不阻断启动。
 - 本域使用的 Redis key：
@@ -312,5 +315,9 @@
 |-----|------|-----|------|
 | `location:reverse:{userID}:{YYYY-MM-DD}` | counter | 首次 +24h | 逆地理日配额 |
 | `ai:family_summary:{familyID}` | string 缓存 | 由 AI 模块设定 | 成文后失效（best-effort） |
+| `job:cursor:auto_record` | string | 无 | 候选用户公平轮转游标（最后处理的 user_id） |
+| `job:last_success:{task}` / `job:last_failure:{task}` | string(RFC3339) | 无 | 后台任务最近成功/失败时间 |
+| `job:fail_streak:{task}` | counter | 无 | 后台任务连续失败次数 |
+| `job:trigger:{task}` | string | 无 | 人工补跑触发键（`job run <name>` 写入，常驻 app 每分钟消费后删除） |
 
 > 注意：`lock:auto_record:{userID}` 与 `lock:background:{task}` 为 **PostgreSQL advisory lock**（ADR-0005），已不是 Redis key，无 TTL/续期。

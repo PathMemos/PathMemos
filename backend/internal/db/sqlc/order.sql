@@ -56,3 +56,13 @@ WHERE state = 'pending'
 ORDER BY id ASC
 LIMIT 1000;
 
+-- name: CloseOwnerlessPendingOrders :execrows
+-- R-17：关闭无主（user_id IS NULL，用户注销产生）的过期 pending 订单，避免永久滞留。
+UPDATE orders SET state = 'closed', updated_at = now()
+WHERE orders.id IN (
+    SELECT o.id FROM orders o
+    WHERE o.state = 'pending' AND o.user_id IS NULL AND o.created_at < sqlc.arg(created_at)
+    ORDER BY o.id ASC
+    LIMIT 1000
+);
+

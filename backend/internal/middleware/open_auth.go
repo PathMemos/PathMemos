@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	stderrors "errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"papafeiji/backend/internal/db"
 	"papafeiji/backend/pkg/errors"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -73,6 +75,11 @@ func (m *OpenAuthMiddleware) Handler(next http.Handler) http.Handler {
 					r = r.WithContext(WithSessionID(WithUserID(r.Context(), userID), "apikey:"+userID))
 					next.ServeHTTP(w, r)
 					return
+				}
+				// DB 基础设施错误与「键不合法」同走 401，但需可区分：仅对非 ErrNoRows 的查询错误记日志，
+				// 避免开源版 DB 故障期间全部表现为无效密钥、无从排查。
+				if err != nil && !stderrors.Is(err, pgx.ErrNoRows) {
+					slog.Warn("open api key lookup failed", slog.Any("error", err))
 				}
 				// B6a-09：连续失败达到阈值才延时，压低暴力穷举速率且不拖慢偶发错误请求。
 				if m.failCount.Add(1) >= 3 {

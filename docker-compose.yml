@@ -107,33 +107,50 @@ services:
   backup:
     image: alpine:3.21
     entrypoint: |
-      /bin/sh -c 'set -euo pipefail
+      /bin/sh -c 'set -u
         apk add --no-cache postgresql15-client >/dev/null
+        KEEP="$${BACKUP_KEEP:-48}"
+        INTERVAL="$${BACKUP_INTERVAL:-3600}"
+        case "$$KEEP" in *[!0-9]*) KEEP=48 ;; esac
+        case "$$INTERVAL" in *[!0-9]*) INTERVAL=3600 ;; esac
+        [ "$$KEEP" -lt 1 ] && KEEP=48
+        [ "$$INTERVAL" -lt 1 ] && INTERVAL=3600
+        OUTPUT="/backups"
+        mkdir -p "$$OUTPUT" || exit 1
+        rm -f "$$OUTPUT"/.db_*.sql "$$OUTPUT"/.db_*.sql.gz "$$OUTPUT"/.uploads_*.tar.gz
+        echo "[backup] loop started: keep=$$KEEP interval=$${INTERVAL}s"
         while true; do
-          KEEP=${BACKUP_KEEP:-7}
-          OUTPUT="/backups"
-          mkdir -p "$$OUTPUT"
-          TIMESTAMP=$$(date +%Y%m%d_%H%M%S)
-
-          echo "[backup] db -> $$OUTPUT/db_$$TIMESTAMP.sql.gz"
-          PGPASSWORD=$$DB_PASSWORD pg_dump -h postgres -U papafeiji papafeiji | gzip > "$$OUTPUT/db_$$TIMESTAMP.sql.gz"
-
-          echo "[backup] uploads -> $$OUTPUT/uploads_$$TIMESTAMP.tar.gz"
-          tar czf "$$OUTPUT/uploads_$$TIMESTAMP.tar.gz" -C /opt/uploads .
-
+          TS=$$(date +%Y%m%d_%H%M%S)
+          echo "[backup] db -> $$OUTPUT/db_$$TS.sql.gz"
+          DB_TMP="$$OUTPUT/.db_$$TS.sql"
+          if PGPASSWORD="$${DB_PASSWORD:-}" pg_dump -h postgres -U papafeiji papafeiji > "$$DB_TMP" && gzip -c "$$DB_TMP" > "$$OUTPUT/db_$$TS.sql.gz"; then
+            rm -f "$$DB_TMP"
+            echo "[backup] db ok"
+          else
+            rm -f "$$DB_TMP" "$$OUTPUT/db_$$TS.sql.gz"
+            echo "[backup] db FAILED" >&2
+          fi
+          echo "[backup] uploads -> $$OUTPUT/uploads_$$TS.tar.gz"
+          UP_TMP="$$OUTPUT/.uploads_$$TS.tar.gz"
+          if tar czf "$$UP_TMP" -C /opt/uploads . && mv -f "$$UP_TMP" "$$OUTPUT/uploads_$$TS.tar.gz"; then
+            echo "[backup] uploads ok"
+          else
+            rm -f "$$UP_TMP"
+            echo "[backup] uploads FAILED" >&2
+          fi
           for prefix in db_ uploads_; do
             ls -1t "$$OUTPUT"/$${prefix}* 2>/dev/null | tail -n +$$((KEEP + 1)) | while read -r f; do
               rm -f "$$f"
             done || true
           done
-
-          echo "[backup] done, next in 6h"
-          sleep 21600
+          echo "[backup] done, next in $${INTERVAL}s"
+          sleep "$$INTERVAL"
         done
       '
     environment:
       DB_PASSWORD: ${DB_PASSWORD}
-      BACKUP_KEEP: ${BACKUP_KEEP:-7}
+      BACKUP_KEEP: ${BACKUP_KEEP:-48}
+      BACKUP_INTERVAL: ${BACKUP_INTERVAL:-3600}
     volumes:
       - ./backups:/backups
       - ./uploads:/opt/uploads:ro

@@ -20,7 +20,7 @@ WHERE inviter_id = $1
 `
 
 type CountInviterMonthlyRewardDaysParams struct {
-	InviterID         string             `json:"inviterId"`
+	InviterID         pgtype.Text        `json:"inviterId"`
 	RewardInviterAt   pgtype.Timestamptz `json:"rewardInviterAt"`
 	RewardInviterAt_2 pgtype.Timestamptz `json:"rewardInviterAt2"`
 }
@@ -33,19 +33,26 @@ func (q *Queries) CountInviterMonthlyRewardDays(ctx context.Context, arg CountIn
 }
 
 const createUserInvite = `-- name: CreateUserInvite :one
-INSERT INTO user_invites (id, user_id, inviter_id, entry_count, created_at)
-VALUES ($1, $2, $3, 0, now())
-RETURNING id, user_id, inviter_id, entry_count, reward_inviter_at, reward_invitee_at, created_at
+INSERT INTO user_invites (id, user_id, inviter_id, entry_count, user_open_id, created_at)
+VALUES ($1, $2, $3, 0, $4, now())
+RETURNING id, user_id, inviter_id, entry_count, reward_inviter_at, reward_invitee_at, created_at, user_open_id
 `
 
 type CreateUserInviteParams struct {
-	ID        string `json:"id"`
-	UserID    string `json:"userId"`
-	InviterID string `json:"inviterId"`
+	ID         string      `json:"id"`
+	UserID     pgtype.Text `json:"userId"`
+	InviterID  pgtype.Text `json:"inviterId"`
+	UserOpenID pgtype.Text `json:"userOpenId"`
 }
 
+// R-21：冗余被邀请人 openid（注销后行保留，作为被邀请奖励终身一次的判定依据）。
 func (q *Queries) CreateUserInvite(ctx context.Context, arg CreateUserInviteParams) (UserInvite, error) {
-	row := q.db.QueryRow(ctx, createUserInvite, arg.ID, arg.UserID, arg.InviterID)
+	row := q.db.QueryRow(ctx, createUserInvite,
+		arg.ID,
+		arg.UserID,
+		arg.InviterID,
+		arg.UserOpenID,
+	)
 	var i UserInvite
 	err := row.Scan(
 		&i.ID,
@@ -55,6 +62,7 @@ func (q *Queries) CreateUserInvite(ctx context.Context, arg CreateUserInvitePara
 		&i.RewardInviterAt,
 		&i.RewardInviteeAt,
 		&i.CreatedAt,
+		&i.UserOpenID,
 	)
 	return i, err
 }
@@ -93,10 +101,10 @@ func (q *Queries) DeleteUserInviteCodeByUserID(ctx context.Context, userID strin
 }
 
 const getUserInviteByUserID = `-- name: GetUserInviteByUserID :one
-SELECT id, user_id, inviter_id, entry_count, reward_inviter_at, reward_invitee_at, created_at FROM user_invites WHERE user_id = $1
+SELECT id, user_id, inviter_id, entry_count, reward_inviter_at, reward_invitee_at, created_at, user_open_id FROM user_invites WHERE user_id = $1
 `
 
-func (q *Queries) GetUserInviteByUserID(ctx context.Context, userID string) (UserInvite, error) {
+func (q *Queries) GetUserInviteByUserID(ctx context.Context, userID pgtype.Text) (UserInvite, error) {
 	row := q.db.QueryRow(ctx, getUserInviteByUserID, userID)
 	var i UserInvite
 	err := row.Scan(
@@ -107,6 +115,7 @@ func (q *Queries) GetUserInviteByUserID(ctx context.Context, userID string) (Use
 		&i.RewardInviterAt,
 		&i.RewardInviteeAt,
 		&i.CreatedAt,
+		&i.UserOpenID,
 	)
 	return i, err
 }
@@ -136,13 +145,13 @@ LIMIT 100
 `
 
 type ListUserInvitesByInviterRow struct {
-	UserID   string      `json:"userId"`
+	UserID   pgtype.Text `json:"userId"`
 	Nickname pgtype.Text `json:"nickname"`
 	Avatar   pgtype.Text `json:"avatar"`
 	Joined   pgtype.Bool `json:"joined"`
 }
 
-func (q *Queries) ListUserInvitesByInviter(ctx context.Context, inviterID string) ([]ListUserInvitesByInviterRow, error) {
+func (q *Queries) ListUserInvitesByInviter(ctx context.Context, inviterID pgtype.Text) ([]ListUserInvitesByInviterRow, error) {
 	rows, err := q.db.Query(ctx, listUserInvitesByInviter, inviterID)
 	if err != nil {
 		return nil, err
@@ -205,15 +214,15 @@ func (q *Queries) MarkInviterRewarded(ctx context.Context, id string) (int64, er
 }
 
 const resolveInviterFromCode = `-- name: ResolveInviterFromCode :one
-UPDATE user_invite_codes
-SET used_at = now()
+SELECT user_id
+FROM user_invite_codes
 WHERE short_code = $1
   AND (expires_at IS NULL OR expires_at > now())
-RETURNING user_id
 `
 
 // 邀请码是邀请人的稳定分享码，可被多个被邀请人多次解析（不限制一次性），
-// 仅接线 000012 迁移引入的过期特性：过期后解析失败。
+// 过期语义由 user_invite_codes.expires_at（baseline 000001）决定：过期后解析失败。
+// R-24：解析为纯读（used_at 死遥测写副作用移除；列保留，将来做过期策略再启用）。
 func (q *Queries) ResolveInviterFromCode(ctx context.Context, shortCode string) (string, error) {
 	row := q.db.QueryRow(ctx, resolveInviterFromCode, shortCode)
 	var user_id string

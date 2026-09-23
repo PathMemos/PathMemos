@@ -146,8 +146,9 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	mpAccount, accErr := h.pool.Queries().GetWxMPAccountByUserID(ctx, pgtype.Text{String: user.ID, Valid: true})
 	if accErr == nil {
 		mpSubscribed = mpAccount.Subscribed
-	} else {
-		// R2-L08：查询失败不再静默——记录告警便于排查订阅状态偏差。
+	} else if !stderrors.Is(accErr, pgx.ErrNoRows) {
+		// 无公众号绑定记录（ErrNoRows）是正常情况，静默降级；仅真实 DB 故障才告警，
+		// 避免每次登录都刷 WARN（与 user.GetProfile 口径一致）。
 		slog.WarnContext(ctx, "get wx mp account failed, mpSubscribed defaults to false", slog.String("user_id", user.ID), slog.Any("error", accErr))
 	}
 	userInfo := userinfo.Build(ctx, user, h.vipService, h.defaultAvatar, mpSubscribed)
@@ -357,7 +358,7 @@ func (h *Handler) BindInviter(w http.ResponseWriter, r *http.Request) {
 	}
 	alreadyBound := user.InvitedBy.Valid && user.InvitedBy.String != ""
 	if !alreadyBound {
-		if _, err := h.pool.Queries().GetUserInviteByUserID(ctx, userID); err == nil {
+		if _, err := h.pool.Queries().GetUserInviteByUserID(ctx, toNullText(userID)); err == nil {
 			alreadyBound = true
 		} else if !stderrors.Is(err, pgx.ErrNoRows) {
 			slog.ErrorContext(ctx, "bind inviter check invite record failed", slog.String("user_id", userID), slog.Any("error", err))
@@ -384,7 +385,7 @@ func (h *Handler) BindInviter(w http.ResponseWriter, r *http.Request) {
 		if current.InvitedBy.Valid && current.InvitedBy.String != "" {
 			return nil
 		}
-		if _, err := q.GetUserInviteByUserID(ctx, userID); err == nil {
+		if _, err := q.GetUserInviteByUserID(ctx, toNullText(userID)); err == nil {
 			return nil
 		} else if !stderrors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("check invite record in tx: %w", err)
@@ -688,19 +689,38 @@ func (h *Handler) applyInviteRewardsWithTx(ctx context.Context, q *sqlc.Queries,
 	if err != nil {
 		return fmt.Errorf("generate invite id: %w", err)
 	}
+	// R-21：冗余被邀请人 openid——注销后邀请行保留（user_id 置 NULL），作为被邀请奖励终身一次的判定依据。
+	invitee, err := q.GetUserByID(ctx, inviteeID)
+	if err != nil {
+		return fmt.Errorf("get invitee user: %w", err)
+	}
+	inviteeOpenID := pgtype.Text{}
+	if invitee.OpenID != "" {
+		inviteeOpenID = pgtype.Text{String: invitee.OpenID, Valid: true}
+	}
 	if _, err := q.CreateUserInvite(ctx, sqlc.CreateUserInviteParams{
-		ID:        inviteID,
-		UserID:    inviteeID,
-		InviterID: inviterID,
+		ID:         inviteID,
+		UserID:     toNullText(inviteeID),
+		InviterID:  toNullText(inviterID),
+		UserOpenID: inviteeOpenID,
 	}); err != nil {
 		return fmt.Errorf("create user invite: %w", err)
 	}
 
-	if err := h.vipService.ExtendVIPDaysWithTx(ctx, inviteeID, 3, q); err != nil {
-		return fmt.Errorf("extend invitee vip: %w", err)
+	// R-21：先标记后发奖——同一微信主体（openid）已终身领取过被邀请奖励时跳过 +3
+	//（部分唯一索引 uq_user_invites_user_open_id 在 DB 层兜底，I1/I11），不阻断注册/绑定主流程，
+	// inviter 侧奖励不受影响（月度 14 天封顶即天花板）。
+	markRows, err := q.MarkInviteeRewarded(ctx, inviteID)
+	if err != nil {
+		if !dbx.IsUniqueViolation(err) {
+			return fmt.Errorf("mark invitee rewarded: %w", err)
+		}
+		slog.InfoContext(ctx, "invitee reward skipped: openid already rewarded", slog.String("invitee_id", inviteeID))
 	}
-	if _, err := q.MarkInviteeRewarded(ctx, inviteID); err != nil {
-		return fmt.Errorf("mark invitee rewarded: %w", err)
+	if markRows > 0 {
+		if err := h.vipService.ExtendVIPDaysWithTx(ctx, inviteeID, 3, q); err != nil {
+			return fmt.Errorf("extend invitee vip: %w", err)
+		}
 	}
 
 	now := timeutil.NowShanghai()
@@ -710,7 +730,7 @@ func (h *Handler) applyInviteRewardsWithTx(ctx context.Context, q *sqlc.Queries,
 		return fmt.Errorf("lock inviter reward: %w", err)
 	}
 	rewardedDays, err := q.CountInviterMonthlyRewardDays(ctx, sqlc.CountInviterMonthlyRewardDaysParams{
-		InviterID:         inviterID,
+		InviterID:         toNullText(inviterID),
 		RewardInviterAt:   pgtype.Timestamptz{Time: monthStart, Valid: true},
 		RewardInviterAt_2: pgtype.Timestamptz{Time: monthEnd, Valid: true},
 	})

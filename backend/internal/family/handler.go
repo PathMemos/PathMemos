@@ -11,6 +11,7 @@ import (
 	"papafeiji/backend/internal/db"
 	"papafeiji/backend/internal/db/sqlc"
 	"papafeiji/backend/internal/middleware"
+	dbx "papafeiji/backend/pkg/db"
 	"papafeiji/backend/pkg/errors"
 	"papafeiji/backend/pkg/timeutil"
 	"papafeiji/backend/pkg/util"
@@ -60,7 +61,7 @@ func (h *Handler) GetFamily(w http.ResponseWriter, r *http.Request) {
 
 	info, err := h.service.GetFamily(ctx, userID)
 	if err != nil {
-
+		slog.ErrorContext(ctx, "failed to get family info", slog.Any("error", err))
 		middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "failed to get family info")
 		return
 	}
@@ -94,6 +95,7 @@ func (h *Handler) CreateFamily(w http.ResponseWriter, r *http.Request) {
 		case ErrAlreadyInFamily:
 			middleware.JSONBizError(w, r, errors.BizAlreadyInFamily, err.Error())
 		default:
+			slog.ErrorContext(ctx, "failed to create family", slog.Any("error", err))
 			middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "failed to create family")
 		}
 		return
@@ -117,6 +119,7 @@ func (h *Handler) LeaveFamily(w http.ResponseWriter, r *http.Request) {
 		case ErrOperationInProgress:
 			middleware.JSONBizError(w, r, errors.BizOperationInProgress, err.Error())
 		default:
+			slog.ErrorContext(ctx, "failed to leave family", slog.Any("error", err))
 			middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "failed to leave family")
 		}
 		return
@@ -148,6 +151,7 @@ func (h *Handler) RemoveMember(w http.ResponseWriter, r *http.Request) {
 		case ErrOperationInProgress:
 			middleware.JSONBizError(w, r, errors.BizOperationInProgress, err.Error())
 		default:
+			slog.ErrorContext(ctx, "failed to remove member", slog.Any("error", err))
 			middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "failed to remove member")
 		}
 		return
@@ -169,6 +173,7 @@ func (h *Handler) DissolveFamily(w http.ResponseWriter, r *http.Request) {
 		case ErrOperationInProgress:
 			middleware.JSONBizError(w, r, errors.BizOperationInProgress, err.Error())
 		default:
+			slog.ErrorContext(ctx, "failed to dissolve family", slog.Any("error", err))
 			middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "failed to dissolve family")
 		}
 		return
@@ -183,7 +188,7 @@ func (h *Handler) CreateInviteLink(w http.ResponseWriter, r *http.Request) {
 
 	info, err := h.service.GetFamily(ctx, userID)
 	if err != nil {
-
+		slog.ErrorContext(ctx, "failed to get family info", slog.Any("error", err))
 		middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "failed to get family info")
 		return
 	}
@@ -200,6 +205,7 @@ func (h *Handler) CreateInviteLink(w http.ResponseWriter, r *http.Request) {
 			case ErrAlreadyInFamily:
 				middleware.JSONBizError(w, r, errors.BizAlreadyInFamily, err.Error())
 			default:
+				slog.ErrorContext(ctx, "failed to create family", slog.Any("error", err))
 				middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "failed to create family")
 			}
 			return
@@ -242,6 +248,7 @@ func (h *Handler) JoinByInviteLink(w http.ResponseWriter, r *http.Request) {
 		case ErrOperationInProgress:
 			middleware.JSONBizError(w, r, errors.BizOperationInProgress, err.Error())
 		default:
+			slog.ErrorContext(ctx, "failed to join family", slog.Any("error", err))
 			middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "failed to join family")
 		}
 		return
@@ -252,7 +259,7 @@ func (h *Handler) JoinByInviteLink(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) grantJoinReward(ctx context.Context, userID, familyID string) {
-	if _, err := h.pool.Queries().GetUserInviteByUserID(ctx, userID); err == nil {
+	if _, err := h.pool.Queries().GetUserInviteByUserID(ctx, toNullText(userID)); err == nil {
 		return
 	} else if !stderrors.Is(err, pgx.ErrNoRows) {
 		slog.WarnContext(ctx, "check user invite failed", "user_id", userID, "error", err)
@@ -261,9 +268,13 @@ func (h *Handler) grantJoinReward(ctx context.Context, userID, familyID string) 
 
 	u, err := h.pool.Queries().GetUserByID(ctx, userID)
 	if err != nil {
+		// F-5：奖励路径任何失败仅 slog.WarnContext，不向客户端报错；瞬时 DB 错误不静默吞掉。
+		slog.WarnContext(ctx, "grant join reward: get user failed", "user_id", userID, "error", err)
 		return
 	}
-	if time.Since(u.CreatedAt.Time) > 5*time.Minute {
+	// R-23：奖励窗口与 /auth/inviter 统一为注册后 7 天（原 5 分钟惩罚弱网/慢扫码新用户，
+	// 且两入口窗口不一致无决策依据）；inviter 侧另有月度 14 天封顶。
+	if time.Since(u.CreatedAt.Time) > 7*24*time.Hour {
 		return
 	}
 
@@ -276,13 +287,18 @@ func (h *Handler) grantJoinReward(ctx context.Context, userID, familyID string) 
 	}
 
 	if err := db.WithTxDeferrable(ctx, h.pool.Pool(), func(ctx context.Context, q *sqlc.Queries) error {
-		if _, innerErr := q.GetUserInviteByUserID(ctx, userID); innerErr == nil {
+		if _, innerErr := q.GetUserInviteByUserID(ctx, toNullText(userID)); innerErr == nil {
 			return nil
 		} else if !stderrors.Is(innerErr, pgx.ErrNoRows) {
+			slog.WarnContext(ctx, "check user invite failed", "user_id", userID, "error", innerErr)
 			return nil
 		}
 
 		if _, checkErr := q.GetUserByID(ctx, ownerID); checkErr != nil {
+			// ErrNoRows（owner 已不存在）为预期跳过；其余 DB 错误按 F-5 记 Warn 后跳过奖励，不静默吞掉。
+			if !stderrors.Is(checkErr, pgx.ErrNoRows) {
+				slog.WarnContext(ctx, "grant join reward: check owner failed, skip reward", "user_id", userID, "owner_id", ownerID, "error", checkErr)
+			}
 			return nil
 		}
 
@@ -290,19 +306,29 @@ func (h *Handler) grantJoinReward(ctx context.Context, userID, familyID string) 
 		if err != nil {
 			return fmt.Errorf("generate invite id: %w", err)
 		}
+		// R-21：冗余被邀请人 openid（注销后行保留，user_id 置 NULL），终身一次判定依据。
 		if _, err := q.CreateUserInvite(ctx, sqlc.CreateUserInviteParams{
-			ID:        inviteID,
-			UserID:    userID,
-			InviterID: ownerID,
+			ID:         inviteID,
+			UserID:     toNullText(userID),
+			InviterID:  toNullText(ownerID),
+			UserOpenID: toNullText(u.OpenID),
 		}); err != nil {
 			return fmt.Errorf("create user invite: %w", err)
 		}
 
-		if err := h.vipService.ExtendVIPDaysWithTx(ctx, userID, 3, q); err != nil {
-			return fmt.Errorf("extend invitee vip: %w", err)
+		// R-21：先标记后发奖——同一微信主体（openid）已终身领取过被邀请奖励时跳过 +3
+		//（uq_user_invites_user_open_id 在 DB 层兜底），inviter 侧奖励不受影响。
+		markRows, err := q.MarkInviteeRewarded(ctx, inviteID)
+		if err != nil {
+			if !dbx.IsUniqueViolation(err) {
+				return fmt.Errorf("mark invitee rewarded: %w", err)
+			}
+			slog.InfoContext(ctx, "invitee reward skipped: openid already rewarded", "user_id", userID)
 		}
-		if _, err := q.MarkInviteeRewarded(ctx, inviteID); err != nil {
-			return fmt.Errorf("mark invitee rewarded: %w", err)
+		if markRows > 0 {
+			if err := h.vipService.ExtendVIPDaysWithTx(ctx, userID, 3, q); err != nil {
+				return fmt.Errorf("extend invitee vip: %w", err)
+			}
 		}
 
 		now := timeutil.NowShanghai()
@@ -312,7 +338,7 @@ func (h *Handler) grantJoinReward(ctx context.Context, userID, familyID string) 
 			return fmt.Errorf("lock inviter reward: %w", err)
 		}
 		rewardedDays, err := q.CountInviterMonthlyRewardDays(ctx, sqlc.CountInviterMonthlyRewardDaysParams{
-			InviterID:         ownerID,
+			InviterID:         toNullText(ownerID),
 			RewardInviterAt:   pgtype.Timestamptz{Time: monthStart, Valid: true},
 			RewardInviterAt_2: pgtype.Timestamptz{Time: monthEnd, Valid: true},
 		})

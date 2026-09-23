@@ -49,6 +49,6 @@ USER appuser
 
 EXPOSE 8080 8081
 
-HEALTHCHECK CMD curl -f http://localhost:8080/health/live || exit 1
+HEALTHCHECK CMD curl -f http://localhost:8080/health/ready || exit 1
 
 ENTRYPOINT ["/app/pathmemos"]

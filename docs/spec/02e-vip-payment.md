@@ -33,7 +33,7 @@
 | D4 | `out_trade_no` 由 `crypto/rand` 生成 32 位不可预测随机串 | 防枚举；回调验签 + DB 幂等（transaction_id 唯一）共同构成防伪造边界（金额不作为闸门，见 D11） | 无 |
 | D5 | 订单状态机仅 `pending / paid / closed` 三态，DB CHECK 约束；允许 `closed → paid` 补记（微信已扣款的补发） | 状态收敛，避免中间态；闭合「已关闭但已支付」漏发 | 无 |
 | D6 | VIP 激活**叠加而非覆盖**：`expire = GREATEST(now, 现有 expire) + 时长`，首次从 now 起算 | 购买/补发不缩短既有权益 | 无 |
-| D7 | `trial` / `free` 每种类型只能领取一次：`user_vip_claims` 上 `(user_id,vip_id)` 唯一；付费档可重复购买 | 领取类防重复，付费类允许续购 | 无 |
+| D7 | `trial` / `free` 每种类型每个微信主体只能领取一次：`user_vip_claims` 上 `(user_id,vip_id)` 唯一 + `(open_id, vip_id)` 部分唯一索引（open_id 冗余发放主体，注销墓碑行防重注册重领；`/vip/free/check` 优先按 openid 判）；付费档可重复购买 | 领取类防重复（含注销循环），付费类允许续购 | 无 |
 | D8 | 虚拟支付依据客户端传入 `env` 选择 prod/sandbox appKey（**仅 0/1 合法**：1=沙箱、0=生产，非法值 400，与 VP-6-AC1 一致）；生产受服务端闸门 `PAYMENT_ALLOW_SANDBOX` 保护，未显式开启时 `env=1` 直接 403（见 VP-6-AC6） | 分环境联调，同时防止客户端在生产环境越权切换沙箱 | 无 |
 | D9 | 交易/领取在 `db.WithTx` 事务内完成；`user_vips` 读取用 `FOR UPDATE` 行锁 | 防并发重复发货/缩短时长 | 无 |
 | D10 | 订单关闭三重机制：下单时关闭同用户同 VIP 且创建超 5 分钟的 pending；用户取消；后台任务关闭创建超 24h 的 pending | 防止陈旧 pending 堆积 | 无 |
@@ -76,7 +76,7 @@
 | VP-3-AC3 | 重复领取返回 HTTP 409 + `code=4090` + `biz_code=TRIAL_VIP_ALREADY_CLAIMED` + message `trial vip already claimed` |
 | VP-3-AC4 | 其它错误返回 500 `CodeInternalError`；无 `ErrInvalidVIP` 分支（trial 领取不校验入参） |
 
-**时序**：登录成功后 `utils/auth.ts` L74-82 在 `data.newUser` 为真时调用 `claimNewUserFreeVip()` → `POST /vip/new-user` → `vip.Service.ClaimTrialVIP` → `db.WithTx` → `activateVIPWithTx`。前端把 `TRIAL_VIP_ALREADY_CLAIMED` 当作成功吞掉（`utils/vip.ts` L65-70）。
+**时序**：注册事务内 `auth/handler.go` 已调 `vipService.IssueTrialVIPWithTx` 直接发放试用（该发放撞 openid 墓碑时静默跳过、不回滚注册，见 02a A-1）；登录成功后 `utils/auth.ts` 在 `data.newUser` 为真时仍调用 `claimNewUserFreeVip()` → `POST /vip/new-user` → `vip.Service.ClaimTrialVIP` → `db.WithTx` → `activateVIPWithTx`，正常 SaaS 流程因已发放而返回 409 `TRIAL_VIP_ALREADY_CLAIMED`；前端把该码当作成功吞掉（`utils/vip.ts`）。该端点仅在注册未发放（如历史/边界路径）时首次成功返回 200。
 
 ### VP-4 免费 VIP 领取与查重
 
@@ -87,7 +87,7 @@
 | VP-4-AC1 | `GET /vip/free` 需要 Session，仅返回 `is_active=true AND type='free'` 的记录（`sort ASC`，上限 100），每项仅 `{id,name}` |
 | VP-4-AC2 | `POST /vip/free/claim` body 上限 8KB；`vipId` 为空 → 400 `4000`；商品不存在/非 free/未激活 → 400 `invalid vip` |
 | VP-4-AC3 | 已领取返回 409 + `code=4090` + `biz_code=FREE_VIP_ALREADY_CLAIMED`；成功 200 `data={}` |
-| VP-4-AC4 | `GET /vip/free/check?vipId=` 返回 `data.claimed`（bool）；`vipId` 为空 → 400；查询只查 `user_vip_claims` |
+| VP-4-AC4 | `GET /vip/free/check?vipId=` 返回 `data.claimed`（bool）；`vipId` 为空 → 400；先取 claimant 的 openid，优先按 `open_id` 查 `user_vip_claims`，openid 缺失（异常数据）才回退 `user_id` 维度（`hasVIPClaimWithQ` / `HasVIPClaimByOpenID`，与 D7 口径一致） |
 
 **时序**：`pages/sub/Vip/Vip.ts doClaimFreeVip` → `GET /vip/free` 取第一个档位 → `POST /vip/free/claim{vipId}` → `vip.Service.ClaimFreeVIP` 校验 `type=='free' && is_active` → `activateVIPWithTx`。
 > 注意：`utils/vip.ts fetchVipInfo` 用 `NEW_USER_FREE_VIP_ID='vip-free-0001'` 调 `/vip/free/check`，因此 UI 的 `receivedFreeVip` 反映的是 **free** 领取状态，不反映 trial 领取状态。
@@ -130,9 +130,9 @@
 | VP-7-AC1 | `GET /payment/virtual/status?outTradeNo=` 需 Session；参数为空 → 400 `outTradeNo is required` |
 | VP-7-AC2 | 订单不存在 / `user_id` 为空 / 不属于当前用户 → HTTP **404**、`code=4040`、`biz_code=ORDER_NOT_FOUND`、message `order not found` |
 | VP-7-AC3 | 真实 DB 错误（非 `pgx.ErrNoRows`）→ HTTP **500** `code=5001` + `slog.Error`，不得伪装成 404 |
-| VP-7-AC4 | 命中返回 200 `data.state ∈ {pending,paid,closed}`；前端每 3s 轮询、最多 10 次（共约 30s），`paid`→成功弹窗，`closed`→失败提示，超时 → `vip.payTimeout`。前端代码中的 `failed` 分支为**历史兼容残留**，后端状态机无 `failed`（04 §5.2），永远不会命中 |
+| VP-7-AC4 | 命中返回 200 `data.state ∈ {pending,paid,closed}`；前端每 3s 轮询、最多 10 次（共约 30s），`paid`→成功弹窗，`closed`→失败提示，超时 → `vip.payTimeout`；前端仅处理 `paid`/`closed`，与后端状态机一致 |
 
-**时序**：`Vip.ts _pollOrderStatus`（L424-486）；`maxCount=10`，`interval=3000ms`。
+**时序**：`Vip.ts _pollOrderStatus`（L419-481）；`maxCount=10`，`interval=3000ms`。
 
 ### VP-8 取消订单
 
@@ -142,7 +142,7 @@
 |----|------|
 | VP-8-AC1 | `POST /payment/virtual/cancel` 需 Session；body 上限 4096B；`outTradeNo` 为空 → 400 |
 | VP-8-AC2 | 仅关闭「当前用户 + out_trade_no + state=pending」的订单（`CloseOrder`）；影响 0 行时回查订单：订单不存在或非本人 → 404 `code=4040` `biz_code=ORDER_NOT_FOUND`；订单已非 pending → 200 `{}`（幂等成功）；仍 pending 但 0 行（并发）→ 200 `{}` |
-| VP-8-AC3 | `CloseOrder` 真实 DB 错误 → 500 `5001`（不再静默吞掉） |
+| VP-8-AC3 | `CloseOrder` 真实 DB 错误 → 500 `5001` |
 | VP-8-AC4 | 前端 `utils/pay.ts` 在支付取消/失败/中止路径 best-effort 调用 `/payment/virtual/cancel` |
 
 **时序**：`payment.Handler.Cancel` L99-153。
@@ -181,7 +181,7 @@
 |----|------|
 | VP-11-AC1 | 下单事务内：`closePendingOrdersByUserAndVIP` 仅关同 user+vip 且创建超 5 分钟的 pending |
 | VP-11-AC2 | 用户取消：见 VP-8 |
-| VP-11-AC3 | 后台任务 `runOrderClose`：cutoff=`now-24h`，按 `id ASC` 游标分页、每批 1000 条 `ListPendingOrdersBefore`（仅 `state=pending AND user_id IS NOT NULL`），跳过空 user，再 `CloseOrdersBatch`（按位置配对 out_trade_no→user_id，只关 pending）；不足 1000 结束；默认每 1 分钟调度一次（`JOB_INTERVAL_ORDER_CLOSE`），PG advisory lock `lock:background:order_close`（ADR-0005，无 TTL） |
+| VP-11-AC3 | 后台任务 `runOrderClose`：cutoff=`now-24h`。先循环 `CloseOwnerlessPendingOrders`（每批 ≤1000）关闭 `user_id IS NULL` 的无主 pending 订单；再按 `id ASC` 游标分页、每批 1000 条 `ListPendingOrdersBefore`（`state=pending AND user_id IS NOT NULL`），`CloseOrdersBatch`（按位置配对 out_trade_no→user_id，只关 pending）；不足 1000 结束；默认每 1 分钟调度一次（`JOB_INTERVAL_ORDER_CLOSE`），PG advisory lock `lock:background:order_close`（ADR-0005，无 TTL） |
 
 ### VP-12 VIP 补发（客服/运营）
 
@@ -200,7 +200,7 @@
 | VP-13-AC1 | `utils/pay.ts getPayEnv()`：iOS 恒返回 0；否则 `envVersion` 为 `develop/trial` → 1，`release` → 0，异常兜底 0 |
 | VP-13-AC2 | `doPay` 先 `POST /payment/virtual/request`（带 `vipId, env`），再 `wx.requestVirtualPayment({signData,paySig,signature,mode})`；成功后回调 `onVirtualPaySuccess(outTradeNo)` 并进入轮询 |
 | VP-13-AC3 | 支付失败 `errCode===-15011` → iOS 测试不支持提示；`errMsg` 含 `SIG_EMPTY` → 签名空提示；`cancelToken` 已取消 → reject `request:abort` |
-| VP-13-AC4 | Vip 页先读 `GET /system/config`：`features.payment===false` 隐藏付费入口，`features.freeVip===false` 隐藏免费入口；私有模式（`getBackendMode()==='private'`）本地兜底两个都关。注意：后端对 freeVip 恒返回 true（`system/handler.go` 硬编码，无服务端开关），`freeVip===false` 分支目前只能由私有模式本地兜底触发；已接受取舍：免费活动下线需发版，不设环境变量开关 |
+| VP-13-AC4 | Vip 页先读 `GET /system/config`：`features.payment===false` 隐藏付费入口，`features.freeVip===false` 隐藏免费入口；私有模式（`getBackendMode()==='private'`）本地兜底两个都关。后端 `features.freeVip` 由环境变量 `FREE_VIP_ENABLED` 控制（默认 `true`，`system/handler.go` 读 `cfg.FreeVipEnabled`）：免费活动下线置 `0` 并重新部署即可，无需发版（SaaS 经 `CFG_FREE_VIP_ENABLED` 注入，见 DEPLOYMENT §2.2/§2.11） |
 | VP-13-AC5 | 商品列表在页面上二次过滤掉 `type==='free'||'trial'`，只展示付费档 |
 
 ## 4. 数据模型
@@ -214,7 +214,7 @@
 | `orders` | `id(text PK)`、`user_id(text NULL)`、`vip_id(text NOT NULL)`、`out_trade_no(text)`、`channel(text)`、`state(text)`、`amount(int)`、`prepay_id(text NULL)`、`transaction_id(text NULL)`、`paid_at(timestamptz NULL)`、`created_at/updated_at` | 虚拟支付订单；`user_id` 可被置空表示用户已删除 |
 | `vips` | `id(text PK)`、`type(text)`、`name`、`time_limit_mark`、`time_limit_number`、`product_id(text NULL)`、`sort(int)`、`is_active(bool)`、`prices(jsonb)`、`created_at` | VIP 商品定义 |
 | `user_vips` | `id(text PK)`、`user_id(text NOT NULL UNIQUE)`、`begin_time`、`expire_time`、`created_at` | 每用户一行；`CHECK(expire_time > begin_time)` |
-| `user_vip_claims` | `id(text PK)`、`user_id`、`vip_id`、`created_at` | 领取记录；`UNIQUE(user_id,vip_id)` 防重复 |
+| `user_vip_claims` | `id(text PK)`、`user_id`、`vip_id`、`open_id`、`created_at` | 领取记录；`UNIQUE(user_id,vip_id)` 防重复；`open_id`（000008 新增并回填）冗余发放主体，防注销重注册重领；`user_id` 可空（000010，注销保留仅含 openid 的墓碑行） |
 
 ### 4.2 约束与索引（真实）
 
@@ -238,8 +238,9 @@
 | `user_vips_check` | `expire_time > begin_time` |
 | user_vips 外键 | `user_id → users(id) ON DELETE CASCADE` |
 | `user_vip_claims_user_id_vip_id_key` | UNIQUE(user_id,vip_id) |
-| user_vip_claims 外键 | `user_id → users(id) ON DELETE CASCADE`；`vip_id → vips(id)` |
-| `idx_user_vips_expire_time` / `idx_user_vip_claims_user_created` / `idx_vips_is_active` | 普通索引 |
+| `uq_user_vip_claims_open_id_vip_id` | 部分唯一索引：`(open_id, vip_id) WHERE open_id IS NOT NULL`（000008） |
+| user_vip_claims 外键 | `user_id → users(id) ON DELETE SET NULL`（000008；可空见 000010）；`vip_id → vips(id)` |
+| `idx_user_vips_expire_time` / `idx_user_vip_claims_user_created` / `idx_user_vip_claims_vip_id` / `idx_vips_is_active` | 普通索引 |
 
 ### 4.3 数据字典
 
@@ -298,6 +299,8 @@
 |------|------|------------------|----------------------|---------|------|
 | 成功 | 200 | `0000` | — | `ok` | `middleware.JSON` |
 | body 非法 / vipId 空 / outTradeNo 空 / env 非 0/1 | 400 | `4000` | — | 各校验文案 | `payment/handler.go`、`vip/handler.go` |
+| body 超上限（按端点：VIP 领取 8KB、支付下单/取消 4KB） | 413 | `4130` | — | `request body too large` | `middleware/body.go` `JSONBodyError` |
+| `env=1` 且 `PAYMENT_ALLOW_SANDBOX` 未开启 | 403 | `4030` | — | `sandbox payment is disabled` | `payment/handler.go` |
 | `payment.ErrInvalidVIP`（下单） | 400 | `4000` | — | `invalid vip` | `payment/handler.go` L94-97 |
 | `vip.ErrInvalidVIP`（免费领取） | 400 | `4000` | — | `invalid vip` | `vip/handler.go` L100-101 |
 | 免费已领 | 409 | `4090` | `FREE_VIP_ALREADY_CLAIMED` | `free vip already claimed` | `vip/handler.go` L98-99 |
@@ -305,7 +308,7 @@
 | 订单不存在/非本人（cancel、status） | **404** | `4040` | `ORDER_NOT_FOUND` | `order not found` | `payment/handler.go` |
 | 其它内部错误（下单、取消、列表、领取、状态查询） | 500 | `5001` | — | `failed to ...` | 各 handler default 分支 |
 
-> 终态：404 响应 `code=4040`、409 响应 `code=4090`（与 HTTP 状态一致的固定枚举，ADR-0008；历史「404 带 code=4000」行为已废除）。
+> 终态：404 响应 `code=4040`、409 响应 `code=4090`（与 HTTP 状态一致的固定枚举，ADR-0008）。
 
 ## 6. 关键实现约束
 
@@ -314,8 +317,8 @@
   - 发货：`orders.state='pending'` 条件更新 + `transaction_id` 唯一；
   - 领取：`user_vip_claims` `(user_id,vip_id)` 唯一 + `UpsertVIPClaim` 的 `rowsAffected==0` 判定；
   - VIP 写入：`UpsertUserVIP` 的 `GREATEST` 防缩短（但不防重复累加，补发/购买本意即累加）。
-- **事务**：`createOrder`、`handleNotify`、`ClaimFreeVIP`/`ClaimTrialVIP`、`ExtendVIPDaysWithTx`/`ActivateVIPWithTx`（由调用方/Claim 包装器包进 `db.WithTx`）；闭包内 DB 错误用 `fmt.Errorf("操作名: %w", err)` 包裹，业务 sentinel（`ErrInvalidVIP`、`ErrFreeVIPAlreadyClaimed`、`ErrTrialVIPAlreadyClaimed`、`errNotifyRejected`）裸返回。
-- **业务拒绝 vs 瞬时故障**：`handleNotify` 中带 `errNotifyRejected` 的错误（订单不存在/金额缺失或非正数/事件不支持/缺字段/23505）→ 200 + 告警；其它 → 500 触发微信重试。金额与标价不一致**不再**拒绝（照常发货 + 告警）。
+- **事务与交付原子性**：`createOrder`、`handleNotify`、`ClaimFreeVIP`/`ClaimTrialVIP`、`ExtendVIPDaysWithTx`/`ActivateVIPWithTx`（由调用方/Claim 包装器包进 `db.WithTx`）。**`handleNotify` 的单个 `db.WithTx` 同时包含 订单置 paid（含 closed 补记）与 `ActivateVIPWithTx` 发货**——「paid」严格等价「已交付」，不存在已扣款未发货窗口；回调重试命中 paid 即幂等成功是安全的。；闭包内 DB 错误用 `fmt.Errorf("操作名: %w", err)` 包裹，业务 sentinel（`ErrInvalidVIP`、`ErrFreeVIPAlreadyClaimed`、`ErrTrialVIPAlreadyClaimed`、`errNotifyRejected`）裸返回。
+- **业务拒绝 vs 瞬时故障**：`handleNotify` 中带 `errNotifyRejected` 的错误（订单不存在/金额缺失或非正数/事件不支持/缺字段/23505）→ 200 + 告警；其它 → 500 触发微信重试。金额与标价不一致不拒绝（照常发货 + 告警）。
 - **告警关键字**：`payment_notify_missing_msg_signature`、`payment_notify_bad_signature`、`payment_notify_decrypt_failed`、`alert:payment_parse_failed`、`payment_notify_plaintext_rejected`、`payment_notify_business_rejected`、`payment_notify_transient_retry`、`payment_notify_amount_missing`、`payment_notify_amount_invalid`、`payment_notify_amount_mismatch`、`payment_notify_closed_order_reissued`、`payment_notify_receive_id_mismatch`（各关键字的实际日志级别见 DEPLOYMENT §10，Warn/Error 混合）。
 - **安全**：Token/AES 密钥仅环境变量注入，不落仓库；POST 回调 body 无密文一律拒绝；签名比较用常量时间；nginx 仅启用 `limit_req` 与 TLS。
 - **签名输入**：`WechatVirtualPayClient.appID` 在构造时赋值、不参与签名计算；`paySig` 使用 appKey，`signature` 使用用户 `session_key`。

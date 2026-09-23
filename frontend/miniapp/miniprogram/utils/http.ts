@@ -3,6 +3,7 @@ import { getSessionId, clearSessionId, setBaseInfo, getBackendMode, getPrivateBa
 import { getBaseURL } from '../config/index';
 import { runWithConcurrency } from './concurrency';
 import { i18n } from './i18n';
+import { localizedBizCodeMessage } from './errorMessages';
 
 // Internal sentinel used by auto-record and other modules to detect session expiration.
 // User-facing copy is always rendered through i18n.t('error.sessionExpired').
@@ -225,8 +226,10 @@ const _handleResponseError = (resData: any, closeTheErrorMessage = false): void 
     wx.showToast({ title: i18n.t('error.privateBackendNotRegistered'), icon: 'none', duration: 2000 });
     return;
   }
+  // C1：后端 message 为英文硬编码，优先按 biz_code 显示本地化文案，未登记码回退后端 message。
+  const bizMessage = localizedBizCodeMessage(resData.biz_code || resData.bizCode);
   wx.showToast({
-    title: resData.message || resData.msg || i18n.t('error.DEFAULT'),
+    title: bizMessage || resData.message || resData.msg || i18n.t('error.DEFAULT'),
     icon: 'none',
     duration: 2000,
   });

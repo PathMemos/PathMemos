@@ -37,21 +37,30 @@ type chatMessage struct {
 }
 
 type streamRequest struct {
-	Model     string          `json:"model"`
-	Messages  []chatMessage   `json:"messages"`
-	Stream    bool            `json:"stream"`
-	MaxTokens int             `json:"max_tokens,omitempty"`
-	Thinking  *thinkingConfig `json:"thinking,omitempty"`
+	Model         string          `json:"model"`
+	Messages      []chatMessage   `json:"messages"`
+	Stream        bool            `json:"stream"`
+	MaxTokens     int             `json:"max_tokens,omitempty"`
+	Thinking      *thinkingConfig `json:"thinking,omitempty"`
+	StreamOptions *streamOptions  `json:"stream_options,omitempty"`
 }
 
 type thinkingConfig struct {
 	Type string `json:"type"`
 }
 
+// streamOptions 请求上游在流末尾返回 token 用量（OpenAI 兼容约定），
+// 用于成本观测（msg="ai chat usage" 结构化日志），不落库。
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type Stream struct {
-	reader        io.ReadCloser
-	scan          *bufio.Scanner
-	parseFailures int
+	reader           io.ReadCloser
+	scan             *bufio.Scanner
+	parseFailures    int
+	promptTokens     int
+	completionTokens int
 }
 
 func (s *Stream) Next() (string, error) {
@@ -76,6 +85,10 @@ func (s *Stream) Next() (string, error) {
 					ReasoningContent string `json:"reasoning_content"`
 				} `json:"delta"`
 			} `json:"choices"`
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+			} `json:"usage"`
 			Error *struct {
 				Message string `json:"message"`
 			} `json:"error"`
@@ -88,6 +101,11 @@ func (s *Stream) Next() (string, error) {
 			continue
 		}
 		s.parseFailures = 0
+		// include_usage：流末尾的用量 chunk（choices 为空）只记录，不产出内容。
+		if payload.Usage != nil {
+			s.promptTokens = payload.Usage.PromptTokens
+			s.completionTokens = payload.Usage.CompletionTokens
+		}
 		if payload.Error != nil && payload.Error.Message != "" {
 			return "", fmt.Errorf("upstream error: %s", payload.Error.Message)
 		}
@@ -114,12 +132,18 @@ func (s *Stream) Close() error {
 	return nil
 }
 
+// Usage 返回上游回报的 token 用量（未开启 include_usage 或尚未收到用量 chunk 时为 0）。
+func (s *Stream) Usage() (promptTokens, completionTokens int) {
+	return s.promptTokens, s.completionTokens
+}
+
 func (c *UpstreamClient) Stream(ctx context.Context, baseURL, model, thinkingType string, maxTokens int, messages []chatMessage) (*Stream, error) {
 	reqBody := streamRequest{
-		Model:     model,
-		Messages:  messages,
-		Stream:    true,
-		MaxTokens: maxTokens,
+		Model:         model,
+		Messages:      messages,
+		Stream:        true,
+		MaxTokens:     maxTokens,
+		StreamOptions: &streamOptions{IncludeUsage: true},
 	}
 	if thinkingType != "" {
 		reqBody.Thinking = &thinkingConfig{Type: thinkingType}

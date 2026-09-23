@@ -59,7 +59,7 @@
 
 **故事**：作为微信用户，我在小程序内静默登录，无需注册表单；首次登录即获得试用 VIP 与个人家庭。
 
-时序（源：`backend/internal/auth/handler.go:97` `Login`、`findOrCreateUser`）：
+时序（源：`backend/internal/auth/handler.go:93` `Login`、`findOrCreateUser`）：
 
 1. 客户端 `wx.login()` 取 code，`POST /auth/login`，body 可选 `inviter`。
 2. `middleware.ReadJSONBody(w,r,&req,4096)`；`code` 为空 → 400。
@@ -67,10 +67,10 @@
 4. `findOrCreateUser`：
    - `session.UnionID != ""` 且 `GetUserByUnionID` 命中 → 仅 `UpdateUserSessionKey`，返回老用户。
    - 否则 `GetUserByOpenID` 命中 → `UpdateUserSessionKey`；若原 `unionid` 为空则补写 `UpdateUserUnionID`。
-   - 都未命中 → 事务内新建：`CreateFamily(is_personal=true)` → `CreateUser`（`user_type='wechat'`，随机昵称）→ `UpsertFamilyMembership(role='owner')` → `IssueTrialVIPWithTx` → `applyInviteRewardsWithTx` → `createOrGetUserInviteCode`（8 位短码）。
+   - 都未命中 → 事务内新建：`CreateFamily(is_personal=true)` → `CreateUser`（`user_type='wechat'`，随机昵称）→ `UpsertFamilyMembership(role='owner')` → `IssueTrialVIPWithTx`（撞 openid 墓碑、即该微信主体已领取过 trial 时**静默跳过发放、不回滚注册**；409 仅由 `/vip/new-user` 端点承载）→ `applyInviteRewardsWithTx` → `createOrGetUserInviteCode`（8 位短码）。
 5. 若 `session.UnionID != ""`：`LinkWxMPAccountByUnionID` 把 `user_id IS NULL` 的公众号记录认领给该用户，失败仅 WARN。
 6. `sessions.Create(ctx, user.ID)` 写 Redis（Lua 原子脚本）。
-7. 读 `wx_mp_accounts.subscribed` 得 `mpSubscribed`（查询失败默认 false + WARN）。
+7. 读 `wx_mp_accounts.subscribed` 得 `mpSubscribed`（`ErrNoRows` 静默视为未订阅；真实 DB 错误 WARN 后按 false 处理）。
 8. 返回 `{ sessionId, newUser, userInfo }`；新用户异步生成默认头像 marker。
 
 **AC**
@@ -99,12 +99,12 @@
 
 **故事**：用户授权微信手机号后绑定到自己账号，每天只能改一次。
 
-时序（`auth/handler.go:223` `BindPhone`）：
+时序（`auth/handler.go:215` `BindPhone`）：
 
 1. 读取 body（4096 上限），取 `code`。
 2. `GetUserByID`；再判 `phoneModificationLockedToday`：`phone_bind_time` 的**上海日期**等于今天 → 400。
 3. `wechat.GetPhoneNumber(ctx, code)`（内部走 `stable_token` 换 access_token，带 Redis 缓存）。
-4. `UpdateUserPhone(phone_number, phone_bind_time=now)`。
+4. `BindUserPhoneIfAllowed` 原子条件更新 `phone_number` + `phone_bind_time=now`（日限在 SQL 内判断）。
 5. 命中 `phone_number` 唯一索引冲突 → 409。
 
 **AC**
@@ -117,9 +117,9 @@
 
 ### A-4 手机号解绑
 
-**故事**：解绑手机号不消耗微信额度；因日限按“当天是否绑定过”判定，解绑后当天仍可解绑/查看，但不能当天再次绑定。
+**故事**：解绑手机号不消耗微信额度；因日限按“当天是否绑定过”判定，当天绑定并解绑后，当天不能再绑定；跨日解绑不影响当日绑定额度（判定依据为最近一次绑定日期，见 D5/AC）。
 
-时序（`auth/handler.go:284` `UnbindPhone`）：读 body → `GetUserByID` → 未绑定 → 400 → `UpdateUserPhone(phone_number=null, phone_bind_time=保留原值)` → 200。
+时序（`auth/handler.go:276` `UnbindPhone`）：读 body → `GetUserByID` → 未绑定 → 400 → `UpdateUserPhone(phone_number=null, phone_bind_time=保留原值)` → 200。
 
 **AC**
 
@@ -128,11 +128,11 @@
 - 解绑**不校验** `code`、不调用微信（`code` 字段仅为客户端兼容保留）。
 - `GET /auth/phone` 在用户不存在时返回 HTTP 400（`StatusBadRequest`），而非 404。
 
-### A-5 登录后补绑邀请人（R4）
+### A-5 登录后补绑邀请人
 
 **故事**：极弱网下用户可能在场景码解析完成前就完成登录，客户端解析完成后调用补绑接口。
 
-时序（`auth/handler.go:334` `BindInviter`）：
+时序（`auth/handler.go:326` `BindInviter`）：
 
 1. 读 body；`inviter` 为空或等于自己 → 400。
 2. 校验邀请人存在（`pgx.ErrNoRows` → 400 `inviter not found`）。
@@ -149,11 +149,11 @@
 
 ### A-6 邀请奖励规则（注册期与补绑共用）
 
-源：`auth/handler.go:683` `applyInviteRewardsWithTx`、`backend/internal/db/sqlc/invite.sql`。
+源：`auth/handler.go:675` `applyInviteRewardsWithTx`、`backend/internal/db/sqlc/invite.sql`。
 
 - 事务内确认邀请人存在（不存在则跳过，不失败）。
-- 插入 `user_invites(user_id=被邀请人, inviter_id=邀请人, entry_count=0)`。
-- 被邀请人 `ExtendVIPDaysWithTx(+3 天)` → `MarkInviteeRewarded`。
+- 插入 `user_invites(user_id=被邀请人, inviter_id=邀请人, entry_count=0, user_open_id=被邀请人 openid)`。
+- 被邀请人：先 `MarkInviteeRewarded`（execrows，`WHERE reward_invitee_at IS NULL`；openid 撞 `uq_user_invites_user_open_id` 部分唯一索引 23505 时仅 Info 日志跳过）→ 标记成功（markRows>0）才 `ExtendVIPDaysWithTx(+3 天)`。
 - 邀请人：先 `LockInviterReward`（PostgreSQL 事务级 advisory lock `hashtext('inviter_reward:'||inviter_id)`）→ `CountInviterMonthlyRewardDays`（当月 `reward_inviter_at` 计数 × 7）→ 若 `< 14`：先 `MarkInviterRewarded`（返回受影响行数）→ 行数 > 0 才 `ExtendVIPDaysWithTx(+7 天)`。
 
 **AC**
@@ -161,7 +161,7 @@
 - 被邀请人 +3 天、邀请人 +7 天，各只加一次。
 - 邀请人每个自然月最多获得 2 次奖励（当月已计 14 天即不再加）。
 - 并发的两次奖励不会双发（advisory 锁 + `MarkInviterRewarded` 的 `WHERE reward_inviter_at IS NULL`）。
-- 每个用户最多绑定一个邀请人（`user_invites.user_id` 唯一）；链接加入奖励（`family/grantJoinReward`，见 PP-02D）与登录期奖励互斥，仅先到者生效。
+- 每个微信主体最多绑定一个邀请人（`user_invites.user_id` 唯一，注销后行保留仅 openid 墓碑）；链接加入奖励（`family/grantJoinReward`，见 PP-02D，窗口同为注册后 7 天（两入口统一））与登录期奖励互斥，仅先到者生效。被邀请奖励按 openid 终身一次（`uq_user_invites_user_open_id` 部分唯一索引）。
 
 ### A-7 用户资料 / 语言
 
@@ -184,7 +184,7 @@
 
 **故事**：用户输入自己的昵称确认后，永久删除账号及其数据。
 
-时序（`auth/handler.go:421` `DeleteAccount` → `family.Service.DeleteAccount` → `user.CleanupAfterAccountDeletion`）：
+时序（`auth/handler.go:413` `DeleteAccount` → `family.Service.DeleteAccount` → `user.CleanupAfterAccountDeletion`）：
 
 1. 读 body，`confirmName` 非空 → 与当前 `users.nickname` 精确比较，不等 → 400。
 2. **先删除当前 session**（失败 → 500，不继续）。
@@ -195,11 +195,11 @@
 **AC**
 
 - `confirmName` 与昵称不一致 → 400 `confirmName mismatch`；用户不存在 → 404；昵称为空/无效 → 500。
-- 注销成功（200）后：`users` 无该 id；`user_invites` / `user_invite_codes` 无该用户记录；该用户全部 session 被删（旧 session 调接口 → 401）。
+- 注销成功（200）后：`users` 无该 id；`user_invite_codes` 无该用户记录；`user_invites` 行保留（`user_id` 置 NULL 墓碑，见下方例外）；该用户全部 session 被删（旧 session 调接口 → 401）。
 - 并发注销同一用户：未抢到用户锁的一次返回 HTTP 429（`biz_code=OPERATION_IN_PROGRESS`）。
 - 同一 IP 1 小时内第 6 次 `DELETE /auth/account` → HTTP 429，`code="4290"`，`biz_code="RATE_LIMITED"`。
 - DB 事务成功提交后，即便后续 session / 文件清理失败，响应仍为 200。
-- 注销为物理删除；同一微信后续登录会创建新的用户（新 `id`），无数据恢复。
+- 注销为物理删除；同一微信后续登录会创建新的用户（新 `id`），无数据恢复。**例外（领取/邀请墓碑）**：`user_vip_claims` 与 `user_invites` 的 `user_id` 因 FK `ON DELETE SET NULL` 保留仅含 openid 的墓碑行（无业务数据），作为 trial/free 领取与被邀请奖励「每微信主体终身一次」的判定依据；`user_invites.inviter_id` 同为 SET NULL（000011），邀请人注销不再连带删除墓碑行、终身一次判定不受邀请人存续影响。
 
 ## 4. 数据模型
 
@@ -231,14 +231,15 @@
 | 字段 | 类型 | 约束 / 说明 |
 |---|---|---|
 | `id` | text | PK |
-| `user_id` | text | **UNIQUE**（`user_invites_user_id_key`）；FK `users ON DELETE CASCADE`；即「一个用户最多一个邀请人」 |
-| `inviter_id` | text | FK `users ON DELETE CASCADE`；索引 `(inviter_id, created_at DESC)` |
+| `user_id` | text | **UNIQUE**（`user_invites_user_id_key`）；FK `users ON DELETE SET NULL`（000008：注销保留行，作被邀请奖励终身一次判定）；即「一个用户最多一个邀请人」 |
+| `inviter_id` | text | **可空**；FK `users ON DELETE SET NULL`（000011：邀请人注销保留被邀请人墓碑行，使「每微信主体终身一次被邀请奖励」不被绕过；down 恢复 CASCADE 前需人工清理 `inviter_id IS NULL` 的孤儿墓碑行）；索引 `(inviter_id, created_at DESC)` |
 | `entry_count` | int | 默认 0 |
+| `user_open_id` | text | 可空；000008 新增并从 `users.open_id` 回填；被邀请人微信 openid 冗余，注册期与家庭链接两条奖励路径均写入，注销后行保留作被邀请奖励终身一次判定 |
 | `reward_inviter_at` | timestamptz | 邀请人奖励发放时间；月度上限按此字段统计 |
 | `reward_invitee_at` | timestamptz | 被邀请人奖励发放时间 |
 | `created_at` | timestamptz | 默认 now() |
 
-补充索引：`idx_user_invites_pending (user_id) WHERE reward_invitee_at IS NULL`；`idx_user_invites_reward_inviter_at (inviter_id, reward_inviter_at) WHERE reward_inviter_at IS NOT NULL`。
+补充索引：`idx_user_invites_pending (user_id) WHERE reward_invitee_at IS NULL`；`idx_user_invites_reward_inviter_at (inviter_id, reward_inviter_at) WHERE reward_inviter_at IS NOT NULL`；`uq_user_invites_user_open_id (user_open_id) WHERE user_open_id IS NOT NULL AND reward_invitee_at IS NOT NULL`（000008，被邀请奖励每微信主体终身一次）。
 
 ### 4.3 `user_invite_codes`
 
@@ -248,7 +249,7 @@
 | `short_code` | text | **UNIQUE**；8 位，字符集 `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`；索引 `idx_user_invite_codes_short_code_lookup` |
 | `created_at` | timestamptz | 默认 now() |
 | `expires_at` | timestamptz | 可空；**当前代码从不写入（恒为 NULL）**，解析 SQL 判 `expires_at IS NULL OR expires_at > now()` |
-| `used_at` | timestamptz | 每次 `/invite/resolve` 成功后置 now()（仅记录最近使用时间，不限制次数） |
+| `used_at` | timestamptz | 可空；解析已改纯读（`ResolveInviterFromCode` 为纯 SELECT，全库无写入点），列保留备将来过期策略启用 |
 
 ### 4.4 `wx_mp_accounts`（本域只读）
 
@@ -262,13 +263,13 @@
 
 | 名称 | 取值 | 实现位置 |
 |---|---|---|
-| 语言 `lang` | `zh` / `zh-Hant` / `en` | `user/handler.go:205` `supportedLangs` |
+| 语言 `lang` | `zh` / `zh-Hant` / `en` | `user/handler.go:202` `supportedLangs` |
 | 用户类型 | `wechat`（唯一） | migration CHECK |
 | 会话 TTL | 滑动 30 天，绝对 90 天 | `middleware/session.go:27-28` |
-| 手机绑定日限 | 1 次 / 自然日（Asia/Shanghai），原子条件更新 | `auth/handler.go` `BindUserPhoneIfAllowed` |
+| 手机绑定日限 | 1 次 / 自然日（Asia/Shanghai），原子条件更新 | `db/sqlc/user.sql` `BindUserPhoneIfAllowed`（调用方 `auth/handler.go`） |
 | 手机绑定限流 | 10 次 / 分钟 / IP | `cmd/server/main.go` |
-| 试用 VIP id | `vip-trial-0001` | `vip/service.go:21` |
-| 新用户免领 VIP id | `vip-free-0001` | `vip/service.go:22`、前端 `config/index.ts:53` |
+| 试用 VIP id | `vip-trial-0001` | `vip/service.go:20` |
+| 免费活动领取 VIP id | `vip-free-0001` | 前端 `GET /vip/free/check` 检查用（`config/index.ts:53`，常量名 `NEW_USER_FREE_VIP_ID` 为历史命名）；商品行由 `vips` 种子（migration 000003）提供 |
 
 ## 5. API 契约
 
@@ -295,7 +296,7 @@
 | POST | `/user/common-addresses/refresh` | Session | 无 body；重算并返回地址列表 |
 | PUT | `/user/common-addresses/{name}` | Session | body `{newName}`（≤8KB）；重命名/合并 + 替换日记地址 |
 
-> 鉴权中间件：`backend/internal/middleware/session.go:279` `SessionMiddleware.Handler`；SaaS 模式挂 Session，开源版（`DEPLOYMENT_MODE=open`）挂 `NewOpenAuthMiddleware`（`backend/cmd/server/main.go:225`）。
+> 鉴权中间件：`backend/internal/middleware/session.go:279` `SessionMiddleware.Handler`；SaaS 模式挂 Session，开源版（`DEPLOYMENT_MODE=open`）挂 `NewOpenAuthMiddleware`（`backend/cmd/server/main.go:242`）。
 
 ### 5.2 请求 / 响应字段
 
@@ -350,8 +351,8 @@
 
 ### 6.2 事务与隔离
 
-- 登录建号：`db.WithTx`（`backend/internal/auth/handler.go:568`），普通隔离级别。
-- 家庭变更 / 注销：`db.WithTxDeferrable`，`pgx.RepeatableRead + Deferrable`，串行化冲突（40001）重试 3 次、间隔 50ms（`backend/internal/db/pool.go:53`）。
+- 登录建号：`db.WithTx`（`backend/internal/auth/handler.go`），普通隔离级别。
+- 家庭变更 / 注销：`db.WithTxDeferrable`，`pgx.RepeatableRead + Deferrable`，串行化冲突（40001）重试 3 次、间隔 50ms（`backend/internal/db/pool.go` `WithTxDeferrable`）。
 - 注销把家庭关系与用户数据放在**同一事务**，DB 提交后不可逆。
 
 ### 6.3 锁与幂等
@@ -371,10 +372,10 @@
 
 | 限流器 | 阈值 | 作用范围 | 实现位置 |
 |---|---|---|---|
-| 全局公开限流 | 60 次 / 分钟 / IP | 所有公开路由 | `main.go:192` |
-| 注销接口限流 | 5 次 / 小时 / IP | `DELETE /auth/account` | `main.go:234` |
+| 全局公开限流 | 60 次 / 分钟 / IP | 所有公开路由 | `main.go:209` |
+| 注销接口限流 | 5 次 / 小时 / IP | `DELETE /auth/account` | `main.go:251` |
 | `/invite/resolve` 限流 | 60 次 / 小时 / IP | 邀请码解析 | `invite/handler.go` |
-| `/health/live`、`/health/ready` 限流 | 30 次 / 分钟 / IP | 健康检查 | `main.go:183` |
+| `/health/live`、`/health/ready`、`/health` 限流 | 30 次 / 分钟 / IP | 健康检查 | `main.go:200-203` |
 
 - 限流算法：进程内滑动窗口（`slidingWindowLimiter`），不跨进程共享；Redis 挂掉不影响限流。
 - 真实 IP 仅在 `RemoteAddr` 命中 `TRUSTED_PROXY_CIDR` 时才解析 `X-Forwarded-For` / `X-Real-IP`（防伪造绕过）。解析规则：**从 XFF 右端向左取第一个「可解析且非私网」的 IP**（跳过空段/非法/私网）；XFF 无命中时回退 `X-Real-IP`（同样要求非私网）；再回退 `RemoteAddr`。
@@ -408,8 +409,8 @@
 
 ### 6.8 后台任务（本域）
 
-- 新用户默认头像 marker 生成：`safe.Go`，超时 `avatar.GenerateMarkerTimeout`（`auth/handler.go:657`）。
-- 注销后清理：`safe.Go`，`context.Background()+5min`（`auth/handler.go:481`）。
+- 新用户默认头像 marker 生成：`safe.Go`，超时 `avatar.GenerateMarkerTimeout`（`auth/handler.go:648`）。
+- 注销后清理：`safe.Go`，`context.Background()+5min`（`auth/handler.go:473`）。
 - 注销后未被清理的物理文件由后台孤儿文件清理任务回收（其它分册）。
 - 注销事务提交后才异步删除相关成员 session，提交后数秒内这些 session 仍可能通过校验。
 - 本域**没有**独立的定时任务；残留 session 依赖 TTL 自然过期。
@@ -420,7 +421,7 @@
 
 | 页面 / 模块 | 行为 |
 |---|---|
-| `utils/auth.ts` | `login()`：本地有 session 先 `GET /user/profile` 校验，失败清 session；否则 `wx.login` → `POST /auth/login`（带 `inviter`，超时 20s）；成功存 sessionId、写 `baseInfo`；`newUser` → 领免费 VIP + 跳 Guide；有 `pendingLinkId` → 跳 Family |
+| `utils/auth.ts` | `login()`：本地有 session 先 `GET /user/profile` 校验，失败清 session；否则 `wx.login` → `POST /auth/login`（带 `inviter`，超时 20s）；成功存 sessionId、写 `baseInfo`；`newUser` → 前端兜底调 `POST /vip/new-user`（trial 已于注册事务发放，正常流程 409 `TRIAL_VIP_ALREADY_CLAIMED` 吞掉）+ 跳 Guide；有 `pendingLinkId` → 跳 Family |
 | `utils/http.ts` | 每个请求加 `Authorization: Bearer <sessionId>` 与 `Accept-Language`；HTTP 401 → `clearSessionId()`（`skipAuthExpire` 场景除外）；private 模式另加 `X-Private-Api-Key` |
 | `utils/storage.ts` | sessionId 键 `papafeiji:sessionId`；`pendingLinkId`（7 天过期）；`pendingInviter` |
 | `pages/index/index.ts` | `onLoad` 解析 `option.inviter` / `option.scene`；`/invite/resolve` 最多等 1.5s；已有登录态时调 `POST /auth/inviter` 补绑；`ensureLogin` 先用 `/user/profile` 校验 |
@@ -439,11 +440,11 @@
 | `REDIS_ADDR` | Redis（session / token 缓存） | 必填（`NewSessionManager(nil)` 会 panic） |
 | `WECHAT_APPID` / `WECHAT_SECRET` | 小程序登录 / 手机号 / 二维码 | SaaS 模式必填（成对回退内置值仅限开源版） |
 | `DEPLOYMENT_MODE` | `saas`（默认）/ `open` | 开源版启用 OpenAuth 与自动 migration |
-| `TRUSTED_PROXY_CIDR` | 可信代理 CIDR（逗号分隔） | 为空则直接信任 `RemoteAddr` |
+| `TRUSTED_PROXY_CIDR` | 可信代理 CIDR（逗号分隔） | 为空则直接信任 `RemoteAddr`；非法/空段会启动校验失败（`config.validate`） |
 | `WORKER_SECRET` | 经 api-worker 中转流量的共享密钥（`X-Worker-Secret`） | **SaaS 必填**（空则启动校验失败）；open 模式必须留空 |
 | `OPEN_API_KEY` | 开源版 API Key | open 模式使用 |
 | `STORAGE_LOCAL_PATH` | 本地文件根目录 | 默认 `/opt/pathmemos/uploads` |
-| `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` / `OSS_ENDPOINT` / `OSS_BUCKET` / `OSS_PUBLIC_URL` | OSS 存储 | all-or-nothing：任一非空即要求全套五变量齐备（否则启动校验失败，见 config.validate）；均空则本地存储兜底 |
+| `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` / `OSS_ENDPOINT` / `OSS_BUCKET` / `OSS_PUBLIC_URL` | OSS 存储 | all-or-nothing：五项中任一非空（含单独设置 `OSS_PUBLIC_URL`）即要求 `OSS_ACCESS_KEY_ID`/`OSS_ACCESS_KEY_SECRET`/`OSS_ENDPOINT`/`OSS_BUCKET` 四项齐备（否则启动校验失败，见 config.validate）；`OSS_PUBLIC_URL` 为文件对外基址回退（`STORAGE_PUBLIC_BASE_URL` 优先）；均空则本地存储兜底 |
 
 ### 8.2 Redis key（本域）
 
@@ -459,8 +460,9 @@
 
 - `deploy/delete-user.sh <phone>`：本地编译 `backend/cmd/admin` 并上传，远端以 app 镜像运行一次性容器执行（`docker compose run --rm --no-deps --entrypoint <admin 二进制> app`，`TARGET_PHONE` 经 `-e` 注入）；默认先备份数据库（可 `--no-backup`），二次确认可 `--force` 跳过。
 - `cmd/admin/main.go`：按 `phone_number` 查用户 → `sessions.DeleteAll` → `familyService.DeleteAccount` → 2 分钟超时内 `CleanupAfterAccountDeletion`。删除失败（含 Redis）**不降级、直接退出**。
+- `cmd/admin jobs status`：读 Redis `job:last_success:{task}` / `job:last_failure:{task}` / `job:fail_streak:{task}` 打印每任务状态；`cmd/admin job run <name>`：写 `job:trigger:<name>`，由常驻 app 每分钟消费执行同名任务（`KnownJobNames` 共 10 项）。`deploy/delete-user.sh` 未封装这两个子命令。
 
 ### 8.4 迁移与门禁
 
-- 迁移基线为 `000001_baseline`（已 squash），当前最大编号 `000006_drop_sys_configs`。本域相关表（`users`/`user_invites`/`user_invite_codes`/`wx_mp_accounts`）定义均在 000001 基线；000004 仅新增 `client_ops_logs`。
+- 迁移基线为 `000001_baseline`（已 squash），当前最大编号 `000011_user_invites_inviter_set_null`。本域相关表（`users`/`user_invites`/`user_invite_codes`/`wx_mp_accounts`）定义均在 000001 基线；000004 仅新增 `client_ops_logs`；000008 变更 `user_invites`（补 `user_open_id` 与部分唯一索引、`user_id` 改 SET NULL 可空）；000010 补 `user_vip_claims.user_id` 可空；000011 将 `user_invites.inviter_id` 改 SET NULL 可空。
 - 本域相关表变更须配对 `.down.sql` 并同步 L4 文档；改 SQL 后跑 `make sqlc-generate` + `make check-sqlc-sync`。

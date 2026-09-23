@@ -24,3 +24,8 @@ backups/
 uploads/
 caddy_data/
 install-info.txt
+# 官网静态站（papafeiji.cn，随 deploy.sh 部署）
+website/node_modules/
+website/out/
+website/.astro/
+deploy/key/

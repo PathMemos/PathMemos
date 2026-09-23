@@ -48,7 +48,7 @@ func (h *Handler) ListPaidVIP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var data []map[string]interface{}
+	data := make([]map[string]interface{}, 0, len(rows))
 	for _, v := range rows {
 		data = append(data, vipToMap(v))
 	}
@@ -66,7 +66,7 @@ func (h *Handler) ListFreeVIP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var data []map[string]interface{}
+	data := make([]map[string]interface{}, 0, len(rows))
 	for _, v := range rows {
 		data = append(data, map[string]interface{}{
 			"id":   v.ID,

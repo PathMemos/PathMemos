@@ -1,4 +1,4 @@
-.PHONY: build dev migrate-up migrate-down sqlc-generate check-sqlc-sync lint lint-go lint-frontend lint-worker test test-frontend test-worker clean
+.PHONY: build build-website dev migrate-up migrate-down sqlc-generate check-sqlc-sync lint lint-go lint-frontend lint-worker test test-frontend test-worker clean
 
 build-linux:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/pathmemos ./backend/cmd/server
@@ -7,6 +7,10 @@ build-local:
 	go build -o bin/pathmemos ./backend/cmd/server
 
 build: build-linux
+
+# 官网静态站（papafeiji.cn）本地构建验证；生产由 deploy/deploy.sh 在控制机构建并同步。
+build-website:
+	cd website && npm ci --no-audit --no-fund && npm run build
 
 dev:
 	go run ./backend/cmd/server

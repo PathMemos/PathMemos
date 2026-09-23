@@ -300,9 +300,10 @@ func (h *Handler) UpdateCommonAddressName(w http.ResponseWriter, r *http.Request
 	ctx := r.Context()
 	userID := middleware.UserID(ctx)
 
-	// chi.URLParam 返回的是已解码的路径参数，不能再做 PathUnescape：
-	// 含 "%" 的地址名（如 "100%棉"）会被二次解码报错或改写。
-	name := chi.URLParam(r, "name")
+	// 必须通过 middleware.URLParam 取参：chi 在 r.URL.RawPath 非空时按原始路径匹配，
+	// encodeURIComponent 不转义、而 Go 默认转义会改写的 ! * ' ( ) 会让 chi.URLParam
+	// 返回仍带编码的值（如 "源头日记(诺德财富中心A座店)"），导致按名字查库 404。
+	name := middleware.URLParam(r, "name")
 	if name == "" {
 		middleware.JSONError(w, r, http.StatusBadRequest, errors.CodeBadRequest, "invalid name")
 		return

@@ -11,6 +11,26 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countAutoRecordCandidates = `-- name: CountAutoRecordCandidates :one
+SELECT count(*)::bigint
+FROM users u
+JOIN user_vips v ON v.user_id = u.id
+WHERE u.auto_record_enabled = true
+  AND v.expire_time > now()
+  AND EXISTS (
+      SELECT 1 FROM auto_record_trajectories t
+      WHERE t.user_id = u.id AND t.geocode_attempts < $1
+  )
+`
+
+// R-01：候选积压量（满批时才统计），超过阈值输出 auto_record_backlog_warn。
+func (q *Queries) CountAutoRecordCandidates(ctx context.Context, maxGeocodeAttempts int32) (int64, error) {
+	row := q.db.QueryRow(ctx, countAutoRecordCandidates, maxGeocodeAttempts)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const deleteStaleTrajectories = `-- name: DeleteStaleTrajectories :execrows
 DELETE FROM auto_record_trajectories
 WHERE id IN (
@@ -134,25 +154,31 @@ func (q *Queries) ListAbnormalAlertCandidates(ctx context.Context, arg ListAbnor
 	return items, nil
 }
 
-const listPendingAutoRecordUsers = `-- name: ListPendingAutoRecordUsers :many
+const listAutoRecordCandidates = `-- name: ListAutoRecordCandidates :many
 SELECT u.id AS user_id
 FROM users u
 JOIN user_vips v ON v.user_id = u.id
-JOIN (
-    SELECT user_id, COUNT(*) AS cnt
-    FROM auto_record_trajectories
-    WHERE created_at > now() - interval '7 days' -- 覆盖 7 天清理窗口，避免 >3 天旧轨迹在清理前失去处理机会
-    GROUP BY user_id
-) t ON t.user_id = u.id
 WHERE u.auto_record_enabled = true
   AND v.expire_time > now()
-ORDER BY t.cnt DESC
-LIMIT $1
+  AND u.id > $1
+  AND EXISTS (
+      SELECT 1 FROM auto_record_trajectories t
+      WHERE t.user_id = u.id AND t.geocode_attempts < $2
+  )
+ORDER BY u.id ASC
+LIMIT $3
 `
 
-// B2-13：以聚合 JOIN 替代 EXISTS + 相关子查询计数，避免每行重复扫描轨迹表。
-func (q *Queries) ListPendingAutoRecordUsers(ctx context.Context, limit int32) ([]string, error) {
-	rows, err := q.db.Query(ctx, listPendingAutoRecordUsers, limit)
+type ListAutoRecordCandidatesParams struct {
+	CursorID           string `json:"cursorId"`
+	MaxGeocodeAttempts int32  `json:"maxGeocodeAttempts"`
+	MaxUsers           int32  `json:"maxUsers"`
+}
+
+// R-01：公平轮转——按 user_id keyset 分页，替代「按积压量 ORDER BY cnt DESC」避免低频用户饥饿；
+// 仅取仍有未达重试上限轨迹的用户（R-02）。
+func (q *Queries) ListAutoRecordCandidates(ctx context.Context, arg ListAutoRecordCandidatesParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, listAutoRecordCandidates, arg.CursorID, arg.MaxGeocodeAttempts, arg.MaxUsers)
 	if err != nil {
 		return nil, err
 	}
@@ -174,17 +200,20 @@ func (q *Queries) ListPendingAutoRecordUsers(ctx context.Context, limit int32) (
 const listTrajectoriesByUser = `-- name: ListTrajectoriesByUser :many
 SELECT id, user_id, lat, lon, recorded_at, geocode_attempts, created_at FROM auto_record_trajectories
 WHERE user_id = $1
+  AND geocode_attempts < $2
 ORDER BY recorded_at ASC
-LIMIT $2
+LIMIT $3
 `
 
 type ListTrajectoriesByUserParams struct {
-	UserID string `json:"userId"`
-	Limit  int32  `json:"limit"`
+	UserID             string `json:"userId"`
+	MaxGeocodeAttempts int32  `json:"maxGeocodeAttempts"`
+	MaxRows            int32  `json:"maxRows"`
 }
 
+// R-02：排除达到逆地理重试上限的终态轨迹，避免其每轮重复聚类/告警（保留至 7 天清理）。
 func (q *Queries) ListTrajectoriesByUser(ctx context.Context, arg ListTrajectoriesByUserParams) ([]AutoRecordTrajectory, error) {
-	rows, err := q.db.Query(ctx, listTrajectoriesByUser, arg.UserID, arg.Limit)
+	rows, err := q.db.Query(ctx, listTrajectoriesByUser, arg.UserID, arg.MaxGeocodeAttempts, arg.MaxRows)
 	if err != nil {
 		return nil, err
 	}

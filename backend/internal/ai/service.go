@@ -11,6 +11,7 @@ import (
 	"log/slog"
 
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -136,6 +137,22 @@ func NewService(pool *db.Pool, rdb *redis.Client, vipService vip.InfoProvider, s
 
 func (s *Service) sysCfg(ctx context.Context) (*config.SysConfig, error) {
 	return s.sysCfgLoader.Load(ctx)
+}
+
+// logUpstreamAlert 限频输出 AI 上游告警关键字（5 分钟一次），由 alert-watch 捕获推送。
+// 上游故障在此前完全不可见（用户只看到对话失败），这是其唯一观测面（R-19）。
+var lastUpstreamAlertUnixMilli atomic.Int64
+
+func logUpstreamAlert(ctx context.Context, err error) {
+	now := time.Now().UnixMilli()
+	last := lastUpstreamAlertUnixMilli.Load()
+	if last != 0 && now-last < 5*60*1000 {
+		return
+	}
+	if !lastUpstreamAlertUnixMilli.CompareAndSwap(last, now) {
+		return
+	}
+	slog.ErrorContext(ctx, "alert=ai_upstream_error", slog.Any("error", err))
 }
 
 // Chat runs a complete AI chat turn. If onChunk is non-nil it is called for each streamed chunk.
@@ -286,6 +303,8 @@ func (s *Service) chatWithPrompt(ctx context.Context, userID, message string, on
 
 	stream, err := s.client.Stream(streamCtx, sysCfg.AIBaseURL, sysCfg.AIModel, sysCfg.AIThinkingType, sysCfg.AIMaxTokens, messages)
 	if err != nil {
+		// 连接失败/非 200：上游不可用的第一现场，限频告警。
+		logUpstreamAlert(ctx, err)
 		safe.Go(ctx, nil, func() { s.refundDailyQuota(userID, quotaDate) })
 		return "", fmt.Errorf("upstream stream: %w", err)
 	}
@@ -334,6 +353,8 @@ func (s *Service) chatWithPrompt(ctx context.Context, userID, message string, on
 			}
 
 			if fullReply.Len() == 0 {
+				// 中途流错误且无任何回复：上游故障，限频告警（超时/取消已在上方分支返回）。
+				logUpstreamAlert(ctx, err)
 				safe.Go(ctx, nil, func() { s.refundDailyQuota(userID, quotaDate) })
 			}
 			if fullReply.Len() > 0 {
@@ -359,6 +380,13 @@ func (s *Service) chatWithPrompt(ctx context.Context, userID, message string, on
 	}
 
 	reply = fullReply.String()
+	if promptTokens, completionTokens := stream.Usage(); promptTokens > 0 || completionTokens > 0 {
+		// B3 成本观测：上游回报的 token 用量（尽力而为的日志，不落库），供 ai-cost.sh 汇总。
+		slog.InfoContext(ctx, "ai chat usage",
+			slog.String("user_id", userID),
+			slog.Int("prompt_tokens", promptTokens),
+			slog.Int("completion_tokens", completionTokens))
+	}
 	if reply != "" {
 		s.saveLogAsync(ctx, userID, msg, reply)
 	} else {
@@ -434,6 +462,9 @@ func (s *Service) tryConsumeDailyQuota(ctx context.Context, userID string, quota
 	// 缓存 TTL 按自然日，避免跨天计数与 DB 权威值不一致。
 	ttlSeconds := int(dailyQuotaCacheTTLFor(quotaDate).Seconds())
 	redisCur, err := dailyQuotaLua.Run(ctx, s.rdb, []string{key}, quota, ttlSeconds).Int64()
+	// 仅在闸门 Lua 成功 incr 后才允许回补 Decr：Redis 故障 fail-open 时 key 未创建，
+	// 无条件 Decr 会造出无 TTL 的 -1 持久键（多得一次配额偏差且旧日期键永久残留）。
+	gateIncr := false
 	if err != nil {
 		// Redis 辅助闸门故障时降级放行（fail-open）：DB 每日配额（IncrementAIDailyQuotaUsed 的
 		// WHERE used<quota 原子条件扣减）仍是权威限制，配额不会因 Redis 抖动被绕过；
@@ -444,6 +475,8 @@ func (s *Service) tryConsumeDailyQuota(ctx context.Context, userID string, quota
 			slog.Any("error", err))
 	} else if redisCur <= 0 {
 		return false, nil
+	} else {
+		gateIncr = true
 	}
 
 	// 数据库为根本：原子扣减并返回扣减后的使用量及是否实际发生扣减。
@@ -454,12 +487,16 @@ func (s *Service) tryConsumeDailyQuota(ctx context.Context, userID string, quota
 	})
 	if err != nil {
 		// DB 异常时回补 Redis，避免 Redis 计数领先于 DB。
-		_ = s.rdb.Decr(ctx, key).Err() //nolint:errcheck // redis rollback is best-effort
+		if gateIncr {
+			_ = s.rdb.Decr(ctx, key).Err() //nolint:errcheck // redis rollback is best-effort
+		}
 		return false, fmt.Errorf("increment ai daily quota used: %w", err)
 	}
 	if !incrResult.Incremented {
 		// DB 未实际扣减（已超限），回补 Redis 辅助缓存。
-		_ = s.rdb.Decr(ctx, key).Err() //nolint:errcheck // redis rollback is best-effort
+		if gateIncr {
+			_ = s.rdb.Decr(ctx, key).Err() //nolint:errcheck // redis rollback is best-effort
+		}
 		return false, nil
 	}
 

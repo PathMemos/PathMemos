@@ -2,7 +2,7 @@
 
 > 全平台能力实时清单（按域分组）。新增/变更能力时同步本条（见 [`spec-standards.md`](spec-standards.md) §一、§九）。
 > 行为细节以对应 L2 分册为准；本表只做**能力登记 + 测试映射**。
-> 测试/验收口径（2026-09 所有者决策）：自动化仅**后端 Go 单测**；小程序/Worker/端到端为**人工验收**（L7 场景号）。存量前端 Jest / Worker vitest 为资产、非门禁。
+> 测试/验收口径：自动化仅**后端 Go 单测**；小程序/Worker/端到端为**人工验收**（L7 场景号）。存量前端 Jest / Worker vitest 为资产、非门禁。
 > 状态：V2.1（以当前代码为唯一事实源）。
 
 ## 认证 / 账号（02a）
@@ -44,6 +44,7 @@
 | 逆地理编码 | `GET /location/reverse` | location/client_test.go |
 | 常用地址替换 / 摘要 | autorecord、后台任务 | — |
 | 自动成文（后台 + 首次即时，互斥锁） | `POST /diary/details/auto` | diary/auto_lock_test.go |
+| 候选公平轮转 / 逆地理终态 | keyset 游标 `job:cursor:auto_record`；`geocode_attempts>=10` 终态排除 | autorecord/scheduler_test.go |
 | 新地点提醒 / 异常告警 | 后台任务 | — |
 | 轨迹清理（7 天） | 后台任务 | — |
 
@@ -52,7 +53,7 @@
 | 能力 | 入口 / 实现 | 测试/验收 |
 |------|------------|------------|
 | 家庭信息 / 创建 / 解散 | `GET/POST/DELETE /family` | — |
-| 邀请链接生成 / 加入 / 奖励 | `POST /family/invite-link`、`/family/invite-link/join` | — |
+| 邀请链接生成 / 加入 / 奖励（奖励窗口统一注册后 7 天；被邀请奖励按 openid 终身一次） | `POST /family/invite-link`、`/family/invite-link/join` | — |
 | 退出 / 移除成员 | `POST /family/leave`、`DELETE /family/members/{userId}` | — |
 | 个人邀请短码解析 / 列表 | `GET /invite/resolve`、`/invite/list` | invite/qrcode_test.go |
 | 个人邀请二维码 | `POST /invite/qrcode` | — |
@@ -63,7 +64,7 @@
 |------|------------|------------|
 | VIP 查询 | `GET /user/vip`、`GET /vip` | — |
 | 新用户试用自动领取 | `POST /vip/new-user` | vip/service_test.go |
-| 免费 VIP 领取 / 查重 | `GET /vip/free`、`POST /vip/free/claim`、`GET /vip/free/check` | — |
+| 免费 VIP 领取 / 查重（trial/free 按微信主体 openid 终身一次，注销墓碑行防重注册重领；check 优先按 openid 判） | `GET /vip/free`、`POST /vip/free/claim`、`GET /vip/free/check` | vip/service_test.go |
 | 虚拟支付下单（沙箱闸门） | `POST /payment/virtual/request` | payment/request_test.go |
 | 回调验签解密 + receive_id 校验 | `POST /api/prod/payment/virtualPayNotify` | payment/notify_crypto_test.go |
 | 幂等发货 / 已关闭订单补发 | payment/service.go | payment/handler_test.go |
@@ -75,8 +76,9 @@
 | 能力 | 入口 / 实现 | 测试/验收 |
 |------|------------|------------|
 | 小程序 SSE 对话 | `POST /ai/chat`（:8081） | ai/replay_test.go |
+| SSE 连接治理（心跳/并发上限/断连释放） | ai/handler.go；`SSE_MAX_CONNS`（默认 200）、单用户 2 | ai/sse_limiter_test.go |
 | 断线重连幂等（request_id + reply 缓存） | ai/service.go | ai/replay_test.go |
-| 公众号对话 | `/wx/callback` | 人工（L7 F7 步骤 5~9） |
+| 公众号对话 | `/wx/callback` | 人工（L7 F7 步骤 6~10） |
 | 每日配额扣减 / 退款 | ai/service.go | — |
 | 上下文组装（背景截断 2 万 runes） | ai/service.go | ai/service_test.go |
 | 前端 AI 抽屉 | components/AIDrawer | 人工（L7 F7；存量 AIDrawer.test.ts 非门禁） |
@@ -117,6 +119,13 @@
 | 健康检查（live / ready / 兼容别名 `/health`） | `GET /health/live`、`GET /health/ready`、`GET /health` | — |
 | 能力探测 | `GET /system/config` | — |
 | 限流（IP / Key / 会话配额，统一 429 `code=4290`+`biz_code=RATE_LIMITED`） | middleware | — |
-| 访问日志 / 客户端运维日志 | middleware、`POST /ops/client-log`（保留 30 天） | — |
-| 后台任务（自动记录/告警/关单/清理/AI 日志/客户端日志，共 10 项（含 purge_deleted_objects，ADR-0013），PG advisory lock 互斥） | jobs/runner.go | — |
-| 部署契约 | deploy/deploy.sh | — |
+| 访问日志（`route`/`duration_ms`）+ 客户端运维日志 | middleware、`POST /ops/client-log`（保留 30 天）；`scripts/accesslog-p95.sh` 统计分位 | — |
+| 后台任务（自动记录/告警/关单/清理/AI 日志/客户端日志，共 10 项（含 purge_deleted_objects，ADR-0013），PG advisory lock 互斥；auto_record 同日去重集合化、成文失败保留轨迹下轮重试） | jobs/runner.go | — |
+| 后台任务观测 / 失联检测 / 人工补跑 | Redis `job:last_success\|last_failure\|fail_streak:{task}`；`job_stale`（>3× 周期）；`papafeiji-admin jobs status` / `job run <name>` | jobs/runner_test.go |
+| 部署契约（零停机分层切换） | deploy/deploy.sh | — |
+| Cloudflare 入口自动装配（API/官网域名 A 记录 DNS-only 装配 + api/mcp Worker 自动部署与 secret 同源同步，`--skip-workers` 可跳过） | deploy/deploy.sh | — |
+| OSS 连接自检（五项成组校验、bucket 缺失自动创建、默认静态资源上传） | deploy/deploy.sh | — |
+| 官网静态站（`papafeiji.cn`/`www`，Astro 构建产物随部署发布，nginx 按 Host 与 API 共用端口；证书 certbot 独立 lineage；构建失败仅警告跳过、不阻断后端部署） | `website/`、deploy/deploy.sh、deploy/nginx/*.conf | — |
+| 告警通道（随部署装配：alert-cron 每 2 分钟 / alert-p95 每 15 分钟 / cert-check 每小时 / 控制机 uptime-check / watchdog 容器 CPU 异常 `papafeiji_cpu_high`；`CFG_ALERT_WEBHOOK_URL` 强烈建议必配） | scripts/alert-cron.sh、alert-p95.sh、deploy/cert-check.sh、scripts/uptime-check.sh、deploy/watchdog.sh（ADR-0015） | — |
+| L7 滥用防护（nginx 限流 + 单 IP 连接上限 + fail2ban 限流打穿自动封禁） | deploy/nginx/default.conf、deploy/deploy.sh 远端 fail2ban jail 装配 | — |
+| 慢 SQL 榜单 / 迁移预演 / AI 成本观测 | scripts/sql-top.sh（pg_stat_statements，迁移 000007）、scripts/rehearse-migration.sh、scripts/ai-cost.sh（`msg="ai chat usage"` 日志） | — |

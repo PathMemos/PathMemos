@@ -54,10 +54,15 @@ Page({
     (this as any)._safeSetData({ isPrivateBackend: getBackendMode() === 'private' });
     try {
       await request.login((this as any)._cancelToken);
-    } catch (e) {
-      logger.error('user page login failed', e);
-      if (!this._isDestroyed && !this._isHidden) {
-        wx.showToast({ title: (this as any).$t('error.DEFAULT'), icon: 'none', duration: 2000 });
+    } catch (e: any) {
+      // request:abort 是 onShow 取消上一次登录 / 切页导致的正常取消（登录是写操作，
+      // 由 onShow/onUnload 管理取消）。此时不得提示「操作失败」，否则每次返回
+      // 个人中心都可能误报（与其它页面一致）。
+      if (e?.message !== 'request:abort') {
+        logger.error('user page login failed', e);
+        if (!this._isDestroyed && !this._isHidden) {
+          wx.showToast({ title: (this as any).$t('error.DEFAULT'), icon: 'none', duration: 2000 });
+        }
       }
     }
     if (this._isDestroyed || this._isHidden) return;

@@ -85,6 +85,15 @@ func userVipRows(id, userID string, begin, expire time.Time) *pgxmock.Rows {
 	}).AddRow(id, userID, begin, expire, time.Now())
 }
 
+func claimantUserRow(openID string) *pgxmock.Rows {
+	return pgxmock.NewRows([]string{
+		"id", "open_id", "unionid", "phone_number", "avatar", "avatar_file_id", "nickname",
+		"user_type", "phone_bind_time", "auto_record_enabled", "personal_family_id",
+		"current_family_id", "invited_by", "lang", "created_at", "updated_at",
+		"abnormal_subscribe_accepted", "last_active_at",
+	}).AddRow("u1", openID, nil, nil, nil, nil, nil, "normal", nil, false, nil, nil, nil, "zh", nil, nil, false, nil)
+}
+
 // TestActivateVIPWithTx_TrialSecondClaim 领取防重：同一用户二次领取试用 VIP 必须被拒绝（C4 核心业务）。
 func TestActivateVIPWithTx_TrialSecondClaim(t *testing.T) {
 	mock, err := pgxmock.NewPool()
@@ -96,8 +105,11 @@ func TestActivateVIPWithTx_TrialSecondClaim(t *testing.T) {
 	mock.ExpectQuery("vips WHERE id = \\$1").
 		WithArgs("vip-trial-0001").
 		WillReturnRows(vipRows(mock, "vip-trial-0001", "trial", "day", 7))
+	mock.ExpectQuery("FROM users WHERE id = \\$1").
+		WithArgs("u1").
+		WillReturnRows(claimantUserRow("openid-u1"))
 	mock.ExpectExec("INSERT INTO user_vip_claims").
-		WithArgs(pgxmock.AnyArg(), "u1", "vip-trial-0001").
+		WithArgs(pgxmock.AnyArg(), pgtype.Text{String: "u1", Valid: true}, "vip-trial-0001", pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("INSERT", 0)) // ON CONFLICT DO NOTHING → 0 行
 
 	s := &Service{}
@@ -121,8 +133,11 @@ func TestActivateVIPWithTx_NewUser(t *testing.T) {
 	mock.ExpectQuery("vips WHERE id = \\$1").
 		WithArgs("vip-month-0001").
 		WillReturnRows(vipRows(mock, "vip-month-0001", "month", "month", 1))
+	mock.ExpectQuery("FROM users WHERE id = \\$1").
+		WithArgs("u1").
+		WillReturnRows(claimantUserRow("openid-u1"))
 	mock.ExpectExec("INSERT INTO user_vip_claims").
-		WithArgs(pgxmock.AnyArg(), "u1", "vip-month-0001").
+		WithArgs(pgxmock.AnyArg(), pgtype.Text{String: "u1", Valid: true}, "vip-month-0001", pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectQuery("FROM user_vips WHERE user_id = \\$1 FOR UPDATE").
 		WithArgs("u1").
@@ -163,8 +178,11 @@ func TestActivateVIPWithTx_ExtendFromExpire(t *testing.T) {
 	mock.ExpectQuery("vips WHERE id = \\$1").
 		WithArgs("vip-month-0001").
 		WillReturnRows(vipRows(mock, "vip-month-0001", "month", "month", 1))
+	mock.ExpectQuery("FROM users WHERE id = \\$1").
+		WithArgs("u1").
+		WillReturnRows(claimantUserRow("openid-u1"))
 	mock.ExpectExec("INSERT INTO user_vip_claims").
-		WithArgs(pgxmock.AnyArg(), "u1", "vip-month-0001").
+		WithArgs(pgxmock.AnyArg(), pgtype.Text{String: "u1", Valid: true}, "vip-month-0001", pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectQuery("FROM user_vips WHERE user_id = \\$1 FOR UPDATE").
 		WithArgs("u1").
@@ -199,8 +217,11 @@ func TestActivateVIPWithTx_ExpiredRestartsFromNow(t *testing.T) {
 	mock.ExpectQuery("vips WHERE id = \\$1").
 		WithArgs("vip-month-0001").
 		WillReturnRows(vipRows(mock, "vip-month-0001", "month", "month", 1))
+	mock.ExpectQuery("FROM users WHERE id = \\$1").
+		WithArgs("u1").
+		WillReturnRows(claimantUserRow("openid-u1"))
 	mock.ExpectExec("INSERT INTO user_vip_claims").
-		WithArgs(pgxmock.AnyArg(), "u1", "vip-month-0001").
+		WithArgs(pgxmock.AnyArg(), pgtype.Text{String: "u1", Valid: true}, "vip-month-0001", pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectQuery("FROM user_vips WHERE user_id = \\$1 FOR UPDATE").
 		WithArgs("u1").
@@ -247,6 +268,62 @@ func TestExtendVIPDaysWithTx_NewUserClaimsRow(t *testing.T) {
 	s := &Service{}
 	if err := s.ExtendVIPDaysWithTx(context.Background(), "u1", 7, sqlc.New(mock)); err != nil {
 		t.Fatalf("extend failed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestHasVIPClaim_ByOpenID R-21：/vip/free/check 按微信主体判重——注销重注册后（新 user_id、同 openid）仍返回已领取。
+func TestHasVIPClaim_ByOpenID(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery("FROM users WHERE id = \\$1").
+		WithArgs("u1").
+		WillReturnRows(claimantUserRow("openid-u1"))
+	mock.ExpectQuery("user_vip_claims WHERE open_id = \\$1").
+		WithArgs(pgtype.Text{String: "openid-u1", Valid: true}, "vip-free-0001").
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+
+	s := &Service{}
+	claimed, err := s.hasVIPClaimWithQ(context.Background(), sqlc.New(mock), "u1", "vip-free-0001")
+	if err != nil {
+		t.Fatalf("HasVIPClaim failed: %v", err)
+	}
+	if !claimed {
+		t.Fatal("want claimed=true by openid")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestHasVIPClaim_FallbackUserID R-21：openid 缺失（异常数据）时回退 user_id 维度判重。
+func TestHasVIPClaim_FallbackUserID(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery("FROM users WHERE id = \\$1").
+		WithArgs("u1").
+		WillReturnRows(claimantUserRow(""))
+	mock.ExpectQuery("user_vip_claims WHERE user_id = \\$1").
+		WithArgs(pgtype.Text{String: "u1", Valid: true}, "vip-free-0001").
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
+
+	s := &Service{}
+	claimed, err := s.hasVIPClaimWithQ(context.Background(), sqlc.New(mock), "u1", "vip-free-0001")
+	if err != nil {
+		t.Fatalf("HasVIPClaim failed: %v", err)
+	}
+	if claimed {
+		t.Fatal("want claimed=false via user_id fallback")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)

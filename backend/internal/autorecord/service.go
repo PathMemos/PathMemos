@@ -3,7 +3,6 @@ package autorecord
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -19,7 +18,6 @@ import (
 	"papafeiji/backend/pkg/timeutil"
 	"papafeiji/backend/pkg/util"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/redis/go-redis/v9"
 )
@@ -30,6 +28,9 @@ const (
 	maxPendingPerUser     = 100
 	processWorkers        = 5
 	maxGeocodeAttempts    = 10
+	// R-01：候选 keyset 轮转游标与积压告警阈值。
+	autoRecordCursorKey            = "job:cursor:auto_record"
+	autoRecordBacklogWarnThreshold = 1000
 )
 
 type Service struct {
@@ -76,9 +77,35 @@ func (s *Service) HasActiveVIP(ctx context.Context, userID string) bool {
 }
 
 func (s *Service) ProcessRound(ctx context.Context) error {
-	userIDs, err := s.pool.Queries().ListPendingAutoRecordUsers(ctx, maxPendingPerUser)
+	// R-01：keyset 轮转游标；Redis 丢失只会从头再扫，不影响正确性（不变量 I2）。
+	cursor := ""
+	if s.rdb != nil {
+		if v, rerr := s.rdb.Get(ctx, autoRecordCursorKey).Result(); rerr == nil {
+			cursor = v
+		}
+	}
+	userIDs, err := s.candidateBatch(ctx, cursor)
 	if err != nil {
 		return fmt.Errorf("list pending users: %w", err)
+	}
+	next, wrapped := nextCursor(userIDs, cursor)
+	if wrapped {
+		userIDs, err = s.candidateBatch(ctx, "")
+		if err != nil {
+			return fmt.Errorf("list pending users (wrap): %w", err)
+		}
+		next, _ = nextCursor(userIDs, "")
+	}
+	if s.rdb != nil && next != cursor {
+		if werr := s.rdb.Set(ctx, autoRecordCursorKey, next, 0).Err(); werr != nil {
+			slog.WarnContext(ctx, "auto record cursor write failed", slog.Any("error", werr))
+		}
+	}
+	// 满批时统计候选总量，超过阈值告警（R-01）。
+	if len(userIDs) == int(maxPendingPerUser) {
+		if n, cerr := s.pool.Queries().CountAutoRecordCandidates(ctx, maxGeocodeAttempts); cerr == nil && n > autoRecordBacklogWarnThreshold {
+			slog.WarnContext(ctx, "auto_record_backlog_warn", slog.Int64("candidates", n), slog.Int("batch", len(userIDs)))
+		}
 	}
 
 	jobs := make(chan string, len(userIDs))
@@ -104,9 +131,28 @@ func (s *Service) ProcessRound(ctx context.Context) error {
 	wg.Wait()
 
 	if failed.Load() > 0 {
+		// R-19：轮次存在用户级失败（轨迹已保留、下轮重试），输出告警关键字供 alert-watch 捕获。
+		slog.ErrorContext(ctx, "alert=auto_record_failed", slog.Int("failed_users", int(failed.Load())))
 		return fmt.Errorf("auto record round completed with %d failures", failed.Load())
 	}
 	return nil
+}
+
+// candidateBatch 取一批候选用户（keyset，按 user_id 升序）。
+func (s *Service) candidateBatch(ctx context.Context, cursor string) ([]string, error) {
+	return s.pool.Queries().ListAutoRecordCandidates(ctx, sqlc.ListAutoRecordCandidatesParams{
+		CursorID:           cursor,
+		MaxGeocodeAttempts: maxGeocodeAttempts,
+		MaxUsers:           maxPendingPerUser,
+	})
+}
+
+// nextCursor 返回下一轮游标与是否回绕：满批取最后一个 id；空批且已有游标表示扫到尾部，回绕到起点。
+func nextCursor(batch []string, prev string) (string, bool) {
+	if len(batch) == 0 {
+		return "", prev != ""
+	}
+	return batch[len(batch)-1], false
 }
 
 func (s *Service) processUser(ctx context.Context, userID string) (err error) {
@@ -167,8 +213,9 @@ func (s *Service) processUser(ctx context.Context, userID string) (err error) {
 	}
 
 	rows, err := s.pool.Queries().ListTrajectoriesByUser(ctx, sqlc.ListTrajectoriesByUserParams{
-		UserID: userID,
-		Limit:  maxPendingPerUser,
+		UserID:             userID,
+		MaxGeocodeAttempts: maxGeocodeAttempts,
+		MaxRows:            maxPendingPerUser,
 	})
 	if err != nil {
 		return fmt.Errorf("list trajectories: %w", err)
@@ -195,8 +242,23 @@ func (s *Service) processUser(ctx context.Context, userID string) (err error) {
 		return s.pool.Queries().DeleteTrajectories(ctx, collectTrajectoryIDs(rows))
 	}
 
-	// 按日期缓存该用户当天的最后一条自动记录，去重只与当天最后一条比较
-	lastAutoEntries := make(map[string]sqlc.GetUserLastAutoEntryByDateRow)
+	// R-20（同日去重集合化）：按日期缓存当天全部自动条目的地址集合，候选与集合比较——
+	// 旧逻辑只与当天最后一条比较，同日折返旧地点（家→公司→家）会重复成文。
+	autoAddrSets := make(map[string]map[string]struct{})
+	autoAddrSetFor := func(recordDate string, date pgtype.Date) (map[string]struct{}, error) {
+		if set, ok := autoAddrSets[recordDate]; ok {
+			return set, nil
+		}
+		rows, err := s.pool.Queries().ListAutoEntryAddressesByDate(ctx, sqlc.ListAutoEntryAddressesByDateParams{
+			CreatedBy:  userID,
+			RecordDate: date,
+		})
+		if err != nil {
+			return nil, err
+		}
+		autoAddrSets[recordDate] = autoAddressSet(rows)
+		return autoAddrSets[recordDate], nil
+	}
 
 	toDelete := invalidIDs
 	var createdDates []string
@@ -280,36 +342,16 @@ func (s *Service) processUser(ctx context.Context, userID string) (err error) {
 			parsedDates[recordDate] = recordDateTime
 		}
 
-		lastAutoEntry, ok := lastAutoEntries[recordDate]
-		if !ok {
-			queried, err := s.pool.Queries().GetUserLastAutoEntryByDate(ctx, sqlc.GetUserLastAutoEntryByDateParams{
-				CreatedBy:  userID,
-				RecordDate: recordDateTime,
-			})
-			if err != nil {
-				if errors.Is(err, pgx.ErrNoRows) {
-					lastAutoEntries[recordDate] = sqlc.GetUserLastAutoEntryByDateRow{}
-					lastAutoEntry = lastAutoEntries[recordDate]
-				} else {
-					slog.ErrorContext(ctx, "auto record get last auto entry by date failed", slog.String("user_id", userID), slog.String("record_date", recordDate), slog.Any("error", err))
-					return err
-				}
-			} else {
-				lastAutoEntry = queried
-				lastAutoEntries[recordDate] = queried
-			}
-		}
-
-		_, dup, dupErr := IsSameAsLastAutoEntry(ctx, s.pool, userID, landmark, address, recordDateTime, &lastAutoEntry)
-		if dupErr != nil {
-			slog.ErrorContext(ctx, "auto record check duplicate failed, skip cluster",
+		addrSet, setErr := autoAddrSetFor(recordDate, recordDateTime)
+		if setErr != nil {
+			slog.ErrorContext(ctx, "auto record list auto entry addresses failed, skip cluster",
 				slog.String("user_id", userID),
 				slog.Int("index", idx),
 				slog.String("record_date", recordDate),
-				slog.Any("error", dupErr))
+				slog.Any("error", setErr))
 			continue
 		}
-		if dup {
+		if isDuplicateAutoAddress(addrSet, landmark, address) {
 			toDelete = append(toDelete, cluster.ids...)
 			continue
 		}
@@ -359,11 +401,12 @@ func (s *Service) processUser(ctx context.Context, userID string) (err error) {
 			continue
 		}
 
-		// 创建成功后更新缓存的当天 last auto entry，后续同日期 cluster 与它比较
-		lastAutoEntries[recordDate] = sqlc.GetUserLastAutoEntryByDateRow{
-			ID:            entryID,
-			Address:       pgtype.Text{String: landmark, Valid: true},
-			DetailAddress: pgtype.Text{String: address, Valid: address != ""},
+		// 创建成功后把新条目地址并入集合，同日后续 cluster 直接与集合比较
+		if landmark != "" {
+			addrSet[landmark] = struct{}{}
+		}
+		if address != "" {
+			addrSet[address] = struct{}{}
 		}
 
 		createdDates = append(createdDates, recordDate)
@@ -549,41 +592,68 @@ func uniqueStrings(ss []string) []string {
 	return result
 }
 
-// IsSameAsLastAutoEntry 检查当前驻点是否与指定日期当天最后一条自动记录重复。
-// last 为 nil 时会按日期查询；调用方可传入缓存的当天最后一条以减少查询。
-func IsSameAsLastAutoEntry(ctx context.Context, pool *db.Pool, userID string, landmark, address string, recordDate pgtype.Date, last *sqlc.GetUserLastAutoEntryByDateRow) (entryID string, ok bool, err error) {
-	var current *sqlc.GetUserLastAutoEntryByDateRow
-	if last == nil {
-		queried, err := pool.Queries().GetUserLastAutoEntryByDate(ctx, sqlc.GetUserLastAutoEntryByDateParams{
-			CreatedBy:  userID,
-			RecordDate: recordDate,
-		})
-		if err != nil {
-			if !errors.Is(err, pgx.ErrNoRows) {
-				slog.DebugContext(ctx, "auto record get last auto entry by date failed", slog.String("user_id", userID), slog.Any("error", err))
-				return "", false, err
+// FindDuplicateAutoEntry 在当天自动条目地址索引中查找同址条目（R-22：后台与手动即时成文共用同一判重语义）。
+// rows 须按 record_time DESC 排序（ListAutoEntryAddressesByDate 保证），首条命中即最新条目；
+// 返回已存在条目 id 供手动成文的响应契约使用（命中时直接返回既有条目）。
+func FindDuplicateAutoEntry(rows []sqlc.ListAutoEntryAddressesByDateRow, landmark, address string) (entryID string, dup bool) {
+	ids := make(map[string]string, len(rows)*2)
+	set := make(map[string]struct{}, len(rows)*2)
+	for _, r := range rows {
+		if r.Address.Valid && r.Address.String != "" {
+			if _, ok := set[r.Address.String]; !ok {
+				ids[r.Address.String] = r.ID
 			}
-			return "", false, nil
+			set[r.Address.String] = struct{}{}
 		}
-		current = &queried
-	} else if last.ID == "" {
-		// B4-05：调用方已缓存“当天无自动记录”的零值哨兵，直接返回不重复，避免重复查库。
-		return "", false, nil
-	} else {
-		current = last
+		if r.DetailAddress.Valid && r.DetailAddress.String != "" {
+			if _, ok := set[r.DetailAddress.String]; !ok {
+				ids[r.DetailAddress.String] = r.ID
+			}
+			set[r.DetailAddress.String] = struct{}{}
+		}
 	}
-	if current == nil || current.ID == "" {
-		return "", false, nil
+	if landmark != "" {
+		if id, ok := ids[landmark]; ok {
+			return id, true
+		}
 	}
-	if landmark != "" && current.Address.Valid && current.Address.String == landmark {
-		slog.DebugContext(ctx, "auto record same as last auto entry by landmark", slog.String("user_id", userID), slog.String("landmark", landmark))
-		return current.ID, true, nil
+	if address != "" {
+		if id, ok := ids[address]; ok {
+			return id, true
+		}
 	}
-	if address != "" && current.DetailAddress.Valid && current.DetailAddress.String == address {
-		slog.DebugContext(ctx, "auto record same as last auto entry by address", slog.String("user_id", userID), slog.String("address", address))
-		return current.ID, true, nil
+	return "", false
+}
+
+// autoAddressSet 把当天自动条目的地址查询结果折叠成去重集合（address 与 detail_address 的并集，去空）。
+func autoAddressSet(rows []sqlc.ListAutoEntryAddressesByDateRow) map[string]struct{} {
+	set := make(map[string]struct{}, len(rows)*2)
+	for _, r := range rows {
+		if r.Address.Valid && r.Address.String != "" {
+			set[r.Address.String] = struct{}{}
+		}
+		if r.DetailAddress.Valid && r.DetailAddress.String != "" {
+			set[r.DetailAddress.String] = struct{}{}
+		}
 	}
-	return "", false, nil
+	return set
+}
+
+// isDuplicateAutoAddress 判断候选驻点是否与当天已有自动条目同址。
+// 匹配规则与原「比最后一条」一致（landmark 对 address、详细地址对 detail_address），
+// 差别仅在比较范围扩为全天集合（R-20）。
+func isDuplicateAutoAddress(set map[string]struct{}, landmark, address string) bool {
+	if landmark != "" {
+		if _, ok := set[landmark]; ok {
+			return true
+		}
+	}
+	if address != "" {
+		if _, ok := set[address]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) vipInfo(ctx context.Context, userID string) bool {
@@ -642,22 +712,23 @@ func parseDate(s string) (time.Time, error) {
 	return t, nil
 }
 
-// handleGeocodeRetry 记录逆地理失败次数，但**从不删除轨迹**：暂时性故障（腾讯 API 宕机/
-// 配额耗尽）恢复后仍可生成驻点，轨迹由 7 天清理窗口统一回收，避免数据永久丢失（PPJ-C03）。
+// handleGeocodeRetry 累计逆地理失败次数并从不删除轨迹（PPJ-C03）。R-02：达到 maxGeocodeAttempts
+// 的轨迹成为终态，由 SQL（ListTrajectoriesByUser / 候选 EXISTS）排除，不再参与聚类与告警；
+// 仅在跨过上限的那一次记录 geocode_discarded，轨迹保留至 7 天清理窗口回收。
 func (s *Service) handleGeocodeRetry(ctx context.Context, rows []sqlc.AutoRecordTrajectory, clusterIDs []string, userID string) {
 	clusterSet := make(map[string]struct{}, len(clusterIDs))
 	for _, id := range clusterIDs {
 		clusterSet[id] = struct{}{}
 	}
 	for _, row := range rows {
-		if _, ok := clusterSet[row.ID]; ok && row.GeocodeAttempts >= maxGeocodeAttempts {
-			// 达到重试上限不删除轨迹：暂时性故障（腾讯 API 宕机/配额耗尽）恢复后仍可
-			// 生成驻点；轨迹由 7 天清理窗口（runCleanupTrajectories）统一回收，避免数据永久丢失。
-			slog.WarnContext(ctx, "auto record geocode retry limit reached, keep trajectory",
+		if _, ok := clusterSet[row.ID]; !ok {
+			continue
+		}
+		if row.GeocodeAttempts+1 >= maxGeocodeAttempts {
+			slog.WarnContext(ctx, "geocode_discarded",
 				slog.String("user_id", userID),
 				slog.String("traj_id", row.ID),
-				slog.Int64("attempts", int64(row.GeocodeAttempts)))
-			return
+				slog.Int("attempts", int(row.GeocodeAttempts+1)))
 		}
 	}
 	if incErr := s.pool.Queries().IncrementTrajectoryGeocodeAttempts(ctx, clusterIDs); incErr != nil {

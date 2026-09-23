@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"papafeiji/backend/pkg/timeutil"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -36,6 +38,15 @@ const (
 	lockPurgeDeletedObjects   = "lock:background:purge_deleted_objects"
 )
 
+// 任务运行观测（R-03）：Redis 记录最近成功/失败时间与连续失败次数；失联阈值为周期 × jobStaleMultiplier。
+const (
+	jobLastSuccessPrefix = "job:last_success:"
+	jobLastFailurePrefix = "job:last_failure:"
+	jobFailStreakPrefix  = "job:fail_streak:"
+	jobTriggerPrefix     = "job:trigger:"
+	jobStaleMultiplier   = 3
+)
+
 // maxPurgeBatchesPerRun 单轮最多刷新批数（20 × purge.MaxBatch = 1 万 URL/轮），其余留待下轮。
 const maxPurgeBatchesPerRun = 20
 
@@ -49,13 +60,16 @@ type Runner struct {
 	cfg         *config.Config
 	purgeQueue  *purge.Queue
 	purger      *purge.Purger
+	rdb         *redis.Client
+	jobs        map[string]time.Duration
+	jobsMu      sync.Mutex
 	wg          sync.WaitGroup
 	cancel      context.CancelFunc
 	tickersMu   sync.Mutex
 	tickers     []*time.Ticker
 }
 
-func NewRunner(pool, bgPool *db.Pool, autoService *autorecord.Service, storage *file.Storage, pushService *push.Service, cfg *config.Config, purgeQueue *purge.Queue, purger *purge.Purger) *Runner {
+func NewRunner(pool, bgPool *db.Pool, autoService *autorecord.Service, storage *file.Storage, pushService *push.Service, cfg *config.Config, purgeQueue *purge.Queue, purger *purge.Purger, rdb *redis.Client) *Runner {
 	return &Runner{
 		pool:        pool,
 		bgPool:      bgPool,
@@ -66,6 +80,8 @@ func NewRunner(pool, bgPool *db.Pool, autoService *autorecord.Service, storage *
 		cfg:         cfg,
 		purgeQueue:  purgeQueue,
 		purger:      purger,
+		rdb:         rdb,
+		jobs:        map[string]time.Duration{},
 	}
 }
 
@@ -73,16 +89,49 @@ func (r *Runner) Start(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
 
-	r.schedule(ctx, r.interval(r.cfg.JobIntervalAutoRecord, 5*time.Minute), 10*time.Minute, lockAutoRecord, r.runAutoRecord)
-	r.schedule(ctx, r.interval(r.cfg.JobIntervalAbnormalAlert, 5*time.Minute), 5*time.Minute, lockAbnormalAlert, r.runAbnormalAlertCheck)
-	r.schedule(ctx, r.interval(r.cfg.JobIntervalOrderClose, time.Minute), 5*time.Minute, lockOrderClose, r.runOrderClose)
-	r.schedule(ctx, r.interval(r.cfg.JobIntervalCleanupAILogs, 24*time.Hour), 10*time.Minute, lockCleanupAILogs, r.runCleanupAILogs)
-	r.schedule(ctx, r.interval(r.cfg.JobIntervalCleanupTrajectories, 6*time.Hour), 10*time.Minute, lockCleanupTrajectories, r.runCleanupTrajectories)
-	r.schedule(ctx, r.interval(r.cfg.JobIntervalCleanupClientOpsLogs, 24*time.Hour), 10*time.Minute, lockCleanupClientOpsLogs, r.runCleanupClientOpsLogs)
-	r.schedule(ctx, r.interval(r.cfg.JobIntervalCleanupOrphanFiles, 7*24*time.Hour), 30*time.Minute, lockCleanupOrphanFiles, r.runCleanupOrphanFiles)
-	r.schedule(ctx, r.interval(r.cfg.JobIntervalCleanupOrphanTrajMaps, 7*24*time.Hour), 10*time.Minute, lockCleanupOrphanTrajMaps, r.runCleanupOrphanTrajMaps)
-	r.scheduleDailyAt(ctx, 3, 0, 30*time.Minute, lockCommonAddressSummary, r.runCommonAddressSummary)
-	r.schedule(ctx, r.interval(r.cfg.JobIntervalPurgeDeletedObjects, 24*time.Hour), 10*time.Minute, lockPurgeDeletedObjects, r.runPurgeDeletedObjects)
+	for _, s := range r.specs() {
+		r.jobsMu.Lock()
+		r.jobs[s.name] = s.staleAfter()
+		r.jobsMu.Unlock()
+		if s.dailyHour >= 0 {
+			r.scheduleDailyAt(ctx, s.dailyHour, s.dailyMinute, s.maxDuration, s.lockKey, s.run)
+		} else {
+			r.schedule(ctx, s.interval, s.maxDuration, s.lockKey, s.run)
+		}
+	}
+	r.wg.Add(1)
+	safe.Go(ctx, nil, func() {
+		defer r.wg.Done()
+		r.watchJobHealth(ctx)
+	})
+}
+
+// jobSpec 描述一个后台任务；注册表同时用于调度、失联检测与人工补跑（R-03）。
+type jobSpec struct {
+	name        string
+	interval    time.Duration
+	dailyHour   int
+	dailyMinute int
+	maxDuration time.Duration
+	lockKey     string
+	run         func(context.Context) error
+}
+
+func (s jobSpec) staleAfter() time.Duration { return s.interval * jobStaleMultiplier }
+
+func (r *Runner) specs() []jobSpec {
+	return []jobSpec{
+		{name: "auto_record", interval: r.interval(r.cfg.JobIntervalAutoRecord, 5*time.Minute), dailyHour: -1, maxDuration: 10 * time.Minute, lockKey: lockAutoRecord, run: r.runAutoRecord},
+		{name: "abnormal_alert", interval: r.interval(r.cfg.JobIntervalAbnormalAlert, 5*time.Minute), dailyHour: -1, maxDuration: 5 * time.Minute, lockKey: lockAbnormalAlert, run: r.runAbnormalAlertCheck},
+		{name: "order_close", interval: r.interval(r.cfg.JobIntervalOrderClose, time.Minute), dailyHour: -1, maxDuration: 5 * time.Minute, lockKey: lockOrderClose, run: r.runOrderClose},
+		{name: "cleanup_ai_logs", interval: r.interval(r.cfg.JobIntervalCleanupAILogs, 24*time.Hour), dailyHour: -1, maxDuration: 10 * time.Minute, lockKey: lockCleanupAILogs, run: r.runCleanupAILogs},
+		{name: "cleanup_trajectories", interval: r.interval(r.cfg.JobIntervalCleanupTrajectories, 6*time.Hour), dailyHour: -1, maxDuration: 10 * time.Minute, lockKey: lockCleanupTrajectories, run: r.runCleanupTrajectories},
+		{name: "cleanup_client_ops_logs", interval: r.interval(r.cfg.JobIntervalCleanupClientOpsLogs, 24*time.Hour), dailyHour: -1, maxDuration: 10 * time.Minute, lockKey: lockCleanupClientOpsLogs, run: r.runCleanupClientOpsLogs},
+		{name: "cleanup_orphan_files", interval: r.interval(r.cfg.JobIntervalCleanupOrphanFiles, 7*24*time.Hour), dailyHour: -1, maxDuration: 30 * time.Minute, lockKey: lockCleanupOrphanFiles, run: r.runCleanupOrphanFiles},
+		{name: "cleanup_orphan_traj_maps", interval: r.interval(r.cfg.JobIntervalCleanupOrphanTrajMaps, 7*24*time.Hour), dailyHour: -1, maxDuration: 10 * time.Minute, lockKey: lockCleanupOrphanTrajMaps, run: r.runCleanupOrphanTrajMaps},
+		{name: "common_address_summary", interval: 24 * time.Hour, dailyHour: 3, dailyMinute: 0, maxDuration: 30 * time.Minute, lockKey: lockCommonAddressSummary, run: r.runCommonAddressSummary},
+		{name: "purge_deleted_objects", interval: r.interval(r.cfg.JobIntervalPurgeDeletedObjects, 24*time.Hour), dailyHour: -1, maxDuration: 10 * time.Minute, lockKey: lockPurgeDeletedObjects, run: r.runPurgeDeletedObjects},
+	}
 }
 
 func (r *Runner) interval(cfgValue, def time.Duration) time.Duration {
@@ -221,6 +270,7 @@ func (r *Runner) runTask(ctx context.Context, lockKey string, maxDuration time.D
 		}()
 	}
 
+	name := jobName(lockKey)
 	done := make(chan error, 1)
 	start := time.Now()
 	safe.GoWithRecover(taskCtx, nil, func() error {
@@ -230,18 +280,155 @@ func (r *Runner) runTask(ctx context.Context, lockKey string, maxDuration time.D
 		done <- panicErr
 	})
 
-	if err := <-done; err != nil {
-		elapsed := time.Since(start)
-		if elapsed > maxDuration*8/10 {
-			slog.Warn("background job slow", slog.String("lock_key", lockKey), slog.Duration("elapsed", elapsed), slog.Duration("max_duration", maxDuration))
-		}
-		slog.Error("background job failed", slog.String("lock_key", lockKey), slog.Any("error", err))
-		return
-	}
+	err := <-done
 	elapsed := time.Since(start)
 	if elapsed > maxDuration*8/10 {
-		slog.Warn("background job slow", slog.String("lock_key", lockKey), slog.Duration("elapsed", elapsed), slog.Duration("max_duration", maxDuration))
+		slog.Warn("background job slow", slog.String("task", name), slog.Duration("elapsed", elapsed), slog.Duration("max_duration", maxDuration))
 	}
+	if err != nil {
+		slog.Error("background job failed", slog.String("task", name), slog.Any("error", err))
+		r.recordJobFailure(ctx, name, elapsed)
+		return
+	}
+	r.recordJobSuccess(ctx, name, elapsed)
+}
+
+func jobName(lockKey string) string { return strings.TrimPrefix(lockKey, "lock:background:") }
+
+// KnownJobNames 返回全部后台任务名，供运维 CLI（jobs status / job run）展示与校验。
+func KnownJobNames() []string {
+	return []string{
+		"auto_record",
+		"abnormal_alert",
+		"order_close",
+		"cleanup_ai_logs",
+		"cleanup_trajectories",
+		"cleanup_client_ops_logs",
+		"cleanup_orphan_files",
+		"cleanup_orphan_traj_maps",
+		"common_address_summary",
+		"purge_deleted_objects",
+	}
+}
+
+// JobLastSuccessKey 返回任务最近成功时间的 Redis 键（R-03）。
+func JobLastSuccessKey(name string) string { return jobLastSuccessPrefix + name }
+
+// JobLastFailureKey 返回任务最近失败时间的 Redis 键（R-03）。
+func JobLastFailureKey(name string) string { return jobLastFailurePrefix + name }
+
+// JobFailStreakKey 返回任务连续失败次数的 Redis 键（R-03）。
+func JobFailStreakKey(name string) string { return jobFailStreakPrefix + name }
+
+// JobTriggerKey 返回人工补跑触发键（R-03）。
+func JobTriggerKey(name string) string { return jobTriggerPrefix + name }
+
+func (r *Runner) recordJobSuccess(ctx context.Context, name string, elapsed time.Duration) {
+	slog.InfoContext(ctx, "job success", slog.String("task", name), slog.Duration("elapsed", elapsed))
+	if r.rdb == nil {
+		return
+	}
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := r.rdb.Set(wctx, jobLastSuccessPrefix+name, now, 0).Err(); err != nil {
+		slog.WarnContext(ctx, "job state write failed", slog.String("task", name), slog.Any("error", err))
+	}
+	if err := r.rdb.Del(wctx, jobFailStreakPrefix+name).Err(); err != nil {
+		slog.WarnContext(ctx, "job state write failed", slog.String("task", name), slog.Any("error", err))
+	}
+}
+
+func (r *Runner) recordJobFailure(ctx context.Context, name string, elapsed time.Duration) {
+	if r.rdb == nil {
+		return
+	}
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := r.rdb.Set(wctx, jobLastFailurePrefix+name, now, 0).Err(); err != nil {
+		slog.WarnContext(ctx, "job state write failed", slog.String("task", name), slog.Any("error", err))
+	}
+	if err := r.rdb.Incr(wctx, jobFailStreakPrefix+name).Err(); err != nil {
+		slog.WarnContext(ctx, "job state write failed", slog.String("task", name), slog.Any("error", err))
+	}
+}
+
+// watchJobHealth 每分钟检查任务失联（>3× 周期未成功）与人工补跑触发键（R-03）。
+func (r *Runner) watchJobHealth(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.checkJobStaleness(ctx)
+			r.checkJobTriggers(ctx)
+		}
+	}
+}
+
+func (r *Runner) checkJobStaleness(ctx context.Context) {
+	if r.rdb == nil {
+		return
+	}
+	for name, staleAfter := range r.jobIntervals() {
+		val, err := r.rdb.Get(ctx, jobLastSuccessPrefix+name).Result()
+		if err != nil {
+			continue // 尚无成功记录：启动宽限期内不告警
+		}
+		ts, perr := time.Parse(time.RFC3339, val)
+		if perr != nil {
+			continue
+		}
+		if time.Since(ts) > staleAfter {
+			slog.ErrorContext(ctx, "job_stale", slog.String("task", name), slog.String("last_success", val), slog.Duration("stale_after", staleAfter))
+		}
+	}
+}
+
+func (r *Runner) checkJobTriggers(ctx context.Context) {
+	if r.rdb == nil {
+		return
+	}
+	for name := range r.jobIntervals() {
+		val, err := r.rdb.GetDel(ctx, jobTriggerPrefix+name).Result()
+		if err != nil || val == "" {
+			continue
+		}
+		s := r.specByName(name)
+		if s == nil {
+			continue
+		}
+		spec := *s
+		slog.InfoContext(ctx, "job manual trigger", slog.String("task", name))
+		r.wg.Add(1)
+		safe.Go(ctx, nil, func() {
+			defer r.wg.Done()
+			r.runTask(ctx, spec.lockKey, spec.maxDuration, spec.run)
+		})
+	}
+}
+
+func (r *Runner) jobIntervals() map[string]time.Duration {
+	r.jobsMu.Lock()
+	defer r.jobsMu.Unlock()
+	out := make(map[string]time.Duration, len(r.jobs))
+	for k, v := range r.jobs {
+		out[k] = v
+	}
+	return out
+}
+
+func (r *Runner) specByName(name string) *jobSpec {
+	for _, s := range r.specs() {
+		if s.name == name {
+			spec := s
+			return &spec
+		}
+	}
+	return nil
 }
 
 func (r *Runner) runAutoRecord(ctx context.Context) error {
@@ -296,7 +483,15 @@ func (r *Runner) runCommonAddressSummary(ctx context.Context) error {
 			break
 		}
 		for _, userID := range userIDs {
-			jobs <- userID
+			select {
+			case jobs <- userID:
+			case <-ctx.Done():
+				// 全部 worker panic 退出（safe.Go 恢复后不回读通道）时裸发送会永久阻塞，
+				// 卡死该任务的调度 goroutine；感知取消后收尾退出，交由调度标记失败。
+				close(jobs)
+				wg.Wait()
+				return ctx.Err()
+			}
 		}
 		cursor = userIDs[len(userIDs)-1]
 		if len(userIDs) < commonAddressSummaryBatchSize {
@@ -379,6 +574,18 @@ func (r *Runner) runAbnormalAlertCheck(ctx context.Context) error {
 func (r *Runner) runOrderClose(ctx context.Context) error {
 
 	cutoff := time.Now().Add(-24 * time.Hour)
+
+	// R-17：先收敛无主（user_id IS NULL，注销产生）的过期 pending 订单。
+	for {
+		n, err := r.bgPool.Queries().CloseOwnerlessPendingOrders(ctx, pgtype.Timestamptz{Time: cutoff, Valid: true})
+		if err != nil {
+			return fmt.Errorf("close ownerless orders: %w", err)
+		}
+		if n < 1000 {
+			break
+		}
+	}
+
 	cursorID := ""
 	for {
 		orders, err := r.bgPool.Queries().ListPendingOrdersBefore(ctx, sqlc.ListPendingOrdersBeforeParams{
@@ -395,11 +602,7 @@ func (r *Runner) runOrderClose(ctx context.Context) error {
 		outTradeNos := make([]string, 0, len(orders))
 		userIDs := make([]string, 0, len(orders))
 		for _, order := range orders {
-			if !order.UserID.Valid || order.UserID.String == "" {
-				// 无效 user_id 的订单无法通过 CloseOrder 关闭（WHERE user_id = NULL 匹配 0 行），
-				// 跳过并继续处理，避免无限循环。
-				continue
-			}
+			// ListPendingOrdersBefore 已过滤 user_id IS NOT NULL；无主订单由上方 R-17 单独收敛。
 			outTradeNos = append(outTradeNos, order.OutTradeNo)
 			userIDs = append(userIDs, order.UserID.String)
 		}

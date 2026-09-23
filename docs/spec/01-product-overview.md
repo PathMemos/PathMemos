@@ -11,7 +11,7 @@ papafeiji（拍拍照记记）是一款以「时间轴 + 地图轨迹」自动�
 |------|------|------|
 | 微信小程序 | 主用户 | 手动/自动记录日记、家庭共享、VIP、AI 对话 |
 | 微信公众号/服务号 | 订阅用户 | 纯 AI 对话 |
-| MCP / 开放 API | 第三方 AI 工具（Cursor/Claude 等） | 日记与回忆读写 |
+| MCP / 开放 API | 第三方 AI 工具（Cursor/Kimi 等） | 日记与回忆读写 |
 
 两种形态：**SaaS 版**（官方托管，默认直连 `pro.papafeiji.cn`）与**开源版**（自部署，经 Cloudflare Worker 路由）。同一份小程序代码，接口不存在时优雅降级。
 
@@ -49,6 +49,6 @@ papafeiji（拍拍照记记）是一款以「时间轴 + 地图轨迹」自动�
 
 | 项 | 现状 |
 |----|------|
-| 端到端验收（L7） | F1–F12 **人工验收清单**（`docs/spec/07-acceptance-flows.md`）；无自动化 flow 执行器（2026-09 所有者决策） |
-| 自动化测试门禁 | 仅后端 Go `go test -race`；存量前端 Jest（8 套件 / 47 用例）与 Worker vitest（38+21）保留为资产、**非门禁**；`spec-check` |
+| 端到端验收（L7） | F1–F12 **人工验收清单**（`docs/spec/07-acceptance-flows.md`）；无自动化 flow 执行器 |
+| 自动化测试门禁 | 仅后端 Go `go test -race`；存量前端 Jest（以 `frontend/miniapp/test/` 实际为准，当前 9 套件 / 49 用例）与 Worker vitest（38+21）保留为资产、**非门禁**；`spec-check` |
 | 人工验收 | 小程序页面交互、公众号链路、Worker 路由按 L7 场景人工执行 |

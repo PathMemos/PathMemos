@@ -4,6 +4,7 @@
 > 上游：PP-01 产品总览｜关联分册：PP-02a~02h
 > 说明：本分册按当前代码实现整理；行内路径指向对应实现位置。
 > 关键实现位置：`frontend/miniapp/miniprogram/`（`app.json`、`app.ts`、`config/index.ts`、`pages/`、`components/`、`utils/`、`behaviors/`）；关键处内联源文件路径。
+> 其他实现文件：`polyfills/textDecoder.ts`（SSE UTF-8 流解码，位于 miniprogram 根目录）、`utils/markdown.ts`（渲染）、`utils/concurrency.ts`（并发 3）、`pages/NoteDetail/shareCanvas.ts`（离屏分享图）、`lib/dayjs`（时间库）；`app.json` 的 `sitemapLocation` 指向 `sitemap.json`。
 
 ## 1. 页面清单（路由 / 用途 / 入口 / 优先级）
 
@@ -38,12 +39,12 @@
 | `requiredBackgroundModes` | `location` |
 | `permission.scope.userLocation.desc` | 「用于记录日记位置」 |
 
-前端测试位于 `frontend/miniapp/test/*.test.ts`（当前 8 套件 / 47 用例），由 `make test-frontend` 与 CI 执行；组件级测试由 `test/jest.setup.ts` 注入 `Component/Page/Behavior` 捕获实现。按 2026-09 验收策略（spec-standards §五），前端测试为**存量资产、非验收门禁**：不要求随新功能新增用例，前端行为以人工验收（L7）为准；CI 是否保留前端 job 列入代码整改清理项。
+前端测试位于 `frontend/miniapp/test/*.test.ts`（以目录实际为准，当前 9 套件 / 49 用例），本地用 `make test-frontend` 执行；组件级测试由 `test/jest.setup.ts` 注入 `Component/Page/Behavior` 捕获实现。按 spec-standards §五 验收策略，前端测试为**存量资产、非验收门禁**：不要求随新功能新增用例，前端行为以人工验收（L7）为准；CI（`.github/workflows/ci.yml`）跑三个 job：backend（lint + go test + 各项同步校验）、frontend（`npm run lint`，不含 Jest）、worker（typecheck）——前端/Worker 测试不在 CI。
 
 - `utils/logger.ts`：分级日志接口（log/info/warn/error），**所有级别一律写入内存缓冲**（上限 100 条，超出裁掉最旧）；release 环境差异仅是丢弃 `detail` 字段（logger 本身不向 console 输出，无级别过滤）；所有字符串 message 先经 `sanitizeUrlForLog` 剥离 query/hash 再入缓冲，防 URL 参数落日志。
 - `utils/opslog.ts`：客户端操作日志本地持久化（key `ops_log_queue`，上限 200、单批 50），打开小程序时批量上报 `POST /ops/client-log`；detail 仅保留计数/标识/错误码等非敏感摘要。
 
-组件（16 个）与 behaviors（5 个）清单：`AIDrawer`（AI 对话抽屉）、`NoteEdit`/`MemoryEdit`/`CoverEdit`（编辑抽屉）、`RecordItem`/`MemoryItem`/`NoteItem`（左滑删除列表项）、`AutoBtn`（首页自动记录开关，内含订阅提示联动）、`CalendarPicker`（日历选日期，非法输入回退今天）、`TimePicker`（时间选择）、`Cell`（通用设置行）、`PTextarea`（受控多行输入）、`Drawer`/`ConfirmDialog`/`SubscribePrompt`（通用抽屉/确认弹窗/订阅提示）、`navigation-bar`（自定义导航栏）；behaviors：`safeSetData`（三标志安全写入）、`theme`/`i18n`（主题/文案订阅）、`touchSwipe`（左滑手势）、`transition`（动效）。
+组件（16 个）与 behaviors（5 个）清单：`AIDrawer`（AI 对话抽屉）、`NoteEdit`/`MemoryEdit`/`CoverEdit`（编辑抽屉）、`RecordItem`/`MemoryItem`/`NoteItem`（左滑删除列表项）、`AutoBtn`（日记详情/编辑内的自动记录开关，内含订阅提示联动；首页开关是 `pages/index/index.ts` 的 `toggleAutoRecord`）、`CalendarPicker`（日历选日期，非法输入回退今天）、`TimePicker`（时间选择）、`Cell`（通用设置行）、`PTextarea`（受控多行输入）、`Drawer`/`ConfirmDialog`/`SubscribePrompt`（通用抽屉/确认弹窗/订阅提示）、`navigation-bar`（自定义导航栏）；behaviors：`safeSetData`（三标志安全写入）、`theme`/`i18n`（主题/文案订阅）、`touchSwipe`（左滑手势）、`transition`（动效）。
 
 ## 2. base URL 模式与运行时配置
 
@@ -89,7 +90,7 @@
 
 ### 2.5 能力探测（`GET /system/config`）
 
-`Vip` 页读取 `data.features.payment` / `data.features.freeVip` 与 `data.mode`；私有模式下本地兜底把两者都置 false。服务端 open 模式恒返回 `payment=false, freeVip=true, wxmp=false`（`backend/internal/system/handler.go`）。`User` 页在 `getBackendMode()==='private'` 时隐藏「我的邀请」入口。
+`Vip` 页读取 `data.features.payment` / `data.features.freeVip` 与 `data.mode`；私有模式下本地兜底把两者都置 false。服务端 open 模式恒返回 `payment=false, wxmp=false`，`freeVip` 由 `FREE_VIP_ENABLED` 控制（默认 true；`backend/internal/system/handler.go`）。`User` 页在 `getBackendMode()==='private'` 时隐藏「我的邀请」入口。
 
 ## 3. 关键页面与交互
 
@@ -101,7 +102,7 @@
 - `login()`：已有 session 先 `GET /user/profile` 校验；失败清 session。否则 `wx.login` → `POST /auth/login {code, inviter?}`（`closeTheErrorMessage=true, skipAuthExpire=true`）。登录并发单飞（`_loginFlight`）。
 - 登录结果（`_applyLoginResult`）：存 sessionId、baseInfo；`GET /auto-record/config` 写 `familyConfig.autoRecordEnabled`；`newUser` → `setNeedShowXPa(true)` 且自动领取新用户 VIP（`claimNewUserFreeVip` → `POST /vip/new-user`）；有 `pendingLinkId` → 若当前页是 Family 就地返回，否则 `redirectTo /pages/Family/Family`；新用户 → `redirectTo /pages/Guide/Guide`。
 - `onShow`：距上次恢复 >30s 则 `tryRestoreAutoRecord`；已登录则 `onAppShow()`，VIP 缓存缺失或超 5 分钟则 `fetchVipInfo()`。启动时 `flushOpsLog()`。
-- 场景码解析与首屏并行，最多等 1.5s；解析完成后若已登录，补调 `POST /auth/inviter` 绑定邀请人（幂等）。
+- 场景码解析与首屏并行、最多等 1.5s（`Promise.race`）：归属 `pages/index/index.ts`（`onLoad` 的 `_handleScene` → `_resolveInviterFromShortCode`，`onShow` 中等待）；解析完成后若已登录，由 index 页补调 `POST /auth/inviter` 绑定邀请人（幂等）。`app.ts _resolveSceneAndLogin` 只做场景码解析并经 `setPendingInviter` 把 inviter 并入 `/auth/login` payload（`utils/auth.ts`），不做补调。
 - 会话过期：`utils/http.ts` 遇 HTTP 401 清 session 并 toast「会话已过期」，返回哨兵错误；后台请求可传 `skipAuthExpire` 避免误踢。
 
 ### 3.2 首页 `pages/index/index`
@@ -120,7 +121,7 @@
 
 ### 3.3 日记详情 `pages/NoteDetail/NoteDetail`
 
-- `onLoad` 解析 `baseInfo`（`{id, recordDate, dateName, coverImg}`），`id` 形如 `family:<familyId>:date:<YYYY-MM-DD>`；无有效 `recordDate` 时 toast 并回退首页。
+- `onLoad` 解析 `baseInfo`（`{id, recordDate, dateName, coverImg}`），`id` 形如 `family:<familyId>:date:<YYYY-MM-DD>`；无有效 `recordDate` 时 toast；页面栈深 >1 时 `wx.navigateBack()`，仅栈内只有 1 页时 `redirectTo` 首页。
 - 详情：`GET /diary/details?diaryId=&page=&size=20`（offset 分页，`MAX_FULL_LIST=200`）；响应 `extra.coverImg/coverImage/memories`；记忆与条目合并按时间排序（memory 排后）。
 - 家庭成员 Tab：按 `familyMemberUserId` 聚合，仅 >1 人时显示；切换按成员过滤。
 - 编辑：仅 `familyMemberUserId === currentUserId` 可编辑，否则 toast「不能编辑他人记录」；`NoteEdit` 提交后 `reloadAfterEdit`。
@@ -129,6 +130,7 @@
 - 分享：`onShareMoment` 确保二维码（`POST /invite/qrcode {raw:true}`）→ 离屏 canvas 生成图片 → `wx.showShareImageMenu`。
 - 二维码在 `onShow` 预生成；生成中复用 in-flight Promise。
 - 整日删除：`DELETE /diary/info`（入口在首页卡片，详情页自身无整日删除按钮）。
+- 封面工具：详情页封面上有 `AutoBtn`（自动记录开关）与「更换封面」入口（`bindCircle`）；编辑提交后本页自行 `_startCoverPolling`（0.5s、最多 12 次）刷新，另有首页 `_pendingCoverPoll` 路径。列表渲染上限 `MAX_IMAGE_LIST=50`、`MAX_TAB_LIST=50`，分片写入 `CHUNK=50`。
 
 ### 3.4 家庭 `pages/Family/Family` 与邀请 `pages/Invite/Invite`
 
@@ -150,6 +152,7 @@
 - 手机号：`getPhoneNumber` → `POST /auth/phone/bind {code}`；已绑定且当天已改 → toast 日限；解绑 `POST /auth/phone/unbind`（无日限，不消耗微信认证）。
 - 服务号：未订阅显示二维码弹窗（`getHelpBaseURL()/follow.png`）。
 - 桌面快捷：Android 且 `canIUse('addToDesktop')` 直接添加，否则引导；可跳 `wx.openAppAuthorizeSetting`。
+- 私有模式（`backend_mode==='private'`）隐藏头像更换入口、手机号绑定/更换、手机号解绑与服务号入口（`Set.wxml` 的 `wx:if="{{!isPrivateBackend}}"`）。
 - CommonAddresses `onShow`：`POST /user/common-addresses/refresh` 取回并按 `count` 降序；点地址弹编辑抽屉，`PUT /user/common-addresses/{oldName} {newName}`；名 >100 字/空拦截。
 
 ### 3.6 VIP `pages/sub/Vip/Vip`
@@ -158,9 +161,10 @@
 |------|-------------|
 | 商品加载 | `GET /vip`，过滤 `type!=='free' && type!=='trial'`，取第一条价格 `amount/100`，默认选中第一档 |
 | 系统配置 | `GET /system/config`；`features.payment/freeVip` 控制入口；私有模式本地兜底关闭 |
+| 无支付能力 | `features.payment===false` 时展示「当前为私有化部署，会员请联系管理员开通」（i18n `vip.openSourceNoPayment`） |
 | 购买 | 未勾选协议先弹协议弹窗；`doPay` → `POST /payment/virtual/request {vipId, env}` → `wx.requestVirtualPayment` |
 | env | iOS 恒 0；否则 develop/trial → 1，release → 0（`utils/pay.ts getPayEnv`） |
-| 轮询 | `GET /payment/virtual/status?outTradeNo=` 每 3s、最多 10 次；`paid` → 成功弹窗 + 刷新 VIP；`closed` → 失败（前端 `failed` 分支为历史兼容残留，后端状态机无该值） |
+| 轮询 | `GET /payment/virtual/status?outTradeNo=` 每 3s、最多 10 次；`paid` → 成功弹窗 + 刷新 VIP；`closed` → 失败提示；超时 → 超时提示 |
 | 免费领取 | `GET /vip/free` → `POST /vip/free/claim {vipId}`；`FREE_VIP_ALREADY_CLAIMED` → 已领取提示 |
 | VIP 刷新 | `onShow` 与支付成功均 `fetchVipInfo()`；VIP 信息 60s 内存缓存 + storage |
 
@@ -168,7 +172,7 @@
 
 ### 3.7 AI 抽屉 `components/AIDrawer/AIDrawer`
 
-- 打开需登录（`index.openAIDrawer` 先 `ensureLogin`）；`sendPrompt` 输入 ≤2500 字符（与后端 `maxMessageCodePoints` 统一；旧「≤500 字」废止）。
+- 打开需登录（`index.openAIDrawer` 先 `ensureLogin`）；`sendPrompt` 输入 ≤2500 字符（与后端 `maxMessageCodePoints` 统一）。
 - 请求体仅 `{message, request_id}`（不传 history，上下文由后端组装；本地列表裁剪至 50 条仅为 UI 展示），`eventSource POST {base}/ai/chat`，headers `Authorization`（私有模式加 `X-Private-Api-Key`）。
 - 流事件：`data` 增量（120ms 合并 setData）、`done` 结束（Markdown→HTML、解析卡片日期标记）、`error`（`{"code","biz_code","bizCode","message"}`；`eventSource` 同时读取 `biz_code` 与旧 `bizCode`；`biz_code=AI_DAILY_QUOTA_EXCEEDED` → 配额弹窗引导 Vip，否则 toast）。
 - 网络类失败自动重连一次（复用同 `request_id`）；重连前清空半截输出。消息上限 `MAX_MESSAGE_COUNT=50`。
@@ -192,7 +196,7 @@
 
 ### 3.10 其他页面
 
-- `Guide`：4 张 OSS 教程图（按语言后缀 `_en`），`next` 到第 4 步写 `setNeedShowXPa(false)` 并 `redirectTo` 首页。
+- `Guide`：4 张 OSS 教程图（按语言后缀 `_en`），`next` 到第 4 步写 `setNeedShowXPa(false)` 并 `redirectTo` 首页；入口另有 `pages/User/User.ts` 的 `toGuidePage`（`redirectTo`）。
 - `About`：`loadAccountName` 取 baseInfo.nickName；注销需在弹窗内输入与昵称完全一致的文本（`canConfirmDelete`），确认后 `DELETE /auth/account {confirmName}` → 成功清本地/关自动记录/回首页。本地清理不因页面隐藏/销毁跳过，仅成功 toast 受可见性约束。
 - `WebPage`：仅允许 `https://` 且 host 命中 `papafeiji.cn` / `xiaohongshu.com`（含子域）；非法 toast 并返回。
 - `UsageGuide`：`openUrl` 打开 `/tutorial/tutorial0..7/`。
@@ -212,7 +216,7 @@
 |------|------|
 | HTTP 401 | `clearSessionId()` + toast `error.sessionExpired`（2s）；`skipAuthExpire=true` 时跳过（后台轮询/自动记录） |
 | HTTP 5xx | toast `error.serverError`（带 statusCode）；私有模式下 Worker `code 5020/5030` → `error.privateBackendUnreachable` |
-| 业务 `code !== '0000'` | `_handleResponseError` toast `message/msg`（2s）；私有模式 `4031` → `error.privateBackendNotRegistered` |
+| 业务 `code !== '0000'` | `_handleResponseError` toast（2s）：优先按 `biz_code` 查 `utils/errorMessages.ts` 映射显示三语本地化文案（`error.biz*` 键，与 `pkg/errors/codes.go` 枚举同源），未登记码回退后端 `message/msg`；私有模式 `4031` → `error.privateBackendNotRegistered` |
 | 上传失败 | `wx.showModal`（非 toast）；配额超限 `USER_IMAGE_STORAGE_LIMIT_EXCEEDED` 弹升级引导 |
 | Toast 节流 | 会话过期与业务错误各 200ms 节流；当前页已销毁/隐藏时不弹 |
 | 错误信息 | `getErrorMessage` 优先返回 Error.message/msg/data.msg，内部哨兵不直接展示 |
@@ -236,7 +240,7 @@
 ### 4.5 生命周期与数据写入约定
 
 - 所有 UI 状态写入经 `_safeSetData`（隐藏时暂存 `_pendingSetData`，`show` 时 `_applyPendingSetData` flush）或 `_forceSetData`（`onHide`/`onUnload` 必须持久化时，豁免 hidden 检查但短路已销毁/已脱离）。
-- `_isDestroyed`、`_isDetached`、`_isHidden` 三标志由 `behaviors/safeSetData.ts` 统一管理。
+- `behaviors/safeSetData.ts` 统一管理 `_isDetached`（`detached`）与 `_isHidden`（`hide`/`show`）；`_isDestroyed` 由各页/组件在 `onUnload`/`detached` 自行置位。
 - `onUnload`/`detached` 取消全部读请求 token、清定时器、`unsubscribeTheme`。
 - 页面持有 AIDrawer 时在 `onHide` 调用其 `onPageHide()`。
 

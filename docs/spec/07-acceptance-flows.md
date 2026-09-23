@@ -2,7 +2,7 @@
 
 > 层级：L7 人工验收｜版本：V2.1｜状态：定稿（以当前代码为唯一事实源）
 > 上游：PP-01 产品总览、PP-02a~02h、PP-06 小程序页面与交互
-> **验收策略（2026-09 所有者决策）**：不引入自动化 flow 执行器；端到端验收以**人工**按本清单执行，自动化门禁仅保留后端 Go 测试（`make test`）。原「机器可读 flow YAML DSL」（`wx.mock`/`api.sse`/`db.sql` 等打桩词汇）废除；场景编号 F1~F12 保持稳定，与 `docs/BUSINESS-FLOWS.md` 对齐。
+> **验收策略**：不引入自动化 flow 执行器；端到端验收以**人工**按本清单执行，自动化门禁仅保留后端 Go 测试（`make test`）。场景编号 F1~F12 保持稳定，与 `docs/BUSINESS-FLOWS.md` 对齐。
 
 ## 1. 执行约定
 
@@ -50,7 +50,7 @@
 4. 删除条目 → 当日无其他条目且无记忆时，首页该日卡片消失。
 5. `GET /diary/stats` 的 `totalEntries/recordDays/weeklyEntries` 与实际一致。
 
-异常核对：正文 10001 字 → 400 + `biz_code=TEXT_TOO_LONG`；图片第 10 张 → 400；地址 >500 → 400；编辑跨天 recordTime → 400 `record time cannot cross day`；图片配额不足 → `USER_IMAGE_STORAGE_LIMIT_EXCEEDED` 弹升级；部分图片上传失败 → 仅补传失败项，已成功图不重传。
+异常核对：正文 10001 字 → 400 + `biz_code=TEXT_TOO_LONG`；图片第 10 张 → 400；地址 >500 → 400；编辑跨天 recordTime → 400 `record time cannot cross day`；图片配额不足 → `USER_IMAGE_STORAGE_LIMIT_EXCEEDED` 弹升级；部分图片上传失败 → 仅补传失败项，已成功图不重传；删除含图条目/日记后，`users.image_storage_bytes` 同步回退（删空后可继续上传）。
 
 ### F3 自动记录
 
@@ -65,7 +65,7 @@
 验收步骤：
 1. 开启开关（VIP）→ `PUT /auto-record/config {enabled:true}` 成功，图标变亮；关闭 → 先上报积压驻留点再置 false。
 2. 真机驻留 ≥10 分钟（300m 内）→ 观察本地驻留点上报；等待后台任务（≤5 分钟）→ 自动出现「（自动记录）」条目，地址为逆地理/常用地址结果。
-3. 同一地点当日再次成文 → 不新建（与当天最后一条自动记录去重）。
+3. 同一地点当日再次成文 → 不新建（与当日全部自动条目的地址并集集合判重，同 02c AR-7/D4）。
 4. 首次开启立即成文：开启后 `POST /diary/details/auto` 返回 `id` 且当日出现条目。
 5. 常用地址核对：次日 03:00 任务后 `GET /user/common-addresses` 出现高频地址；后续成文 300m 内命中常用地址名。
 6. 前端采集阈值（前台/后台质心窗口、静止 300m、驻留 10 分钟、本地队列 50 上限、精度过滤 iOS 3000m/其它 500m）按 02c §7 人工核对真机行为。
@@ -108,7 +108,7 @@
 3. B 退出（`POST /family/leave`）→ 回到个人家庭；A（owner）退出 → 403 `OWNER_CANNOT_LEAVE_FAMILY`。
 4. A 移除 B（`DELETE /family/members/{userId}`，需二次确认）→ B 回个人家庭；移除自己/owner → 403。
 5. A 解散家庭（`DELETE /family`，一次性账号执行）→ 全员回各自个人家庭，家庭删除，封面迁移正确。
-6. 个人邀请：B 的邀请页生成小程序码/分享图 → 新用户 C 扫码注册 → `GET /invite/list` 出现 C；C 与 B 各得奖励（B 为邀请人时受月度 14 天上限约束）。
+6. 个人邀请：B 的邀请页生成小程序码/分享图 → 新用户 C 扫码注册 → `GET /invite/list` 出现 C；C 与 B 各得奖励（B 为邀请人时受月度 14 天上限约束；注册 7 天内加入/补绑均有效（两入口统一窗口）；同一微信注销重注册后被邀请奖励不再发放（openid 墓碑））。
 7. `POST /invite/qrcode`（raw 与合成图）→ 各自缓存 6 天内复用同一 URL。
 8. 已知风险（已接受，ADR-0012）：**owner 打开他人邀请链接会触发整家合并且不可逆**——人工验收时用一次性账号验证该行为符合预期即可，不做防护断言。
 
@@ -118,7 +118,7 @@
 
 | 项 | 内容 |
 |----|------|
-| 前置 | SaaS 模式；虚拟支付四项密钥已配置；有付费商品（`vip-month-0001`/`vip-year-0001`） |
+| 前置 | SaaS 模式；虚拟支付五项密钥已配置（`WECHAT_VIRTUAL_OFFER_ID`/`APP_KEY_PRODUCTION`/`APP_KEY_SANDBOX`/`CALLBACK_TOKEN`/`CALLBACK_AES_KEY`）；有付费商品（`vip-month-0001`/`vip-year-0001`） |
 | 涉及接口 | `GET /user/vip`、`GET /vip`、`POST /payment/virtual/request`、`GET /payment/virtual/status`、`POST/GET /api/prod/payment/virtualPayNotify`、`POST /vip/new-user`、`GET /vip/free`、`POST /vip/free/claim`、`GET /vip/free/check`、`POST /payment/virtual/cancel` |
 | 涉及表 | `vips`、`user_vips`、`user_vip_claims`、`orders`、`users` |
 | 涉及页面 | `pages/sub/Vip/Vip`、`utils/pay.ts`、`utils/vip.ts` |
@@ -132,7 +132,7 @@
 6. 免费 VIP：`GET /vip/free` → `POST /vip/free/claim` → 成功一次，再领 → 409 `FREE_VIP_ALREADY_CLAIMED`；`GET /vip/free/check` 返回 `claimed=true`。
 7. 体验版/开发版预期：`env=1` 在未开启 `PAYMENT_ALLOW_SANDBOX` 的环境必然 403 `sandbox payment is disabled`——**预期行为**（trial 由注册自动发放、不可购买；沙箱联调走专用环境）。
 
-异常核对：`env∉{0,1}`（curl）→ 400；他人订单 status/cancel → 404 `ORDER_NOT_FOUND`；明文回调（无 encrypt）→ 固定成功 JSON 且不发货；金额非正数 → 业务拒绝。
+异常核对：`env∉{0,1}`（curl）→ 400；他人订单 status/cancel → 404 `ORDER_NOT_FOUND`；明文回调（无 encrypt）→ 固定成功 JSON 且不发货；金额非正数 → 业务拒绝；**回调事务中途失败（如人工注入 DB 抖动）→ 微信重试后 VIP 最终到账且不重复叠加**（paid 严格等价已交付，见 02e §6 事务原子性）。
 
 ### F7 AI 对话（小程序 + 公众号）
 
@@ -148,29 +148,30 @@
 2. 断网重连（或快速重发同一条）→ 同 `request_id` 命中回放，不重复扣配额（`ai_daily_quota_usage.used` 不变）。
 3. 配额：非 VIP 一天第 11 次 → 配额弹窗引导 VIP 页；VIP 第 101 次 → 同样拦截。
 4. 输入 2501 字 → 400；`request_id` 非法 → 400。
+5. 并发与在途：同用户开第 3 个 AI 连接（第三会话/设备）→ 429 envelope（`code=4290`、`biz_code=RATE_LIMITED`）；同 `request_id` 在途期间并发第二次请求 → `OPERATION_IN_PROGRESS`（在途不回落生成）；退款注入失败 4 次 → 日志出现 `alert:ai_quota_refund_failed`。
 
 验收步骤（公众号，人工覆盖 02f AI-3 / 02g P-1~P-3）：
-5. 关注公众号 → 收到欢迎语 + 小程序卡片；`wx_mp_accounts.subscribed=true`。
-6. 发送文本 → 先回「正在思考」，随后收到分段客服消息（≤2000 字节/段）；同一秒重复发送同一句 → 60s 内去重不重复触发 AI。
-7. 发送语音（可识别）→ 按文本处理；无法识别 → 语音失败提示。
-8. 未绑定用户（未登录过小程序的微信号）发消息 → 回引导文案 + 小程序卡片。
-9. 取关再关注 → 订阅状态联动；配额用尽 → 「当天额度已用完」文案。
+6. 关注公众号 → 收到欢迎语 + 小程序卡片；`wx_mp_accounts.subscribed=true`。
+7. 发送文本 → 先回「正在思考」，随后收到分段客服消息（≤2000 字节/段）；同一秒重复发送同一句 → 60s 内去重不重复触发 AI。
+8. 发送语音（可识别）→ 按文本处理；无法识别 → 语音失败提示。
+9. 未绑定用户（未登录过小程序的微信号）发消息 → 回引导文案 + 小程序卡片。
+10. 取关再关注 → 订阅状态联动；配额用尽 → 「当天额度已用完」文案。
 
 ### F8 MCP 开放接入
 
 | 项 | 内容 |
 |----|------|
-| 前置 | SaaS 模式；`MCP_WORKER_SECRET/MCP_PUBLIC_URL` 已配置；Worker 可用；有 MCP 客户端（Cursor/Claude Desktop） |
+| 前置 | SaaS 模式；`MCP_WORKER_SECRET/MCP_PUBLIC_URL` 已配置；Worker 可用；有 MCP 客户端（Cursor/Kimi 等） |
 | 涉及接口 | `POST/GET/DELETE /mcp/key`、`POST /mcp/key/rotate`；Worker `https://mcp.pathmemos.com/mcp`、`/mcp/diary`、`/mcp/memories`、`/auth`、`/auth/bind`；源站 `/internal/mcp/*` |
 | 涉及表 | `api_keys`、`memories`、`diaries` |
 | 涉及页面 | `pages/sub/Mcp/Mcp` |
 
 验收步骤：
 1. MCP 页生成 Key（32 位、永不过期）→ 复制 mcpConfig 配入 Cursor → 工具调用 `query_memories` 能读日记/回忆；`store_memory` 写入后小程序内可见。
-2. `POST /mcp/key/rotate` → 旧 Key 立即失效（客户端 401），新 Key 可用。
-3. 绑定页：浏览器打开 `https://mcp.pathmemos.com/auth` → 粘贴 Key → 得到 `?t=<token>` URL → Claude Desktop 配置该 URL 可用（人工覆盖 02h MCP-3）。
+2. `POST /mcp/key/rotate` → 旧 Key 回源鉴权立即失效（客户端 401），新 Key 可用；边缘缓存最长 5 分钟自然收敛（keycheck 正缓存 60s、GET 缓存 1~5min）。
+3. 绑定页：浏览器打开 `https://mcp.pathmemos.com/auth` → 粘贴 Key → 得到 `?t=<token>` URL → MCP 客户端配置该 URL 可用（人工覆盖 02h MCP-3）。
 4. `GET /mcp/diary?limit=0`（curl）→ 200 空数组；跨度 >180 天 → 400；无效 Key → 401；Key 30/min 限流 → 429 `RATE_LIMITED`。
-5. 直连源站 `/internal/mcp/diary`（无 `X-Worker-Secret`）→ 403；`MCP_WORKER_SECRET` 未配置的环境 → 500。
+5. 直连源站 `/internal/mcp/diary`（无 `X-Worker-Secret`）→ 403；`MCP_WORKER_SECRET` 未配置 → saas 启动失败（健康门禁不通过），配置后恢复。
 
 ### F9 账号注销
 
@@ -178,14 +179,14 @@
 |----|------|
 | 前置 | 一次性测试账号，写入 1 条日记、1 张图片；`confirmName` 等于当前昵称 |
 | 涉及接口 | `DELETE /auth/account`（IP 限流 5 次/小时） |
-| 涉及表 | `users` 及全部级联表；`orders.user_id` 置空；`api_keys`/`user_invite_codes`/`user_common_addresses`/`ai_daily_quota_usage` 应用层清理 |
+| 涉及表 | `users` 及全部级联表；`orders.user_id` 置空；`user_invites`/`user_vip_claims` 置 NULL 保留（领取/邀请墓碑）；`api_keys`/`user_invite_codes`/`user_common_addresses`/`ai_daily_quota_usage` 应用层清理 |
 | 涉及页面 | `pages/sub/About/About` |
 
 验收步骤：
 1. About 页输入错误昵称 → 400 不注销。
 2. 输入正确昵称 → 200；本地清空回首页；旧 session 调接口 → 401；数据库 `users` 无该行；文件进入孤儿清理窗口。
 3. 并发注销（双端同时确认）→ 一端 429 `OPERATION_IN_PROGRESS`。
-4. 注销后同一微信重新登录 → 新用户（新 id），无旧数据。
+4. 注销后同一微信重新登录 → 新用户（新 id），无旧数据；重注册成功且 trial 不再发放（openid 墓碑跳过，登录不被 500 阻断）。
 
 ### F10 推送与异常告警
 
@@ -274,7 +275,7 @@
 | 02c AR-4 驻留点聚类 | 02c | F3 | 300m/30 分钟 |
 | 02c AR-5 逆地理编码 | 02c | F3 | 日配额 |
 | 02c AR-6 常用地址替换 | 02c | F3 | 300m 命中 |
-| 02c AR-7 同点去重 | 02c | F3 | 与当天最后自动条目比较 |
+| 02c AR-7 同点去重 | 02c | F3 | 与当日全部自动条目的地址并集集合判重（同 02c AR-7/D4） |
 | 02c AR-8 后台成文 | 02c | F3 | 5 分钟任务 |
 | 02c AR-9 首次即时成文 | 02c | F3 | `POST /diary/details/auto` |
 | 02c AR-10 新地点提醒 | 02c | F10 | — |
@@ -285,7 +286,7 @@
 | 02d F-2 创建家庭 | 02d | F5 | — |
 | 02d F-3 邀请链接 | 02d | F5 | linkId=familyId |
 | 02d F-4 链接加入 | 02d | F5 | — |
-| 02d F-5 链接加入奖励 | 02d | F5 | 注册 5 分钟内 |
+| 02d F-5 链接加入奖励 | 02d | F5 | 注册 7 天内（统一窗口） |
 | 02d F-6 退出家庭 | 02d | F5 | owner 禁止 |
 | 02d F-7 移除成员 | 02d | F5 | 步骤 4 |
 | 02d F-8 解散家庭 | 02d | F5（步骤 5） | 破坏性；一次性账号执行 |
@@ -308,7 +309,7 @@
 | 02e VP-13 前端支付交互 | 02e | F6 | — |
 | 02f AI-1 小程序 SSE | 02f | F7 | — |
 | 02f AI-2 重连幂等 | 02f | F7 | request_id + reply 缓存 |
-| 02f AI-3 公众号对话 | 02f | F7（步骤 5~9） | 公众号链路人工覆盖 |
+| 02f AI-3 公众号对话 | 02f | F7（步骤 6~10） | 公众号链路人工覆盖 |
 | 02f AI-4 配额 | 02f | F7 | 10/100 每日 |
 | 02f AI-5 上下文落库 | 02f | F7 | — |
 | 02f AI-6 上游异常 | 02f | F7 | 断上游人工演练 |
@@ -319,7 +320,7 @@
 | 02g F-5 头像更新 | 02g | F11 | — |
 | 02g F-6 存储与 URL | 02g | F11 | 本地/OSS |
 | 02g F-7 孤儿文件清理 | 02g | 不需场景 | 后台 7 天任务，DB 抽查即可 |
-| 02g P-1 公众号验证 | 02g | F7（步骤 5~9） | 公众号链路人工覆盖 |
+| 02g P-1 公众号验证 | 02g | F7（步骤 6~10） | 公众号链路人工覆盖 |
 | 02g P-2 消息去重 | 02g | F7（步骤 6） | Redis 60s |
 | 02g P-3 客服消息 | 02g | F7（步骤 6） | — |
 | 02g P-4 异常告警推送 | 02g | F10 | — |

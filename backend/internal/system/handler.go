@@ -29,15 +29,15 @@ func (h *Handler) GetConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if cfg.DeploymentMode == "open" {
-		// 开源版：微信支付回调指向 SaaS，付费购买关闭；免费 VIP 正常可用。
+		// 开源版：微信支付回调指向 SaaS，付费购买关闭；免费 VIP 默认可用（FREE_VIP_ENABLED 可关）。
 		features["payment"] = false
-		features["freeVip"] = true
+		features["freeVip"] = cfg.FreeVipEnabled
 		features["wxmp"] = false
 	} else {
 		features["payment"] = cfg.WechatVirtualOfferID != "" &&
 			cfg.WechatVirtualAppKeyProd != "" &&
 			cfg.WechatVirtualAppKeySandbox != ""
-		features["freeVip"] = true
+		features["freeVip"] = cfg.FreeVipEnabled
 		features["wxmp"] = cfg.WechatMsgToken != ""
 	}
 

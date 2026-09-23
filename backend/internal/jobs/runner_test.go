@@ -5,8 +5,39 @@ import (
 	"testing"
 	"time"
 
+	"papafeiji/backend/internal/config"
 	"papafeiji/backend/internal/pkg/safe"
 )
+
+// R-03：任务注册表必须完整、名字唯一、失联阈值 > 0，且与运维 CLI 的任务名清单一致。
+func TestJobSpecsRegistry(t *testing.T) {
+	r := &Runner{cfg: &config.Config{}, jobs: map[string]time.Duration{}}
+	specs := r.specs()
+	if len(specs) != len(KnownJobNames()) {
+		t.Fatalf("specs=%d, KnownJobNames=%d", len(specs), len(KnownJobNames()))
+	}
+	seen := map[string]bool{}
+	for _, s := range specs {
+		if s.name == "" || s.lockKey == "" || s.run == nil {
+			t.Fatalf("incomplete spec: %+v", s)
+		}
+		if seen[s.name] {
+			t.Fatalf("duplicate job name %q", s.name)
+		}
+		seen[s.name] = true
+		if s.staleAfter() <= 0 {
+			t.Fatalf("job %s staleAfter must be > 0", s.name)
+		}
+	}
+	for _, name := range KnownJobNames() {
+		if !seen[name] {
+			t.Fatalf("KnownJobNames has %q but specs does not", name)
+		}
+	}
+	if got := jobName(lockAutoRecord); got != "auto_record" {
+		t.Fatalf("jobName = %q, want auto_record", got)
+	}
+}
 
 func TestGoWithRecover_PanicNotifiesChannel(t *testing.T) {
 	ctx := context.Background()

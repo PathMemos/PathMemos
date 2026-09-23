@@ -58,7 +58,7 @@
 
 作为用户，我进入某天详情看到该天条目、图片、封面与我的记忆。
 
-**时序**：GET /diary/details?diaryId=&memberUserId=&page=&size= → parseVirtualID（非法 400）→ GetFamilyMembers 校验家庭（不匹配 403 code=4030）→ memberUserId 过滤（空=全家；self=本人；其他必须是成员，否则 404 code=4040）→ ListDiaryEntries（sort ASC, record_time ASC NULLS LAST, created_at ASC，offset/limit）→ 批量取图片路径 → entryToMap；记忆按 memoryUserID（指定成员时用成员，否则本人）ListMemoriesByUserAndDate → memoryToMap；封面 ResolveCoverImage → JSONWithExtra(data=entries, extra={coverImg,coverImage,memories})。
+**时序**：GET /diary/details?diaryId=&memberUserId=&page=&size= → parseVirtualID（非法 400）→ GetFamilyMembers 校验家庭（不匹配 403 code=4030）→ memberUserId 过滤（空=全家；self=本人；其他必须是成员，否则 404 code=4040）→ ListDiaryEntries（sort ASC, record_time ASC NULLS LAST, created_at ASC，offset/limit）→ 批量取图片路径 → entryToMap；记忆按 memoryUserID（指定成员时用成员，否则本人）ListMemoriesByUserAndDate → memoryToMap；封面 ResolveCoverImage → `JSONWithExtraAndCount`(data=entries, extra={coverImg,coverImage,memories}, count)。
 
 **AC**：
 - size 默认 20、上限 100；page 默认 1。
@@ -77,7 +77,7 @@
 - body >64KB → 413 code=4130；JSON 非法 → 400。
 - imageIds >9 → 400 code=4000（maxImagesPerEntry=9）。
 - text >10000 code points → 400 code=4000 + biz_code=TEXT_TOO_LONG。
-- color 非 validator.ValidateColor 合法值 → 400 code=4000 + biz_code=INVALID_COLOR_FORMAT；空串视为不设置。
+- color 非 validator.ValidateColor 合法值 → 400 code=4000 + biz_code=INVALID_COLOR_FORMAT；空串与缺省一致视为不设置（创建/更新均映射为 NULL）。
 - lat/lon 只传其一或越界 → 400 code=4000 + biz_code=INVALID_COORDINATES。
 - address/detailAddress >500 runes → 400 code=4000。
 - recordTime 非 RFC3339 → 400 code=4000。
@@ -88,19 +88,19 @@
 
 作为作者，我要修改自己的条目。
 
-**时序**：PUT /diary/details（id 必填，空 400）→ 取条目/日记，非作者 403 code=4030；取家庭；校验图片 → 计算 removedImageIDs（旧关联中不在新集合的）→ 若改了 recordTime 且上海日期 ≠ 日记日期 → ErrRecordTimeCrossDay 400 code=4000 → db.WithTx：UpdateDiaryEntry（0 行 → 404）、DeleteDiaryEntryImages、批量写新关联、批量清理被移除图片的封面引用、TouchDiaryUpdatedAt → 异步失效 MCP 缓存 → **同步**刷新封面 → 异步物理删除被移除且无其它引用的文件（safe.Go 2 分钟）→ 返回 {card?}。
+**时序**：PUT /diary/details（id 必填，空 400）→ 取条目/日记，非作者 403 code=4030；取家庭；校验图片 → 计算 removedImageIDs（旧关联中不在新集合的）→ 若改了 recordTime 且上海日期 ≠ 日记日期 → ErrRecordTimeCrossDay 400 code=4000 → db.WithTx：UpdateDiaryEntry（0 行 → 404）、DeleteDiaryEntryImages、批量写新关联、批量清理被移除图片的封面引用、TouchDiaryUpdatedAt → 异步失效 MCP 缓存 → **同步**刷新封面 → 异步物理删除被移除且无其它引用的文件（safe.Go 2 分钟）→ 返回 {card?}；物理删除与 files 行删除、图片配额回退（`DecrementUserImageStorage`）同一事务，扣减失败整体回滚。
 
 **AC**：跨天改期返回 400 code=4000；条目不存在 404 code=4040；非作者 403 code=4030；被移除图片的封面引用被批量清空。
 
 ### D-6 删除条目
 
-**时序**：DELETE /diary/details?id= → id 空 400 code=4000 → 取条目/日记（不存在 404 code=4040，非作者 403 code=4030）→ db.WithTx：DeleteDiaryEntryImagesReturningFileIDs、批量清封面引用、DeleteDiaryEntryByID、TouchDiaryUpdatedAt；若条目数=0 且当日记忆数=0 则删除空日记 → 异步刷新封面（safe.Go 30s）+ 异步物理删除图片（safe.Go 2 分钟）。
+**时序**：DELETE /diary/details?id= → id 空 400 code=4000 → 取条目/日记（不存在 404 code=4040，非作者 403 code=4030）→ db.WithTx：DeleteDiaryEntryImagesReturningFileIDs、批量清封面引用、DeleteDiaryEntryByID、TouchDiaryUpdatedAt；若条目数=0 且当日记忆数=0 则删除空日记 → 异步刷新封面（safe.Go 30s）+ 异步物理删除图片（safe.Go 2 分钟）+ **同步**失效该用户 MCP 缓存（`mcp.InvalidateUserCache`；创建/更新路径为 safe.Go 异步，删除路径为同步）+ 同步失效家庭 AI 汇总缓存（`InvalidateFamilySummary`；条目增/改/删后 handler 均调用）；物理删除与 files 行删除、图片配额回退（`DecrementUserImageStorage`）同一事务，扣减失败整体回滚。
 
 **AC**：删除最后一条条目且当日无记忆时 diaries 行被删除；有记忆时不删除。
 
 ### D-7 自动记录成文（VIP）
 
-**时序**：POST /diary/details/auto body {lat,lon} → vipService.GetVIPInfo，非 VIP 返回 HTTP 403 + code=4030 + biz_code=NOT_VIP→ 坐标校验（非法 400 code=4000）→ 日配额 location.CheckReverseQuota（每用户每日 200 次；Redis 不可用 fail-closed；超限 429 code=4290 + biz_code=RATE_LIMITED）→ 腾讯逆地理编码（失败 500 code=5001）→ record_date 为上海当日，record_time=now → 同一天内与上一条自动记录去重（landmark 或 detail_address 相同则返回已有 entryID，不新建）→ db.WithTx：UpsertDiary + CreateDiaryEntry（text=（自动记录）、address=landmark、detail_address=address）→ 异步 refreshCoverAsync + safe.Go 新地点推送（SendNewPlaceAlert）→ 返回 {id}。
+**时序**：POST /diary/details/auto body {lat,lon} → vipService.GetVIPInfo，非 VIP 返回 HTTP 403 + code=4030 + biz_code=NOT_VIP→ 坐标校验（非法 400 code=4000）→ 日配额 location.CheckReverseQuota（每用户每日 200 次；Redis 不可用 fail-closed；超限 429 code=4290 + biz_code=RATE_LIMITED）→ 腾讯逆地理编码（失败 500 code=5001）→ record_date 为上海当日，record_time=now → 同一天内与全部自动条目的地址并集集合判重（与后台共用同一语义：landmark/detail_address 命中集合任一成员即重复，返回已有 entryID——首条命中即最新同址条目，不新建）→ db.WithTx：UpsertDiary + CreateDiaryEntry（text=（自动记录）、address=landmark、detail_address=address（空时不写，与后台自动记录一致））→ 异步 refreshCoverAsync + safe.Go 新地点推送（SendNewPlaceAlert）→ 返回 {id}。
 
 **AC**：非 VIP 403 code=4030 biz_code=NOT_VIP；超配额 429 code=4290 biz_code=RATE_LIMITED；同地点重复调用返回同一 entryID 且不新增行；条目 text 精确等于（自动记录）；无 redis 时直接 429。
 
@@ -124,7 +124,7 @@
 
 ### D-10 删除整日日记
 
-**时序**：DELETE /diary/info?id= → parseVirtualID（非法 400）→ DeleteDiary：校验家庭（403）→ 取本人该日期日记（不存在直接返回成功）→ db.WithTx：删除本人当日 memories、DeleteDiaryImagesReturningFileIDs、批量清手动/图片封面引用、DeleteDiaryByID（级联删除该用户当日 entries）→ 异步失效 MCP 缓存 → 异步物理删除文件（2 分钟）→ 异步刷新家庭当日封面（30s）→ 记录 OPS-LOG diary deleted。handler 成功后 InvalidateFamilySummary。
+**时序**：DELETE /diary/info?id= → parseVirtualID（非法 400）→ DeleteDiary：校验家庭（403）→ 取本人该日期日记（不存在直接返回成功）→ db.WithTx：删除本人当日 memories、DeleteDiaryImagesReturningFileIDs、批量清手动/图片封面引用、DeleteDiaryByID（级联删除该用户当日 entries）→ 异步失效 MCP 缓存 → 异步物理删除文件（2 分钟）→ 异步刷新家庭当日封面（30s）→ 记录 OPS-LOG diary deleted；物理删除与 files 行删除、图片配额回退（`DecrementUserImageStorage`）同一事务，扣减失败整体回滚。handler 成功后 InvalidateFamilySummary。
 
 **AC**：只删除当前用户在该日期的日记/记忆，不影响其他成员同日日记；家庭不匹配 403；id 非法 400。
 
@@ -164,11 +164,10 @@ GET /diary/stats：取家庭成员 → 上海当前时间所在周（周一为�
 | diary_entries | id PK、diary_id FK→diaries ON DELETE CASCADE、created_by FK→users ON DELETE CASCADE、text text、lat/lon numeric(10,7)、address/detail_address text、record_time timestamptz、sort int DEFAULT 0、color text、created_at/updated_at | CHECK：address/detail_address ≤500 字符；lat/lon 成对；lat∈[-90,90]、lon∈[-180,180]；color 匹配 #(3/6/8 位十六进制) |
 | diary_entry_images | id PK、diary_entry_id FK→diary_entries ON DELETE CASCADE、file_id FK→files(id)（无 CASCADE）、sort_order int DEFAULT 0、created_at；UNIQUE(diary_entry_id,file_id) | 条目-文件关联；索引 entry_id/file_id |
 | memories | id PK、user_id FK→users ON DELETE CASCADE、record_time timestamptz NOT NULL、record_date date NOT NULL、title text NOT NULL、content text NOT NULL、created_at | 无 updated_at；查询覆盖索引 (user_id, record_date DESC, record_time DESC) INCLUDE(title,content) |
-| family_daily_covers | family_id text、record_date date、复合 PK(family_id,record_date)、cover_file_id FK→files ON DELETE SET NULL、cover_type text DEFAULT default、manual_cover_file_id FK→files ON DELETE SET NULL、updated_at | CHECK cover_type ∈ {image,trajectory,default,manual}；触发器 trg_family_daily_covers_fix_type：manual_cover_file_id IS NULL 且 cover_type=manual → default，cover_file_id IS NULL 且 cover_type∈{image,trajectory} → default |
+| family_daily_covers | family_id text（FK→families ON DELETE CASCADE，000009）、record_date date、复合 PK(family_id,record_date)、cover_file_id FK→files ON DELETE SET NULL、cover_type text DEFAULT default、manual_cover_file_id FK→files ON DELETE SET NULL、updated_at | CHECK cover_type ∈ {image,trajectory,default,manual}；触发器 trg_family_daily_covers_fix_type：manual_cover_file_id IS NULL 且 cover_type=manual → default，cover_file_id IS NULL 且 cover_type∈{image,trajectory} → default |
 | files | 见 PP-02G | 封面/图片/轨迹图/头像 marker 共用 |
 | users | current_family_id、avatar_file_id 等 | 提供家庭与头像信息 |
 
-**注**：代码中不存在名为 covers 的表，封面表实为 family_daily_covers。
 
 ## 5. API 契约
 
@@ -232,10 +231,10 @@ GET /diary/stats：取家庭成员 → 上海当前时间所在周（周一为�
 
 ## 8. 运维与任务
 
-- **后台任务**（backend/internal/jobs/runner.go）：孤儿文件清理（默认 7 天周期）、旧系统文件清理（轨迹图 7 天）、自动记录（5 分钟）、异常告警（5 分钟）、公共地址汇总（每日 03:00）、AI 日志清理（>90 天）、订单关闭、客户端日志清理（>30 天）。任务用 PostgreSQL advisory lock 互斥，任务自身幂等。
+- **后台任务**（backend/internal/jobs/runner.go）：孤儿文件清理（默认 7 天周期）、旧系统文件清理（轨迹图 7 天）、自动记录（5 分钟）、异常告警（5 分钟）、公共地址汇总（每日 03:00）、AI 日志清理（>90 天）、订单关闭、客户端日志清理（>30 天）、轨迹清理（默认 6 小时）、已删对象 CDN 刷新（默认 24 小时，`CDN_REFRESH_ENABLED=1` 才启用）。任务用 PostgreSQL advisory lock 互斥，任务自身幂等。
 - 并发换头像 / 并发封面刷新可能产生孤儿轨迹文件，由 7 天清理任务回收。
 - **Redis 键**：`lock:covers:refresh:{family}:{date}`（SETNX 30s 去重节流标记）、location:reverse:{user}:{date}、ai:family_summary:{family}（InvalidateFamilySummary）。
 - **锁**：`lock:covers:{family}:{date}` 为 PostgreSQL advisory lock（ADR-0005），不是 Redis 键。
 - **环境变量**：STORAGE_LOCAL_PATH（默认 /opt/pathmemos/uploads）、TENCENT_MAP_KEY（可多值，backend/internal/config/config.go）、OSS_*、JOB_INTERVAL_*。
 - **轨迹图外部依赖**：腾讯静态地图 https://apis.map.qq.com/ws/staticmap/v2/；应用内限流 limiter.WaitStaticMap。
-- **Migration**：本域相关为 000001_baseline、000002_fix_cover_trigger_preserve_file_id（封面触发器保留 cover_file_id）；当前最大编号 000006_drop_sys_configs；均含 .down.sql。
+- **Migration**：本域相关为 000001_baseline、000002_fix_cover_trigger_preserve_file_id（封面触发器保留 cover_file_id）、000009_family_covers_fk（`family_daily_covers.family_id` 补外键）；当前最大编号 000011_user_invites_inviter_set_null；均含 .down.sql。

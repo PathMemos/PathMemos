@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"papafeiji/backend/internal/pkg/safe"
+
 	"github.com/redis/go-redis/v9"
 )
 
@@ -49,13 +51,13 @@ func NewClient(addr string) (*redis.Client, error) {
 	rdb := redis.NewClient(opt)
 
 	// B6a-08：启动时异步 Ping，失败仅告警不阻断启动；连接池与请求级重试自愈。
-	go func() {
+	safe.Go(context.Background(), nil, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := rdb.Ping(ctx).Err(); err != nil {
 			slog.Warn("redis startup ping failed", slog.Any("error", err))
 		}
-	}()
+	})
 
 	return rdb, nil
 }

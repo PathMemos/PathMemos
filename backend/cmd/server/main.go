@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -189,7 +192,7 @@ func run() error {
 	diaryService.SetNewPlaceAlerter(pushService)
 	autoRecordService := autorecord.NewService(pool, rdb, cfg, diaryService, pushService)
 	bgAutoRecordService := autorecord.NewService(bgPool, rdb, cfg, diaryService, pushService)
-	jobRunner := jobs.NewRunner(pool, bgPool, bgAutoRecordService, storage, pushService, cfg, purgeQueue, cdnPurger)
+	jobRunner := jobs.NewRunner(pool, bgPool, bgAutoRecordService, storage, pushService, cfg, purgeQueue, cdnPurger, rdb)
 	jobRunner.Start(ctx)
 
 	httpRouter := chi.NewRouter()
@@ -209,6 +212,8 @@ func run() error {
 	publicLimiter := mw.NewIPRateLimiter(60, time.Minute, cfg.TrustedProxyCIDR)
 	publicRouter := chi.NewRouter()
 	publicRouter.Use(publicLimiter.Handler)
+	// 公开路由（登录、支付/公众号回调、system/config）也输出访问日志，供 P95 统计。
+	publicRouter.Use(mw.AccessLogMiddleware(logger))
 
 	mcpHandler := mcp.NewHandler(pool, cfg, rdb)
 
@@ -423,7 +428,21 @@ func newLogger(level string) *slog.Logger {
 		lv = slog.LevelInfo
 	}
 
-	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lv})
+	// LOG_FILE 非空时把结构化日志同时落盘到该文件（compose 挂载的持久化目录），
+	// stdout 保留以便 docker logs / 现有告警扫描继续可用；容器重建后宿主机日志不丢，
+	// 便于多天排障与日志监控。未配置（如本地开发）时仅输出 stdout。
+	var w io.Writer = os.Stdout
+	if path := strings.TrimSpace(os.Getenv("LOG_FILE")); path != "" {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "log file dir unavailable, fallback to stdout: path=%s err=%v\n", path, err)
+		} else if f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "log file unavailable, fallback to stdout: path=%s err=%v\n", path, err)
+		} else {
+			w = io.MultiWriter(os.Stdout, f)
+		}
+	}
+
+	handler := slog.NewJSONHandler(w, &slog.HandlerOptions{Level: lv})
 	return slog.New(handler)
 }
 

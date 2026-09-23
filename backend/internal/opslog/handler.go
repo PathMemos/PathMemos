@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"papafeiji/backend/internal/db"
@@ -115,13 +116,8 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 	if device == "" {
 		device = r.UserAgent()
 	}
-	if len(device) > 256 {
-		device = device[:256]
-	}
-	appVersion := req.AppVersion
-	if len(appVersion) > 64 {
-		appVersion = appVersion[:64]
-	}
+	device = truncateUTF8(device, 256)
+	appVersion := truncateUTF8(req.AppVersion, 64)
 
 	if _, err := h.pool.Queries().InsertClientOpsLog(ctx, sqlc.InsertClientOpsLogParams{
 		ID:         id,
@@ -140,4 +136,13 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	middleware.JSON(w, r, http.StatusOK, map[string]interface{}{})
+}
+
+// truncateUTF8 按字节上限截断并丢弃切断的多字节残片，避免写出非法 UTF-8 触发
+// Postgres invalid byte sequence 导致上报接口 500（device 256 / appVersion 64）。
+func truncateUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return strings.ToValidUTF8(s[:max], "")
 }

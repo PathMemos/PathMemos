@@ -219,29 +219,7 @@ func (q *Queries) GetDiaryEntry(ctx context.Context, id string) (DiaryEntry, err
 	return i, err
 }
 
-const getUserLastAutoEntry = `-- name: GetUserLastAutoEntry :one
-SELECT id, address, detail_address
-FROM diary_entries
-WHERE created_by = $1
-  AND text = '（自动记录）'
-ORDER BY record_time DESC NULLS LAST
-LIMIT 1
-`
-
-type GetUserLastAutoEntryRow struct {
-	ID            string      `json:"id"`
-	Address       pgtype.Text `json:"address"`
-	DetailAddress pgtype.Text `json:"detailAddress"`
-}
-
-func (q *Queries) GetUserLastAutoEntry(ctx context.Context, createdBy string) (GetUserLastAutoEntryRow, error) {
-	row := q.db.QueryRow(ctx, getUserLastAutoEntry, createdBy)
-	var i GetUserLastAutoEntryRow
-	err := row.Scan(&i.ID, &i.Address, &i.DetailAddress)
-	return i, err
-}
-
-const getUserLastAutoEntryByDate = `-- name: GetUserLastAutoEntryByDate :one
+const listAutoEntryAddressesByDate = `-- name: ListAutoEntryAddressesByDate :many
 SELECT e.id, e.address, e.detail_address
 FROM diary_entries e
 JOIN diaries d ON d.id = e.diary_id
@@ -249,25 +227,39 @@ WHERE e.created_by = $1
   AND e.text = '（自动记录）'
   AND d.record_date = $2
 ORDER BY e.record_time DESC NULLS LAST
-LIMIT 1
 `
 
-type GetUserLastAutoEntryByDateParams struct {
+type ListAutoEntryAddressesByDateParams struct {
 	CreatedBy  string      `json:"createdBy"`
 	RecordDate pgtype.Date `json:"recordDate"`
 }
 
-type GetUserLastAutoEntryByDateRow struct {
+type ListAutoEntryAddressesByDateRow struct {
 	ID            string      `json:"id"`
 	Address       pgtype.Text `json:"address"`
 	DetailAddress pgtype.Text `json:"detailAddress"`
 }
 
-func (q *Queries) GetUserLastAutoEntryByDate(ctx context.Context, arg GetUserLastAutoEntryByDateParams) (GetUserLastAutoEntryByDateRow, error) {
-	row := q.db.QueryRow(ctx, getUserLastAutoEntryByDate, arg.CreatedBy, arg.RecordDate)
-	var i GetUserLastAutoEntryByDateRow
-	err := row.Scan(&i.ID, &i.Address, &i.DetailAddress)
-	return i, err
+// R-20/R-22（同日去重集合化）：取当天全部自动条目的 id+地址，后台与手动即时成文共用；
+// 后者需要已存在条目 id 供响应契约（ORDER BY DESC 保证首条命中即最新）。
+func (q *Queries) ListAutoEntryAddressesByDate(ctx context.Context, arg ListAutoEntryAddressesByDateParams) ([]ListAutoEntryAddressesByDateRow, error) {
+	rows, err := q.db.Query(ctx, listAutoEntryAddressesByDate, arg.CreatedBy, arg.RecordDate)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAutoEntryAddressesByDateRow{}
+	for rows.Next() {
+		var i ListAutoEntryAddressesByDateRow
+		if err := rows.Scan(&i.ID, &i.Address, &i.DetailAddress); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listDiaryEntryImageFileIDsByDiaryID = `-- name: ListDiaryEntryImageFileIDsByDiaryID :many

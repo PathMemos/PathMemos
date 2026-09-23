@@ -1523,10 +1523,16 @@ func (s *Service) CreateAutoEntry(ctx context.Context, userID string, lat, lon f
 		}()
 	}
 
-	lastID, dup, err := autorecord.IsSameAsLastAutoEntry(ctx, s.pool, userID, landmark, address, recordDateTime, nil)
+	// R-22：与后台 autorecord 共用同日地址并集判重（可识别同日折返旧地点），
+	// 命中时直接返回已存在条目 id（响应契约不变）。
+	addrRows, err := s.pool.Queries().ListAutoEntryAddressesByDate(ctx, sqlc.ListAutoEntryAddressesByDateParams{
+		CreatedBy:  userID,
+		RecordDate: recordDateTime,
+	})
 	if err != nil {
-		return "", "", "", fmt.Errorf("check last auto entry: %w", err)
+		return "", "", "", fmt.Errorf("list auto entry addresses: %w", err)
 	}
+	lastID, dup := autorecord.FindDuplicateAutoEntry(addrRows, landmark, address)
 	if dup {
 		slog.DebugContext(ctx, "auto entry same as last auto entry, skip create", slog.String("user_id", userID), slog.String("landmark", landmark))
 		return lastID, familyID, recordDate, nil
@@ -1568,7 +1574,7 @@ func (s *Service) CreateAutoEntry(ctx context.Context, userID string, lat, lon f
 			Lat:           latNum,
 			Lon:           lonNum,
 			Address:       pgtype.Text{String: landmark, Valid: true},
-			DetailAddress: pgtype.Text{String: address, Valid: true},
+			DetailAddress: pgtype.Text{String: address, Valid: address != ""},
 			RecordTime:    pgtype.Timestamptz{Time: now, Valid: true},
 		}); err != nil {
 			return fmt.Errorf("create diary entry: %w", err)
@@ -1725,12 +1731,24 @@ func (s *Service) deleteIfOnlySelfReferenced(ctx context.Context, fileID, selfEn
 				return nil
 			}
 		}
-		file, err := q.GetFileByID(ctx, fileID)
+		// FOR UPDATE 在 files 行上串行化「引用检查→删除→扣减」，防止同一文件被两个并发
+		// 删除事务先后通过引用检查而双扣配额（与 file.DeletePhysicalIfUnreferenced 对齐）。
+		file, err := q.GetFileByIDForUpdate(ctx, fileID)
 		if err != nil {
 			return fmt.Errorf("get file: %w", err)
 		}
 		if err := q.DeleteFile(ctx, fileID); err != nil {
 			return fmt.Errorf("delete file record: %w", err)
+		}
+		// 与 file.DeletePhysicalIfUnreferenced 同约束：扣减失败须回滚，否则 files 行已删、
+		// image_storage_bytes 未回退，幽灵字节永久占用配额且无法补偿。
+		if file.FileType == "image" && file.CreatedBy.Valid && file.CreatedBy.String != "" {
+			if decErr := q.DecrementUserImageStorage(ctx, sqlc.DecrementUserImageStorageParams{
+				ID:                file.CreatedBy.String,
+				ImageStorageBytes: file.SizeBytes,
+			}); decErr != nil {
+				return fmt.Errorf("decrement user image storage: %w", decErr)
+			}
 		}
 		filePath = file.Path
 		storageType = file.StorageType
@@ -2576,7 +2594,7 @@ func buildCreateEntryParams(entryID, diaryID, userID string, req *entryRequest, 
 	if req.Sort != nil {
 		params.Sort = *req.Sort
 	}
-	if req.Color != nil {
+	if req.Color != nil && *req.Color != "" {
 		params.Color = pgtype.Text{String: *req.Color, Valid: true}
 	}
 

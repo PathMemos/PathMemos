@@ -4,7 +4,7 @@
 > 上游：PP-01 产品总览｜关联 ADR：ADR-0001（MCP 剥离到 Cloudflare Worker）、ADR-0004（app/sse 双容器）
 > 说明：本文件按当前代码实现整理，描述当前接口契约。章节遵循 docs/spec-standards.md 第二节 L3 必含小节（认证与请求头 / 统一响应结构 / 错误码词汇表 / 分页 / 状态码映射 / 超时与限流 / 数据归属校验 / 幂等约定 / 按域分组全登记 + 通用契约模板）。
 >
-> **实现锚点**（仅定位用途；行为契约以本文为准，与代码不一致时按 `spec-standards.md` §七「整改期权威顺序」裁决——行为类差异以本文为准修改代码）：
+> **实现锚点**（仅定位用途，标注当前代码位置）：
 > - 路由挂载与中间件顺序：backend/cmd/server/main.go
 > - 各域注册方法：backend/internal/*/handler.go 的 Register / RegisterPublic / RegisterProtected；backend/internal/mcp/rpc.go 的 RegisterInternal / RegisterPublic
 > - 中间件：backend/internal/middleware/{session,open_auth,worker,response,ratelimit,keylimit,body,accesslog}.go
@@ -32,7 +32,7 @@
 - Authorization: Bearer sessionId → Redis session:<id> → 注入 user_id + session_id 到 context（middleware/session.go:279-301）。
 - 会话 TTL：滑动过期 30 天（sessionExpiry）、绝对过期 90 天（sessionAbsoluteExpiry）；每次成功读取刷新滑动 TTL（session.go:23-29,160-178）。
 - 缺失 session → 401 + code="4010" + biz_code="SESSION_INVALID" + message="missing session"；不存在/过期 → 401 + code="4010" + biz_code="SESSION_INVALID" + "invalid or expired session"；Redis 错误 → 500 + code="5001" + "failed to check session"。
-- SaaS 模式的受保护分组使用 SessionMiddleware；open 模式使用 OpenAuthMiddleware（main.go:224-227,301-305）。
+- SaaS 模式的受保护分组使用 SessionMiddleware；open 模式使用 OpenAuthMiddleware（main.go:240-245,318-322）。
 
 **B. 开源版 API Key 鉴权（仅 open 模式，OpenAuthMiddleware）**
 
@@ -50,8 +50,8 @@
   - 路径命中 skip 前缀 → 直接放行；
   - **无 X-Forwarded-Host** → 直接放行（允许 SaaS 小程序直连 pro.papafeiji.cn）；
   - 有 X-Forwarded-Host → 校验 X-Worker-Secret，缺失/不匹配返回 403（纯文本 forbidden，非统一 envelope）。
-- HTTP apiRouter 的 skip 前缀：/api/prod/payment/virtualPayNotify、/wx/callback、/internal/mcp（main.go:190）；health 端点不挂载 WorkerAuth；SSE 路由的 WorkerAuth 无 skip 前缀，但 health 注册在分组之外（main.go:292-300）。
-- SaaS /internal/mcp/* 由 mcp.workerSecretAuth 独立校验 MCP_WORKER_SECRET：未配置 → 500 + server misconfigured；不匹配 → 403 + forbidden（mcp/rpc.go:41-58）。
+- HTTP apiRouter 的 skip 前缀：/api/prod/payment/virtualPayNotify、/wx/callback、/internal/mcp（main.go:207）；health 端点不挂载 WorkerAuth；SSE 路由的 WorkerAuth 无 skip 前缀，但 health 注册在分组之外（main.go:309-317）。
+- SaaS /internal/mcp/* 由 mcp.workerSecretAuth 独立校验 MCP_WORKER_SECRET：saas 模式启动即强制非空（`config.validate`），运行时未配置 → 500 + server misconfigured；不匹配 → 403 + forbidden（mcp/rpc.go）。
 
 ### 1.3 部署模式差异（DEPLOYMENT_MODE=saas|open，默认 saas）
 
@@ -59,13 +59,13 @@
 |------|----------------|--------|
 | 受保护分组中间件 | SessionMiddleware | OpenAuthMiddleware |
 | MCP 协议端点 | 仅 /internal/mcp/*（X-Worker-Secret，RegisterInternal） | 仅公开 /mcp/*（RegisterPublic，IP 限流 60/min） |
-| /mcp/key* 管理 | 会话分组内 | 会话分组内；以 apikey: 身份调用会被 403 拒绝（mcp/handler.go:173-179） |
-| 启动 migration / seed | 由 deploy.sh 控制 | 启动时 migration.Run + bootstrap.SeedOpenBackend（main.go:111,134） |
+| /mcp/key* 管理 | 会话分组内 | 会话分组内；以 apikey: 身份调用会被 403 拒绝（mcp/handler.go:169-175） |
+| 启动 migration / seed | 由 deploy.sh 控制 | 启动时 migration.Run + bootstrap.SeedOpenBackend（main.go:112,135） |
 | /system/config features | payment/wxmp 按 env 计算 | payment=false、wxmp=false |
 
 ## 2. 统一响应结构
 
-源文件：backend/internal/middleware/response.go（responseEnvelope，第 16-25 行）。
+源文件：backend/internal/middleware/response.go（responseEnvelope，第 15-24 行）。
 
 字段定义：
 
@@ -75,20 +75,21 @@
 | BizCode | biz_code | 不出现 | 可选出现 | **语义码唯一载体**（如 SESSION_INVALID、RATE_LIMITED、NOT_VIP）；同一 biz_code 全端点同一 HTTP 状态 |
 | Message | message | "ok" | 具体文案 | |
 | Data | data | 业务数据 | 不出现（omitempty） | 空 map 会输出，nil 省略 |
-| Extra | extra | 不出现 | 不出现 | 仅 JSONWithExtra（GET /diary/details）使用 |
+| Extra | extra | 不出现 | 不出现 | 仅 GET /diary/details（经 JSONWithExtraAndCount）下发非空 extra |
 | Count | count | 不出现 | 不出现 | JSONWithPagination（GET /diary/info）与 JSONWithExtraAndCount（GET /diary/details）使用 |
 | NextCursor | nextCursor | 不出现 | 不出现 | 同上 |
-| RequestID | request_id | 始终出现 | 始终出现 | 优先复用请求头 X-Request-ID，否则 middleware.GetReqID，最后生成 UUID（response.go:51-63） |
+| RequestID | request_id | 始终出现 | 始终出现 | 优先复用请求头 X-Request-ID，否则 middleware.GetReqID，最后生成 UUID（response.go:50-62） |
 
-三个构造器：
+六个构造器：
 
 | 函数 | 字段组合 | 使用者 |
 |------|---------|--------|
 | JSON(w,r,status,data) | code=0000, message=ok, data | 绝大多数成功响应 |
 | JSONWithPagination(w,r,status,data,nextCursor,count) | + count、nextCursor | GET /diary/info |
-| JSONWithExtra(w,r,status,data,extra) | + extra | GET /diary/details（旧） |
+| JSONWithExtra(w,r,status,data,extra) | + extra | JSON() 的底层实现（extra=nil） |
 | JSONWithExtraAndCount(w,r,status,data,extra,count) | + extra、count | GET /diary/details |
 | JSONError(w,r,status,code,message,bizCode...) | code/message；biz_code 可选 | 所有错误 |
+| JSONBizError(w,r,bizCode,message) | code/HTTP 状态由 biz_code 唯一推导；biz_code | 仅持有 biz_code 的错误分支 |
 
 ### 2.1 非 envelope 响应（必须单独处理）
 
@@ -98,9 +99,9 @@
 | 微信公众号回调 GET /wx/callback | 纯文本 echostr（200）或 fail（403） | wxmp/handler.go:94-114 |
 | 微信公众号回调 POST /wx/callback | XML 回复或纯文本 success（200） | wxmp/handler.go:203-248,444-454 |
 | SSE POST /ai/chat | text/event-stream，见 2.2 | ai/handler.go、ai/upstream.go |
-| MCP 数据端点 /mcp/*、/internal/mcp/* | MCP JSON-RPC 或 {"data":...,"truncated":...}；HTTP 层错误为纯文本 | mcp/server.go、mcp/handler.go |
-| POST /file/upload 超时 | http.TimeoutHandler 返回 {"code":"5001","message":"upload timeout"}（非统一 envelope 包：是 message 不是 msg，且无 request_id） | main.go:256 |
-| WorkerAuth / workerSecretAuth 拒绝 | 纯文本 forbidden（403） | middleware/worker.go:39-41、mcp/rpc.go:54-56 |
+| MCP 数据端点 /mcp/*、/internal/mcp/* | JSON-RPC 端点 `/mcp`、`/internal/mcp/rpc` 错误为纯文本（`mcp/server.go`）；REST 端点 `diary`/`memories` 返回统一 envelope（401/400/413/429/500 走 `middleware.JSON*`，`mcp/handler.go`） | mcp/server.go、mcp/handler.go |
+| POST /file/upload 超时 | http.TimeoutHandler 返回 {"code":"5001","message":"upload timeout"}（非统一 envelope 包：是 message 不是 msg，且无 request_id） | main.go:273 |
+| WorkerAuth / workerSecretAuth 拒绝 | 纯文本 forbidden（403） | middleware/worker.go:39-41、mcp/rpc.go:52-55 |
 
 ### 2.2 SSE 事件流（POST /ai/chat）
 
@@ -108,15 +109,16 @@
 
 | 事件 | 载荷 | 源文件 |
 |------|------|--------|
-| 数据块 | 每个 chunk 按行输出 data: <line> + 换行，末尾空行 | ai/upstream.go:246-258 |
-| 结束 | event: done + data 空行 | ai/upstream.go:260-266 |
-| 错误 | event: error，data 为 {"code":"<枚举>","biz_code":"<语义码?>","bizCode":"<语义码?>","message":"<msg>"}（`bizCode` 为**常驻兼容字段**，与 `biz_code` 长期并存，供旧客户端读取） | ai/upstream.go:268-283 |
+| 数据块 | 每个 chunk 按行输出 data: <line> + 换行，末尾空行 | ai/upstream.go:244-256 |
+| 心跳 | 每 25s 一条 SSE 注释行 `: heartbeat`（无 event/data 语义，客户端忽略） | ai/handler.go |
+| 结束 | event: done + data 空行 | ai/upstream.go:258-264 |
+| 错误 | event: error，data 为 {"code":"<枚举>","biz_code":"<语义码?>","bizCode":"<语义码?>","message":"<msg>"}（`bizCode` 为与 `biz_code` 同时下发、供旧客户端读取的兼容字段） | ai/upstream.go:266-282 |
 
 错误事件取值：配额超限 code=4290、biz_code=AI_DAILY_QUOTA_EXCEEDED、message="daily ai chat quota exceeded"；在途冲突（同 request_id 处理中，等待超时或在途失败，**不回落生成**）code=4290、biz_code=OPERATION_IN_PROGRESS、message="ai turn in progress, retry later"；超时 code=5001、message="timeout"；上游错误 code=5001、message="upstream error"（ai/handler.go）。
 
 ## 3. 错误码词汇表
 
-**词汇表规范源：本文 §3.1/§3.2（ADR-0008）；`backend/pkg/errors/codes.go` 的常量必须与下表一致（常量列为该文件中的 Go 常量名，不一致时改代码）。**
+**词汇表规范源：本文 §3.1/§3.2（ADR-0008）；`backend/pkg/errors/codes.go` 的常量与下表一一对应（常量列为该文件中的 Go 常量名）。**
 
 ### 3.1 code 固定枚举（终态，ADR-0008）
 
@@ -140,8 +142,8 @@
 
 | biz_code | Go 常量 | HTTP | code | 说明 / 发出位置 |
 |----------|---------|------|------|-----------------|
-| SESSION_INVALID | `BizSessionInvalid` | 401 | 4010 | Session/OpenAuth 中间件：缺失或失效会话（不再作为 code 下发） |
-| RATE_LIMITED | `BizRateLimited` | 429 | 4290 | IP/Key 限流（ratelimit.go、keylimit.go）、逆地理/位置/AI 配额路径（不再作为 code 下发） |
+| SESSION_INVALID | `BizSessionInvalid` | 401 | 4010 | Session/OpenAuth 中间件：缺失或失效会话（仅作为 biz_code 下发） |
+| RATE_LIMITED | `BizRateLimited` | 429 | 4290 | IP/Key 限流（ratelimit.go、keylimit.go）、逆地理/位置配额、AI IP/并发限流（AI 日配额单独下发 `AI_DAILY_QUOTA_EXCEEDED`） |
 | NOT_VIP | `BizNotVip` | 403 | 4030 | 非 VIP 调用 VIP 能力（autorecord、diary auto） |
 | PHONE_ALREADY_BOUND | `BizPhoneAlreadyBound` | 409 | 4090 | 手机号已被绑定（auth） |
 | FAMILY_NOT_FOUND | `BizFamilyNotFound` | 404 | 4040 | 邀请链接目标家庭不存在 |
@@ -151,10 +153,10 @@
 | ALREADY_IN_FAMILY / FAMILY_FULL | `BizAlreadyInFamily` / `BizFamilyFull` | 409 | 4090 | 创建 / 加入家庭 |
 | FREE_VIP_ALREADY_CLAIMED / TRIAL_VIP_ALREADY_CLAIMED | `BizFreeVipAlreadyClaimed` / `BizTrialVipAlreadyClaimed` | 409 | 4090 | VIP 领取防重 |
 | ORDER_NOT_FOUND | `BizOrderNotFound` | 404 | 4040 | 订单不存在 / 非本人 |
-| OPERATION_IN_PROGRESS | `BizOperationInProgress` | 429 | 4290 | 锁冲突 / 并发注销 / AI 在途（autorecord 409 → 429） |
+| OPERATION_IN_PROGRESS | `BizOperationInProgress` | 429 | 4290 | 锁冲突 / 并发注销 / AI 在途 |
 | INVALID_FILE_TYPE / FILE_SIZE_EXCEEDED | `BizInvalidFileType` / `BizFileSizeExceeded` | 400 | 4000 | 上传类型 / 大小校验 |
 | USER_IMAGE_STORAGE_LIMIT_EXCEEDED | `BizUserImageStorageLimitExceeded` | 400 | 4000 | 图片存储配额 |
-| TEXT_TOO_LONG / INVALID_COLOR_FORMAT / INVALID_COORDINATES | `BizTextTooLong` / `BizInvalidColorFormat` / `BizInvalidCoordinates` | 400 | 4000 | 日记条目校验（不再作为 code 下发） |
+| TEXT_TOO_LONG / INVALID_COLOR_FORMAT / INVALID_COORDINATES | `BizTextTooLong` / `BizInvalidColorFormat` / `BizInvalidCoordinates` | 400 | 4000 | 日记条目校验、AI 消息过长（`message too long`，见 02f；仅作为 biz_code 下发） |
 | AI_DAILY_QUOTA_EXCEEDED | `BizAIDailyQuotaExceeded` | 429（SSE 体内） | 4290 | AI 日配额（SSE error 事件） |
 
 ### 3.3 域内 Go 哨兵错误（不是 code，映射为 message 或 Code*）
@@ -166,7 +168,7 @@
 | file | ErrNotFileOwner、ErrSystemFileDelete、ErrFileNotFound、ErrFileInUse | 删除文件错误分支 | file/errors.go |
 | vip | ErrFreeVIPAlreadyClaimed、ErrTrialVIPAlreadyClaimed、ErrInvalidVIP | 领取 VIP 错误分支 | vip/errors.go |
 | diary | ErrEntryNotFound、ErrFamilyMismatch、ErrMemberNotFound、ErrPermissionDenied、ErrCoverUpdateInProgress、ErrDailyReverseQuotaExceeded、errTextTooLong、errInvalidColor、errInvalidCoords、errTooManyImages 等 | 日记 handler | diary/service.go、diary/handler.go |
-| ai | ErrAIDailyQuotaExceeded、errAIChatTimeout | SSE 错误分支 | ai/service.go |
+| ai | ErrAIDailyQuotaExceeded、errAIChatTimeout、errAITurnInProgress | SSE 错误分支（errAITurnInProgress → SSE error 事件 code=4290 + biz_code=OPERATION_IN_PROGRESS，message `ai turn in progress, retry later`） | ai/service.go |
 
 ### 3.4 状态码映射
 
@@ -187,19 +189,19 @@ errors.HTTPStatus(bizCode)：
 
 | 端点 | 方式 | 参数 | 响应字段 | 源文件 |
 |------|------|------|---------|--------|
-| GET /diary/info | 游标（日期） | cursorDate（默认 9999-12-31，格式 YYYY-MM-DD，非法 400）、size（默认 10；<1 重置为 10，>20 夹取至 20） | data（卡片数组）、count=len(cards)、nextCursor | diary/handler.go:66-95 |
-| GET /diary/details | 页码 | page（默认 1，小于 1 归 1）、size（默认 20；<1 重置为 20，>100 夹取至 100）、memberUserId 可选 | data + extra（服务层给出分页元信息） | diary/handler.go:212-257 |
-| POST /diary/info/dates | 批量 | body dates[]，最多 31 个 | data 为卡片数组，无分页 | diary/handler.go:97-140 |
-| MCP GET /mcp/diary、GET /mcp/memories | limit 条数 | limit 默认 500，最大 1000（limit=0 合法返回空）；日期默认最近 90 天，跨度上限 180 天 | {"data":...,"truncated":bool} | mcp/handler.go:402-414,416-447 |
+| GET /diary/info | 游标（日期） | cursorDate（默认 9999-12-31，格式 YYYY-MM-DD，非法 400）、size（默认 10；<1 重置为 10，>20 夹取至 20） | data（卡片数组）、count=len(cards)、nextCursor | diary/handler.go:63-92 |
+| GET /diary/details | 页码 | page（默认 1，小于 1 归 1）、size（默认 20；<1 重置为 20，>100 夹取至 100）、memberUserId 可选 | data + extra + count（服务层给出分页元信息） | diary/handler.go:209-256 |
+| POST /diary/info/dates | 批量 | body dates[]，最多 31 个 | data 为卡片数组，无分页 | diary/handler.go:94-137 |
+| MCP GET /mcp/diary、GET /mcp/memories | limit 条数 | limit 默认 500，最大 1000（limit=0 合法返回空）；日期默认最近 90 天，跨度上限 180 天 | {"data":...,"truncated":bool} | mcp/handler.go:398-410,412-443 |
 
 ## 5. 数据归属校验约定
 
 - 受保护 handler 的用户身份**只从 context 取**（middleware.UserID(ctx)），不从 URL/body 取用户 ID（middleware/session.go:31-36）。
 - 数据归属在 handler/service 层校验：
   - 文件：files.created_by 必须等于当前用户，或双方 current_family_id 相同（file/handler.go:465-543）；系统文件按 metadata.family_id 与用户 current_family_id 比对。
-  - 日记：虚拟 ID 形如 family:<familyId>:date:<YYYY-MM-DD>，familyId 必须等于当前用户 current_family_id，否则 403（diary/handler.go:544,212）。
-  - 支付订单：orders.user_id 必须等于当前用户，否则按 ORDER_NOT_FOUND 返回（payment/handler.go:155-173）。
-- MCP/API Key 端点：Bearer key 的 SHA-256 命中 api_keys.key_hash，以该行 user_id 作为数据归属；expires_at 仅存储、不作为有效性条件（mcp/server.go:70-82、mcp/handler.go:42,494-497）。
+  - 日记：虚拟 ID 形如 family:<familyId>:date:<YYYY-MM-DD>，familyId 必须等于当前用户 current_family_id，否则 403（diary/service.go:130-136,505-511）。
+  - 支付订单：orders.user_id 必须等于当前用户，否则按 ORDER_NOT_FOUND 返回（payment/handler.go:144-147,183-186）。
+- MCP/API Key 端点：Bearer key 的 SHA-256 命中 api_keys.key_hash，以该行 user_id 作为数据归属；expires_at 仅存储、不作为有效性条件（mcp/server.go:70-82、mcp/handler.go:42,490-493）。
 - Authorization 与会话不匹配时不会静默降级为默认用户（open 模式 session 失效直接 401，open_auth.go:47-55）。
 
 ## 6. 超时与限流
@@ -212,14 +214,14 @@ errors.HTTPStatus(bizCode)：
 | SSE（sse） | 127.0.0.1:8081 | 0（不限制，防掐断 SSE） | 10 秒 | 0 | 60 秒 |
 
 - 优雅关闭：SIGINT/SIGTERM → shuttingDown=true（`/health/ready` 返回 503）→ 停止后台任务 → 30s 超时的 Shutdown。
-- POST /file/upload 额外包 http.TimeoutHandler(5*time.Minute)，超时体见 2.1（main.go:256）。
-- AI 流超时 AIStreamTimeout = 180s（ai/handler.go:22）；上游 HTTP 客户端超时 5 分钟（config.go:443-448）、通用客户端 30 秒（config.go:433-436）。
+- POST /file/upload 额外包 http.TimeoutHandler(5*time.Minute)，超时体见 2.1（main.go:273）。
+- AI 流超时 `AIStreamTimeout` = 180s（`ai/handler.go`）；上游 HTTP 客户端超时 5 分钟（`config.SSEHTTPClient()`）、通用客户端 30 秒（`config.HTTPClient()`）。
 
 ### 6.2 body 大小上限（middleware.ReadJSONBody）
 
 | 端点 | 上限 | 源文件 |
 |------|------|--------|
-| 用户设置类（/user/*） | 8 KB | user/handler.go:31 |
+| 用户设置类（/user/*） | 8 KB | user/handler.go:30 |
 | VIP 领取 | 8 KB | vip/handler.go:16 |
 | 登录/绑手机号/绑定邀请人/注销/支付 request/cancel/auto-record config/push | 4 KB | 各 handler |
 | 日记条目/记忆/封面、家庭 join、邀请 qrcode | 64 KB | diary/handler.go、family/handler.go、invite/handler.go |
@@ -237,14 +239,16 @@ errors.HTTPStatus(bizCode)：
 
 | 范围 | 阈值 | 实现 | 源文件 |
 |------|------|------|--------|
-| GET /health/live、/health/ready | 30 次/分钟/IP | 内存滑动窗口（app 与 sse 两个 Server 共享同一 limiter 实例，健康端点合并共享 30 次/分钟预算） | main.go:183,292 |
-| 公开路由组（login、支付回调、wx 回调、/invite/resolve 另加、/system/config） | 60 次/分钟/IP | 同上 | main.go:192-194 |
+| GET /health/live、/health/ready | 30 次/分钟/IP | 内存滑动窗口（同容器内 app 与 sse 两个 Server 共享同一 limiter 实例，健康端点合并共享 30 次/分钟/IP 预算；双容器部署时两容器各自独立计数，每容器 30/min/IP） | main.go:200-203,309-311 |
+| 公开路由组（login、支付回调、wx 回调、/invite/resolve 另加、/system/config） | 60 次/分钟/IP | 同上 | main.go:209-211 |
 | GET /invite/resolve | 60 次/小时/IP | 独立 limiter | invite/handler.go |
-| DELETE /auth/account | 5 次/小时/IP | 独立 limiter | main.go:234 |
-| SSE POST /ai/chat | 30 次/分钟/IP | 独立 limiter | main.go:297,308 |
-| POST /file/upload | 60 次/分钟/IP | 独立 limiter（防海量小文件耗尽 files 行/inode；先于 5 分钟 TimeoutHandler 执行） | main.go:249-258 |
-| MCP 数据端点（open 公开 /mcp/*） | 60 次/分钟/IP（外层）+ 30 次/分钟/API Key（内层） | IP limiter + KeyRateLimiter | mcp/rpc.go:33-38、mcp/handler.go:61-72 |
-| AI 每日配额 | 非 VIP 10 次/天、VIP 100 次/天 | Redis ai:daily_chat:<userId>:<date> Lua 原子计数 | ai/handler.go:25-27、ai/service.go:272-284 |
+| DELETE /auth/account | 5 次/小时/IP | 独立 limiter | main.go:251 |
+| POST /auth/phone/bind | 10 次/分钟/IP | 独立 limiter | main.go:260 |
+| SSE POST /ai/chat | 30 次/分钟/IP | 独立 limiter | main.go:314 |
+| SSE 并发连接 | 单用户 2、进程内 `SSE_MAX_CONNS`（默认 200） | `chatLimiter`（package 级，仅 sse 进程） | ai/handler.go |
+| POST /file/upload | 60 次/分钟/IP | 独立 limiter（防海量小文件耗尽 files 行/inode；先于 5 分钟 TimeoutHandler 执行） | main.go:268-275 |
+| MCP 数据端点（open 公开 /mcp/*） | 60 次/分钟/IP（外层）+ 30 次/分钟/API Key（内层） | IP limiter + KeyRateLimiter | mcp/rpc.go:29-37、mcp/handler.go:59-70 |
+| AI 每日配额 | 非 VIP 10 次/天、VIP 100 次/天 | Redis ai:daily_chat:<userId>:<date> Lua 原子计数 | ai/handler.go:25-27、ai/service.go:259-272,429-467 |
 | 逆地理编码 | 200 次/用户/天 | Redis location:reverse:<userId>:<date>，fail-closed | location/quota.go:14-51 |
 | 限流算法 | 滑动窗口，maxBuckets=10000（1.2 倍触发驱逐） | slidingWindowLimiter | middleware/ratelimit.go:26-97 |
 | 可信代理 | TRUSTED_PROXY_CIDR（配置后才解析 X-Forwarded-For/X-Real-IP） | | middleware/ratelimit.go:149-191 |
@@ -256,20 +260,20 @@ errors.HTTPStatus(bizCode)：
 - MCP：默认返回 500 条、上限 1000，日期跨度上限 180 天（mcp/handler.go:32-38）。
 - 自动记录轨迹：单批最多 50 点（autorecord/handler.go:22）。
 - 客户端日志：单次最多 200 条（超限保留前 200 条）；缺 `t`/`type` 或 `type` 超 128 字节的事件**整条丢弃**；单条 detail 超 1024B 时**丢弃该条事件的 detail 字段**（事件保留，仅入 t/type，不做部分截断；opslog/handler.go）。
-- 日记条目：正文不超过 10000 code point、颜色 #RGB/#RRGGBB/#RRGGBBAA、地址不超过 500、图片不超过 9（diary/handler.go:568-637）。
-- 记忆：标题 1~50 字、正文不超过 10000 字（diary/handler.go:389-426、mcp/server.go）。
+- 日记条目：正文不超过 10000 code point、颜色 #RGB/#RRGGBB/#RRGGBBAA、地址不超过 500、图片不超过 9（diary/handler.go:571-632）。
+- 记忆：标题 1~50 字、正文不超过 10000 字（diary/handler.go:388-425、mcp/handler.go:540-560）。
 
 ## 7. 幂等约定
 
 | 场景 | 幂等键 / 机制 | 行为 | 源文件 |
 |------|--------------|------|--------|
 | 支付回调发货 | orders.transaction_id 唯一索引 + orders.state（pending/closed→paid） | 重复回调不重复发货；closed 被支付补记并发货；金额>0 一律发货（不一致仅告警）；瞬时故障返回非 2xx 触发微信重试，业务性拒绝返回固定成功 | payment/handler.go、payment/service.go |
-| 关闭订单 | CloseOrder 条件更新（仅 pending 且属主） | 已关闭/已支付/并发关闭均返回 200 | payment/handler.go:99-153 |
+| 关闭订单 | CloseOrder 条件更新（仅 pending 且属主） | 已关闭/已支付/并发关闭均返回 200 | payment/handler.go:107-161 |
 | AI 对话 | 客户端 request_id（格式 ^[A-Za-z0-9_-]{8,64}$）；无则消息哈希 | 重连复用同一 request_id 命中回复缓存，不重复扣配额/落库 | ai/handler.go:31-32,78-81、ai/service.go:77-83,193-214 |
-| MCP POST /mcp/key | 用户唯一（api_keys UNIQUE(user_id)） | 已存在时返回既有 key（get-or-create） | mcp/handler.go:181-229 |
-| POST /mcp/key/rotate | 事务内先删后建 | 每次换发新 key | mcp/handler.go:278-319 |
-| 家庭加入 | family_members 唯一约束 + errAlreadyInTargetFamily | 已在目标家庭返回 200 | family/handler.go:242-243 |
-| 绑定邀请人 | 事务内行锁 GetUserByIDForUpdate + 幂等检查 | 已绑定幂等成功；注册超过 7 天静默成功不绑定 | auth/handler.go:334 |
+| MCP POST /mcp/key | 用户唯一（api_keys UNIQUE(user_id)） | 已存在时返回既有 key（get-or-create） | mcp/handler.go:177-225 |
+| POST /mcp/key/rotate | 事务内先删后建 | 每次换发新 key | mcp/handler.go:274-315 |
+| 家庭加入 | family_members 唯一约束 + errAlreadyInTargetFamily | 已在目标家庭返回 200 | family/handler.go:238-239 |
+| 绑定邀请人 | 事务内行锁 GetUserByIDForUpdate + 幂等检查 | 已绑定幂等成功；注册超过 7 天静默成功不绑定 | auth/handler.go:378-399 |
 | 微信公众号消息 | msgID Redis SETNX（60s TTL） | 重复消息返回占位文案，不重复触发 AI | wxmp/handler.go:41,207-219,250-263 |
 | 免费/试用 VIP 领取 | user_vip_claims UNIQUE(user_id,vip_id)、user_vips UNIQUE(user_id) | 重复领取返回 409 业务码 | vip/handler.go、迁移唯一约束 |
 | 文件上传失败回滚 | 请求内已提交 part 的顺序回滚（记录/物理文件/配额） | 避免半成功 | file/handler.go:110-208 |
@@ -381,7 +385,7 @@ errors.HTTPStatus(bizCode)：
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |------|------|------|------|
-| POST | /payment/virtual/request | 登录态 | body {vipId,env}（env 仅 0/1）；创建微信虚拟支付订单 |
+| POST | /payment/virtual/request | 登录态 | body {vipId,env}（env 仅 0/1；env=1 需 PAYMENT_ALLOW_SANDBOX=1，否则 403）；创建微信虚拟支付订单 |
 | POST | /payment/virtual/cancel | 登录态 | body {outTradeNo}；仅关闭自己 pending 订单，重复/已关闭幂等 200 |
 | GET | /payment/virtual/status | 登录态 | query outTradeNo；返回 {state}；非属主按 ORDER_NOT_FOUND |
 | GET | /api/prod/payment/virtualPayNotify | 微信签名（公开组） | 服务器地址验证：校验 signature/timestamp/nonce 后原样返回 echostr |
@@ -403,7 +407,7 @@ errors.HTTPStatus(bizCode)：
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |------|------|------|------|
-| POST | /ai/chat | 登录态 + IP 30/min | body {message,request_id?}；SSE 流式返回（见 2.2）；日配额非 VIP 10、VIP 100 |
+| POST | /ai/chat | 登录态 + IP 30/min | body {message（不超过 2500 code point），request_id?}；SSE 流式返回（见 2.2）；日配额非 VIP 10、VIP 100 |
 
 ### 8.14 MCP / 开放接口（mcp）
 
@@ -451,11 +455,11 @@ errors.HTTPStatus(bizCode)：
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |------|------|------|------|
-| GET | /system/config | 公开（IP 60/min） | **只读能力探测（capability probe），非配置中心、无运行时配置管理**。返回 {mode,features}；ai=AI_API_KEY 非空、mcp=MCP_ENABLED（默认 true，可用 MCP_ENABLED=0 关）、freeVip 恒为 true（后端无开关可置 false；已接受取舍：免费活动下线需发版，不设服务端/环境变量开关）；open 强制 payment=false,wxmp=false；saas 的 payment 需三项微信虚拟支付 env 齐全、wxmp=WECHAT_MSG_TOKEN 非空（system/handler.go） |
+| GET | /system/config | 公开（IP 60/min） | **只读能力探测（capability probe），非配置中心、无运行时配置管理**。返回 {mode,features}；ai=AI_API_KEY 非空、mcp=MCP_ENABLED（默认 true，可用 MCP_ENABLED=0 关）、freeVip 由 `FREE_VIP_ENABLED` 控制（默认 true，置 0 关闭免费入口无需发版）；open 强制 payment=false,wxmp=false；saas 的 payment 需三项微信虚拟支付 env 齐全、wxmp=WECHAT_MSG_TOKEN 非空（system/handler.go） |
 
 ### 8.18 后台任务（非 HTTP，供 API 行为解释）
 
-jobs.Runner.Start（jobs/runner.go:66），所有任务用 PostgreSQL advisory lock（`lock:background:{task}`）互斥、任务自身幂等，间隔可用 env 覆盖（默认值来自 config.go:131-170）：
+`jobs.Runner.Start`（jobs/runner.go），所有任务用 PostgreSQL advisory lock（`lock:background:{task}`）互斥、任务自身幂等，间隔可用 env 覆盖（默认值来自 config.go）；`KnownJobNames` 共 10 项，Redis 记录 `job:last_success` / `job:last_failure` / `job:fail_streak`，`watchJobHealth` 每分钟做失联检测（>3× 周期输出 `job_stale`）并消费 `job:trigger:<name>` 人工补跑：
 
 | 任务 | 间隔（默认） | 对应 API/表 |
 |------|-------------|-------------|

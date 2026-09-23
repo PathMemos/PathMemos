@@ -66,6 +66,7 @@ func configWithAllFilledExcept(emptyVar string) *Config {
 		APIHost:                     "api.example.com",
 		DeploymentMode:              "saas",
 		WorkerSecret:                "worker-secret",
+		MCPWorkerSecret:             "mcp-worker-secret",
 	}
 
 	switch emptyVar {
@@ -91,6 +92,8 @@ func configWithAllFilledExcept(emptyVar string) *Config {
 		cfg.APIHost = ""
 	case "WORKER_SECRET":
 		cfg.WorkerSecret = ""
+	case "MCP_WORKER_SECRET":
+		cfg.MCPWorkerSecret = ""
 	case "WECHAT_MSG_TOKEN":
 		cfg.WechatMsgToken = ""
 	case "WECHAT_VIRTUAL_CALLBACK_TOKEN":

@@ -27,5 +27,5 @@
 ### 负面 / 代价
 
 - SaaS 的 MCP 功能**强依赖 Cloudflare Worker + KV**，单机不再自足。
-- 源站必须维护 `MCP_WORKER_SECRET`，未配置时 `/internal/mcp/*` 返回 500。
+- 源站必须维护 `MCP_WORKER_SECRET`，saas 模式缺省时启动即失败；源站保留空值 500 防御分支（启动校验通过后不可达）。
 - 开源版走另一条路径（直接暴露 `/mcp/*`），两形态行为需在文档中区分。

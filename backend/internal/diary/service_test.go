@@ -3,6 +3,8 @@ package diary
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -270,4 +272,99 @@ func TestPickGeocodeResult(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fileRow 构造 files 行（GetFileByID 为 SELECT *，11 列）。
+func fileRow(fileType string) *pgxmock.Rows {
+	return pgxmock.NewRows([]string{
+		"id", "created_by", "path", "name", "suffix", "size_bytes",
+		"file_type", "metadata", "created_at", "updated_at", "storage_type",
+	}).AddRow("f1", pgtype.Text{String: "u1", Valid: true}, "p/a.jpg", "a", "jpg",
+		int64(123), fileType, nil, time.Now(), time.Now(), "local")
+}
+
+func fileRefRow() *pgxmock.Rows {
+	return pgxmock.NewRows([]string{"used_by_cover", "used_by_entry", "avatar_user_count"}).
+		AddRow(false, false, int32(0))
+}
+
+// TestDeleteIfOnlySelfReferenced R-29：编辑/删除条目路径的物理删除与配额回退同一事务——
+// image 文件删除必须调 DecrementUserImageStorage 且失败整体回滚；system 文件不扣配额。
+func TestDeleteIfOnlySelfReferenced(t *testing.T) {
+	setup := func(t *testing.T) (pgxmock.PgxPoolIface, *Service, string) {
+		t.Helper()
+		mock, err := pgxmock.NewPool()
+		if err != nil {
+			t.Fatalf("new mock pool: %v", err)
+		}
+		t.Cleanup(mock.Close)
+		tmp := t.TempDir()
+		full := filepath.Join(tmp, "p", "a.jpg")
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write file: %v", err)
+		}
+		svc := &Service{pool: db.NewPoolWithDBTX(mock), storage: file.NewStorage(tmp)}
+		return mock, svc, full
+	}
+
+	t.Run("image decrements quota in same tx", func(t *testing.T) {
+		mock, svc, full := setup(t)
+		mock.ExpectBegin()
+		mock.ExpectQuery("EXISTS").WithArgs(pgtype.Text{String: "f1", Valid: true}).WillReturnRows(fileRefRow())
+		mock.ExpectQuery("FROM files WHERE id").WithArgs("f1").WillReturnRows(fileRow("image"))
+		mock.ExpectExec("DELETE FROM files").WithArgs("f1").WillReturnResult(pgxmock.NewResult("DELETE", 1))
+		mock.ExpectExec("image_storage_bytes").
+			WithArgs("u1", int64(123)).
+			WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+		mock.ExpectCommit()
+
+		if err := svc.deleteIfOnlySelfReferenced(context.Background(), "f1", "entry-1"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if _, err := os.Stat(full); !os.IsNotExist(err) {
+			t.Fatalf("physical file should be removed")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("expectations: %v", err)
+		}
+	})
+
+	t.Run("decrement failure rolls back", func(t *testing.T) {
+		mock, svc, full := setup(t)
+		mock.ExpectBegin()
+		mock.ExpectQuery("EXISTS").WithArgs(pgtype.Text{String: "f1", Valid: true}).WillReturnRows(fileRefRow())
+		mock.ExpectQuery("FROM files WHERE id").WithArgs("f1").WillReturnRows(fileRow("image"))
+		mock.ExpectExec("DELETE FROM files").WithArgs("f1").WillReturnResult(pgxmock.NewResult("DELETE", 1))
+		mock.ExpectExec("image_storage_bytes").WithArgs("u1", int64(123)).WillReturnError(errors.New("dec fail"))
+		mock.ExpectRollback()
+
+		if err := svc.deleteIfOnlySelfReferenced(context.Background(), "f1", "entry-1"); err == nil {
+			t.Fatalf("expected error on decrement failure")
+		}
+		if _, err := os.Stat(full); err != nil {
+			t.Fatalf("physical file should remain after rollback")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("expectations: %v", err)
+		}
+	})
+
+	t.Run("system file skips decrement", func(t *testing.T) {
+		mock, svc, _ := setup(t)
+		mock.ExpectBegin()
+		mock.ExpectQuery("EXISTS").WithArgs(pgtype.Text{String: "f1", Valid: true}).WillReturnRows(fileRefRow())
+		mock.ExpectQuery("FROM files WHERE id").WithArgs("f1").WillReturnRows(fileRow("system"))
+		mock.ExpectExec("DELETE FROM files").WithArgs("f1").WillReturnResult(pgxmock.NewResult("DELETE", 1))
+		mock.ExpectCommit()
+
+		if err := svc.deleteIfOnlySelfReferenced(context.Background(), "f1", "entry-1"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("expectations: %v", err)
+		}
+	})
 }

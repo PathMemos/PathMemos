@@ -15,17 +15,40 @@ import (
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 
 	"github.com/jackc/pgx/v5"
+	goredis "github.com/redis/go-redis/v9"
 
 	"papafeiji/backend/internal/config"
 	"papafeiji/backend/internal/db"
 	"papafeiji/backend/internal/family"
 	"papafeiji/backend/internal/file"
+	"papafeiji/backend/internal/jobs"
 	mw "papafeiji/backend/internal/middleware"
 	"papafeiji/backend/internal/redis"
 	"papafeiji/backend/internal/user"
 )
 
 func main() {
+	args := os.Args[1:]
+	if len(args) > 0 {
+		switch args[0] {
+		case "jobs":
+			if len(args) == 2 && args[1] == "status" {
+				withRedis(func(rdb *goredis.Client) { printJobStatus(context.Background(), rdb) })
+				return
+			}
+		case "job":
+			if len(args) == 3 && args[1] == "run" {
+				withRedis(func(rdb *goredis.Client) { triggerJob(context.Background(), rdb, args[2]) })
+				return
+			}
+		}
+		log.Fatalf("unknown admin command %q; usage: jobs status | job run <name>（无参数时按 TARGET_PHONE 删除用户）", args)
+	}
+	deleteUserByPhone()
+}
+
+// deleteUserByPhone 是既有运维语义：按 TARGET_PHONE 彻底删除用户及其数据。
+func deleteUserByPhone() {
 	phone := os.Getenv("TARGET_PHONE")
 	if phone == "" {
 		log.Fatal("TARGET_PHONE is required")
@@ -116,4 +139,60 @@ func main() {
 	}
 
 	fmt.Println("done")
+}
+
+// withRedis 连接 Redis 后执行运维子命令（只读状态/写触发键，不触碰 DB）。
+func withRedis(run func(*goredis.Client)) {
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		log.Fatal("REDIS_ADDR is required")
+	}
+	rdb, err := redis.NewClient(addr)
+	if err != nil {
+		log.Fatalf("connect redis: %v", err)
+	}
+	defer rdb.Close() //nolint:errcheck // 一次性运维 CLI，退出前关闭连接
+	run(rdb)
+}
+
+// printJobStatus 打印每个后台任务的最近成功/失败时间与连续失败次数（R-03）。
+func printJobStatus(ctx context.Context, rdb *goredis.Client) {
+	orDash := func(s string) string {
+		if s == "" {
+			return "-"
+		}
+		return s
+	}
+	fmt.Printf("%-28s %-24s %-24s %s\n", "JOB", "LAST_SUCCESS", "LAST_FAILURE", "FAIL_STREAK")
+	for _, name := range jobs.KnownJobNames() {
+		var last, fail, streak string
+		if v, err := rdb.Get(ctx, jobs.JobLastSuccessKey(name)).Result(); err == nil {
+			last = v
+		}
+		if v, err := rdb.Get(ctx, jobs.JobLastFailureKey(name)).Result(); err == nil {
+			fail = v
+		}
+		if v, err := rdb.Get(ctx, jobs.JobFailStreakKey(name)).Result(); err == nil {
+			streak = v
+		}
+		fmt.Printf("%-28s %-24s %-24s %s\n", name, orDash(last), orDash(fail), orDash(streak))
+	}
+}
+
+// triggerJob 写入一次性触发键；常驻 app 的 watchJobHealth 在 1 分钟内读取并复用锁+幂等执行（R-03）。
+func triggerJob(ctx context.Context, rdb *goredis.Client, name string) {
+	known := false
+	for _, n := range jobs.KnownJobNames() {
+		if n == name {
+			known = true
+			break
+		}
+	}
+	if !known {
+		log.Fatalf("unknown job %q (known: %v)", name, jobs.KnownJobNames())
+	}
+	if err := rdb.Set(ctx, jobs.JobTriggerKey(name), "1", 0).Err(); err != nil {
+		log.Fatalf("set job trigger: %v", err)
+	}
+	fmt.Printf("trigger set for job %s; the running app picks it up within 1 minute\n", name)
 }

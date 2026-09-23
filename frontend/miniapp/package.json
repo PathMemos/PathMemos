@@ -16,13 +16,13 @@
   "devDependencies": {
     "@jest/globals": "^30.5.1",
     "@types/jest": "^30.0.0",
-    "@typescript-eslint/eslint-plugin": "^8.0.0",
-    "@typescript-eslint/parser": "^8.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.70.0",
+    "@typescript-eslint/parser": "^8.70.0",
     "eslint": "^8.57.0",
     "jest": "^30.5.1",
-    "miniprogram-api-typings": "^2.8.3-1",
+    "miniprogram-api-typings": "^5.2.3",
     "ts-jest": "^29.4.12",
-    "typescript": "^6.0.3"
+    "typescript": "^5.9.3"
   },
   "main": "miniprogram/app.ts",
   "description": ""

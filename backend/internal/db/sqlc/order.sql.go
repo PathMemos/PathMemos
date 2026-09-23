@@ -52,6 +52,25 @@ func (q *Queries) CloseOrdersBatch(ctx context.Context, arg CloseOrdersBatchPara
 	return result.RowsAffected(), nil
 }
 
+const closeOwnerlessPendingOrders = `-- name: CloseOwnerlessPendingOrders :execrows
+UPDATE orders SET state = 'closed', updated_at = now()
+WHERE orders.id IN (
+    SELECT o.id FROM orders o
+    WHERE o.state = 'pending' AND o.user_id IS NULL AND o.created_at < $1
+    ORDER BY o.id ASC
+    LIMIT 1000
+)
+`
+
+// R-17：关闭无主（user_id IS NULL，用户注销产生）的过期 pending 订单，避免永久滞留。
+func (q *Queries) CloseOwnerlessPendingOrders(ctx context.Context, createdAt pgtype.Timestamptz) (int64, error) {
+	result, err := q.db.Exec(ctx, closeOwnerlessPendingOrders, createdAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const closePendingOrdersByUser = `-- name: ClosePendingOrdersByUser :exec
 UPDATE orders SET state = 'closed', updated_at = now()
 WHERE user_id = $1 AND state = 'pending' AND created_at < now() - interval '5 minutes'

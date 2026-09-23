@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spec-check.sh — papafeiji-saas spec 门禁（见 docs/spec-standards.md §九）
+# spec-check.sh — PathMemos-SaaS spec 门禁（见 docs/spec-standards.md §九）
 # 用法：bash scripts/spec-check.sh [--warn]
 #   --warn：把「spec 随代码变更」从阻断降级为提示（默认阻断）
 # 退出码：0 全部通过；1 存在阻断项。
@@ -179,6 +179,13 @@ print(" ".join(bad[:20]))
 PY
 )"
 if [[ -z "$LINEREF" ]]; then ok "spec file:line 引用在范围内"; else warn "file:line 引用失效: $LINEREF"; fi
+
+# 13. docs 无过程产物/评审残留（阻断）— SR-13
+ARTIFACTS="$(grep -rnE '\bR-[0-9]{2}\b|plans/|第三步整改' docs/ --exclude='spec-standards.md' 2>/dev/null || true)"
+if [[ -z "$ARTIFACTS" ]]; then ok "docs 无过程产物（R-xx / plans / 第三步整改）"; else
+  block "docs 含过程产物/评审残留（应放入 plans/，保持 docs 为代码终态）"
+  printf '%s\n' "$ARTIFACTS" | head -20
+fi
 
 # 11. MCP 静态方法双源对账（提示）— SR-11
 if [[ -f scripts/check_mcp_static_sync.py ]]; then

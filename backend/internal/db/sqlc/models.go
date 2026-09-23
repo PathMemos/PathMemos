@@ -189,12 +189,13 @@ type UserCommonAddress struct {
 
 type UserInvite struct {
 	ID              string             `json:"id"`
-	UserID          string             `json:"userId"`
-	InviterID       string             `json:"inviterId"`
+	UserID          pgtype.Text        `json:"userId"`
+	InviterID       pgtype.Text        `json:"inviterId"`
 	EntryCount      int32              `json:"entryCount"`
 	RewardInviterAt pgtype.Timestamptz `json:"rewardInviterAt"`
 	RewardInviteeAt pgtype.Timestamptz `json:"rewardInviteeAt"`
 	CreatedAt       pgtype.Timestamptz `json:"createdAt"`
+	UserOpenID      pgtype.Text        `json:"userOpenId"`
 }
 
 type UserInviteCode struct {
@@ -215,9 +216,10 @@ type UserVip struct {
 
 type UserVipClaim struct {
 	ID        string             `json:"id"`
-	UserID    string             `json:"userId"`
+	UserID    pgtype.Text        `json:"userId"`
 	VipID     string             `json:"vipId"`
 	CreatedAt pgtype.Timestamptz `json:"createdAt"`
+	OpenID    pgtype.Text        `json:"openId"`
 }
 
 type Vip struct {

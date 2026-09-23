@@ -11,16 +11,32 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// NewPool 创建 API 请求池：语句超时 30s；上限 DB_MAX_CONNS（默认 50），下限 DB_MIN_CONNS（默认 10）。
 func NewPool(databaseURL string) (*pgxpool.Pool, error) {
-	return newPoolWithTimeout(databaseURL, true, 10)
+	return newPool(databaseURL, true, intEnv("DB_MAX_CONNS", 50, 5), intEnv("DB_MIN_CONNS", 10, 1))
 }
 
+// NewBackgroundPool 创建后台任务池：语句不超时；使用独立上限 DB_BG_MAX_CONNS（默认 10）
+// 与下限 DB_BG_MIN_CONNS（默认 2），不与请求池共用 DB_MAX_CONNS/DB_MIN_CONNS，
+// 保证「请求池 + 后台池」的连接预算可被 scripts/check-conn-budget.sh 精确校验。
 func NewBackgroundPool(databaseURL string) (*pgxpool.Pool, error) {
-	// B2-19：后台任务池只需少量常驻连接，MinConns 从 10 降到 2，避免浪费数据库连接。
-	return newPoolWithTimeout(databaseURL, false, 2)
+	return newPool(databaseURL, false, intEnv("DB_BG_MAX_CONNS", 10, 1), intEnv("DB_BG_MIN_CONNS", 2, 1))
 }
 
-func newPoolWithTimeout(databaseURL string, enableStatementTimeout bool, defaultMinConns int32) (*pgxpool.Pool, error) {
+// intEnv 读取正整数环境变量；缺失、非法或小于 min 时返回 def。
+func intEnv(key string, def, min int32) int32 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < int(min) {
+		return def
+	}
+	return int32(n)
+}
+
+func newPool(databaseURL string, enableStatementTimeout bool, maxConns, minConns int32) (*pgxpool.Pool, error) {
 	if databaseURL == "" {
 		return nil, fmt.Errorf("database URL is empty")
 	}
@@ -30,23 +46,10 @@ func newPoolWithTimeout(databaseURL string, enableStatementTimeout bool, default
 		return nil, fmt.Errorf("parse database config: %w", err)
 	}
 
-	maxConns := int32(50)
-	if v := os.Getenv("DB_MAX_CONNS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 5 {
-			maxConns = int32(n)
-		}
-	}
-	config.MaxConns = maxConns
-
-	minConns := defaultMinConns
-	if v := os.Getenv("DB_MIN_CONNS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
-			minConns = int32(n)
-		}
-	}
 	if minConns > maxConns {
 		minConns = maxConns
 	}
+	config.MaxConns = maxConns
 	config.MinConns = minConns
 	config.MaxConnLifetime = time.Hour
 	config.MaxConnIdleTime = 30 * time.Minute

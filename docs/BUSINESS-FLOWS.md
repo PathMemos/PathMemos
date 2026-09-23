@@ -65,7 +65,7 @@
 | 项 | 内容 |
 |----|------|
 | 触发 | 首页按日期/家庭筛选点开日记 |
-| 主流程 | ① `GET /diary/info`（cursor 分页）→ ② 详情 `GET /diary/details`（offset 分页）→ ③ 统计 `GET /diary/stats`、日期 `GET /diary/info/dates` → ④ 编辑/删除 `PUT/DELETE /diary/details` 或 `DELETE /diary/info` → ⑤ 分享生成图片（含二维码） |
+| 主流程 | ① `GET /diary/info`（cursor 分页）→ ② 详情 `GET /diary/details`（offset 分页）→ ③ 统计 `GET /diary/stats`、日期 `POST /diary/info/dates` → ④ 编辑/删除 `PUT/DELETE /diary/details` 或 `DELETE /diary/info` → ⑤ 分享生成图片（含二维码） |
 | 涉及 | 前端 `pages/index`、`pages/NoteDetail`、`components/NoteItem/RecordItem` |
 | 期望 | 列表/详情一致，删除后计数与封面同步 |
 | 异常 | 详情页 offset 分页在并发增删下可能重复/漏条 |
@@ -87,7 +87,7 @@
 | 触发 | VIP 页点购买 |
 | 主流程 | ① `GET /vip` / `GET /user/vip` 查权益 → ② `POST /payment/virtual/request`（env=0 现网）→ ③ `wx.requestVirtualPayment` → ④ 微信回调 `POST /api/prod/payment/virtualPayNotify`（安全模式验签+解密）→ ⑤ 幂等发货叠加 VIP → ⑥ 前端轮询 `GET /payment/virtual/status` |
 | 涉及 | 表 `orders`、`vips`、`user_vips`、`user_vip_claims`；新用户试用 `POST /vip/new-user`、免费领取 `POST /vip/free/claim` |
-| 期望 | 支付成功即到账；重复回调不重复发货；金额校验 |
+| 期望 | 支付成功即到账；重复回调不重复发货；金额 > 0 校验（与标价不一致仅告警照发，ADR-0011） |
 | 异常 | 沙箱 `env=1` 生产已禁用（403）；回调失败可按 AGENTS.md 重放 |
 
 ## F7 AI 对话
@@ -104,11 +104,11 @@
 
 | 项 | 内容 |
 |----|------|
-| 触发 | 用户在 MCP 页生成 API Key，配置到 Cursor/Claude 等 |
+| 触发 | 用户在 MCP 页生成 API Key，配置到 Cursor/Kimi 等 |
 | 主流程 | ① `POST /mcp/key`（或 rotate）→ ② 展示 `mcpConfig`（Worker 地址）→ ③ 客户端请求 `mcp.pathmemos.com/mcp` → ④ Worker 透传源站 `/internal/mcp/*`（`X-Worker-Secret`）→ ⑤ 按 `key_hash` 校验读写日记/回忆 |
 | 涉及 | 表 `api_keys`、`memories`；Worker `mcp-worker` |
 | 期望 | 绑定页 `/auth` 生成 `?t=token`；SaaS 源站不暴露公开 `/mcp/*` |
-| 异常 | 未配置 `MCP_WORKER_SECRET` → `/internal/mcp/*` 500；静态方法鉴权现状见 02h |
+| 异常 | saas 模式缺 `MCP_WORKER_SECRET` 启动即失败；源站保留空值 500 防御分支（启动校验通过后不可达）；静态方法鉴权现状见 02h |
 
 ## F9 账号注销
 
@@ -162,4 +162,4 @@
 | PP-02g 文件 | F11 | 上传/配额/头像 |
 | PP-02h 私有化 | F12 | api-worker 路由 |
 
-> 结论：F1~F12 与当前实现一致。对应 flow 见 `docs/spec/07-acceptance-flows.md`。
+> 各 flow 对应 `docs/spec/07-acceptance-flows.md` 场景 F1~F12。

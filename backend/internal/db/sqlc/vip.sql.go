@@ -108,12 +108,29 @@ SELECT EXISTS(SELECT 1 FROM user_vip_claims WHERE user_id = $1 AND vip_id = $2) 
 `
 
 type HasVIPClaimParams struct {
-	UserID string `json:"userId"`
-	VipID  string `json:"vipId"`
+	UserID pgtype.Text `json:"userId"`
+	VipID  string      `json:"vipId"`
 }
 
 func (q *Queries) HasVIPClaim(ctx context.Context, arg HasVIPClaimParams) (bool, error) {
 	row := q.db.QueryRow(ctx, hasVIPClaim, arg.UserID, arg.VipID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const hasVIPClaimByOpenID = `-- name: HasVIPClaimByOpenID :one
+SELECT EXISTS(SELECT 1 FROM user_vip_claims WHERE open_id = $1 AND vip_id = $2) AS exists
+`
+
+type HasVIPClaimByOpenIDParams struct {
+	OpenID pgtype.Text `json:"openId"`
+	VipID  string      `json:"vipId"`
+}
+
+// R-21：按微信主体判重（注销重注册后仍能识别已领取），openid 为空时调用方回退 HasVIPClaim。
+func (q *Queries) HasVIPClaimByOpenID(ctx context.Context, arg HasVIPClaimByOpenIDParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasVIPClaimByOpenID, arg.OpenID, arg.VipID)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
@@ -231,19 +248,27 @@ func (q *Queries) UpsertUserVIP(ctx context.Context, arg UpsertUserVIPParams) (U
 }
 
 const upsertVIPClaim = `-- name: UpsertVIPClaim :execrows
-INSERT INTO user_vip_claims (id, user_id, vip_id, created_at)
-VALUES ($1, $2, $3, now())
-ON CONFLICT (user_id, vip_id) DO NOTHING
+INSERT INTO user_vip_claims (id, user_id, vip_id, open_id, created_at)
+VALUES ($1, $2, $3, $4, now())
+ON CONFLICT DO NOTHING
 `
 
 type UpsertVIPClaimParams struct {
-	ID     string `json:"id"`
-	UserID string `json:"userId"`
-	VipID  string `json:"vipId"`
+	ID     string      `json:"id"`
+	UserID pgtype.Text `json:"userId"`
+	VipID  string      `json:"vipId"`
+	OpenID pgtype.Text `json:"openId"`
 }
 
+// R-21：open_id 冗余发放主体；不带目标的 ON CONFLICT DO NOTHING 同时覆盖
+// (user_id, vip_id) 与 (open_id, vip_id) 两级唯一，rowsAffected=0 → 409 已领取。
 func (q *Queries) UpsertVIPClaim(ctx context.Context, arg UpsertVIPClaimParams) (int64, error) {
-	result, err := q.db.Exec(ctx, upsertVIPClaim, arg.ID, arg.UserID, arg.VipID)
+	result, err := q.db.Exec(ctx, upsertVIPClaim,
+		arg.ID,
+		arg.UserID,
+		arg.VipID,
+		arg.OpenID,
+	)
 	if err != nil {
 		return 0, err
 	}

@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/go-chi/chi/v5"
 )
 
 // statusRecorder 包装 ResponseWriter，捕获实际写入的状态码供访问日志使用。
@@ -26,9 +28,9 @@ func (w *statusRecorder) Flush() {
 	}
 }
 
-// AccessLogMiddleware 为每个已鉴权请求输出一条 INFO 访问日志并绑定 user_id，
-// 用于数据问题复盘：可还原用户在某时间点对某接口执行的操作序列（含失败请求）。
-// 必须挂在 SessionMiddleware/OpenAuthMiddleware 之后，此时 user_id 已写入 context。
+// AccessLogMiddleware 为每个请求输出一条 INFO 结构化访问日志（含路由模板 route 与耗时 duration_ms），
+// 用于数据问题复盘与 SLO 统计（scripts/accesslog-p95.sh 读取）。
+// 挂到鉴权中间件之后时 user_id 已写入 context；挂到公开路由时 user_id 为空。
 func AccessLogMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -36,14 +38,21 @@ func AccessLogMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
 			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 			next.ServeHTTP(rec, r)
 
+			elapsed := time.Since(start)
+			route := ""
+			if rc := chi.RouteContext(r.Context()); rc != nil {
+				route = rc.RoutePattern()
+			}
 			logger.Info("api access",
 				slog.String("request_id", RequestID(r.Context())),
 				slog.String("user_id", UserID(r.Context())),
 				slog.String("method", r.Method),
+				slog.String("route", route),
 				slog.String("path", r.URL.Path),
 				slog.String("query", r.URL.RawQuery),
 				slog.Int("status", rec.status),
-				slog.Duration("duration", time.Since(start)),
+				slog.Int64("duration_ms", elapsed.Milliseconds()),
+				slog.Duration("duration", elapsed),
 				slog.String("ip", r.RemoteAddr),
 			)
 		})

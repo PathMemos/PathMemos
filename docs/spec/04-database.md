@@ -8,7 +8,7 @@
 
 ## 1. 概述
 
-- 数据库：PostgreSQL；所有主键为 text（UUID 字符串），无自增整数主键。
+- 数据库：PostgreSQL；主键为 text 或 text+date 复合（无自增整数主键）。
 - 无软删除列：全部业务表使用**物理删除**（多为 ON DELETE CASCADE / SET NULL），没有 deleted_at / is_deleted 字段。
 - 时间列统一 timestamptz，数据库会话时区设为 Asia/Shanghai（db/db.go 连接级 RuntimeParams）。
 - 唯一约束与部分唯一索引共同承担幂等（支付回调、VIP 领取、邀请、家庭成员）。
@@ -19,7 +19,7 @@
 用户是绝大多数表的归属中心；家庭是日记与部分文件共享的协作中心。
 
     users (id)
-      |-- 1:1 personal_family_id / current_family_id --> families (id)
+      |-- N:1 personal_family_id / current_family_id --> families (id)
       |-- family_members (user_id, family_id) --> families
       |-- 1:N diaries (user_id) 1:N diary_entries (diary_id, created_by)
       |                            |-- diary_entry_images (diary_entry_id) --> files (id)
@@ -65,7 +65,7 @@
 | avatar | text | Y | CHECK length <= 2048 | 头像 URL |
 | avatar_file_id | text | Y | FK files(id) ON DELETE SET NULL；部分索引 idx_users_avatar_file_id | 头像文件 |
 | nickname | text | Y | | 昵称 |
-| user_type | text | N | default 'wechat'；CHECK = 'wechat' | 仅微信用户 |
+| user_type | text | N | default 'wechat'；CHECK = 'wechat' | 仅微信用户（当前单值 'wechat'，预留扩展） |
 | phone_bind_time | timestamptz | Y | | 最近绑定手机时间（日限判断） |
 | auto_record_enabled | boolean | N | default false；索引 idx_users_auto_record_enabled | 自动记录开关 |
 | personal_family_id | text | Y | FK families(id) ON DELETE RESTRICT；索引 idx_users_personal_family | 个人家庭 |
@@ -154,13 +154,13 @@
 | updated_at | timestamptz | N | now() | |
 | manual_cover_file_id | text | Y | FK files(id) ON DELETE SET NULL；部分索引 | 手动指定封面 |
 
-主键 (family_id, record_date)。触发器 trg_family_daily_covers_fix_type：BEFORE INSERT OR UPDATE 执行 fix_cover_type_on_null_fk()，manual 且 manual_cover_file_id 为空时降级 cover_type='default'（保留 cover_file_id）；image/trajectory 且 cover_file_id 为空时降级 'default'。
+主键 (family_id, record_date)。`family_id` FK families(id) ON DELETE CASCADE（000009 补齐；迁移内先清孤儿行）。触发器 trg_family_daily_covers_fix_type：BEFORE INSERT OR UPDATE 执行 fix_cover_type_on_null_fk()，manual 且 manual_cover_file_id 为空时降级 cover_type='default'（保留 cover_file_id）；image/trajectory 且 cover_file_id 为空时降级 'default'。
 
 ### 3.8 memories（回忆）
 
 | 字段 | 类型 | NULL | 默认 / 约束 | 说明 |
 |------|------|------|-------------|------|
-| id | text | N | PK | 也是 diaries.id（MCP 创建时同 ID upsert） |
+| id | text | N | PK | 也是 diaries.id（创建时同 ID upsert） |
 | user_id | text | N | FK users(id) ON DELETE CASCADE | |
 | record_time | timestamptz | N | | |
 | record_date | date | N | | |
@@ -219,24 +219,25 @@
 | 字段 | 类型 | NULL | 默认 / 约束 | 说明 |
 |------|------|------|-------------|------|
 | id | text | N | PK | |
-| user_id | text | N | FK users(id) ON DELETE CASCADE；UNIQUE(user_id,vip_id) | |
+| user_id | text | N→Y | FK users(id) ON DELETE **SET NULL**（000008：注销保留墓碑行）；UNIQUE(user_id,vip_id) | |
 | vip_id | text | N | FK vips(id) | |
+| open_id | text | Y | 000008 新增：发放主体微信 openid（写入时冗余，历史回填） | 墓碑行（user_id NULL）凭 openid 防"注销重注册重领" |
 | created_at | timestamptz | N | now() | |
 
-索引：idx_user_vip_claims_user_created、idx_user_vip_claims_vip_id。
+索引：idx_user_vip_claims_user_created、idx_user_vip_claims_vip_id、**uq_user_vip_claims_open_id_vip_id**（部分唯一 `(open_id, vip_id) WHERE open_id IS NOT NULL`）。
 
 ### 3.13 orders（支付订单）
 
 | 字段 | 类型 | NULL | 默认 / 约束 | 说明 |
 |------|------|------|-------------|------|
 | id | text | N | PK | |
-| user_id | text | Y | FK users(id) ON DELETE SET NULL；部分索引 idx_orders_null_user | 允许为空（异常订单） |
+| user_id | text | Y | FK users(id) ON DELETE SET NULL；部分索引 idx_orders_null_user | 注销事务内 `NullifyOrdersByUser` 置空（FK SET NULL）产生无主订单，由关单任务 `CloseOwnerlessPendingOrders` 收敛 |
 | vip_id | text | N | FK vips(id)；索引 idx_orders_vip_id | |
 | out_trade_no | text | N | UNIQUE orders_out_trade_no_key；CHECK length <= 32 | |
 | channel | text | N | CHECK = 'virtual_pay' | 仅微信虚拟支付 |
 | state | text | N | default 'pending'；CHECK pending/paid/closed | |
 | amount | integer | N | CHECK > 0 | 单位分 |
-| prepay_id | text | Y | CHECK length <= 128 | |
+| prepay_id | text | Y | CHECK length <= 128 | （预留：后端不访问微信下单，当前无写入点，恒 NULL） |
 | transaction_id | text | Y | UNIQUE orders_transaction_id_key + 部分唯一 uq_orders_transaction_id_not_null；CHECK length <= 128 | 微信支付单号，幂等键 |
 | paid_at | timestamptz | Y | | |
 | created_at | timestamptz | N | now() | |
@@ -256,7 +257,7 @@
 
 索引：idx_ai_dialog_logs_created_at、idx_ai_dialog_logs_user_created_at。
 
-> 保留策略：仅保留 90 天，由后台任务 `cleanup_ai_dialog_logs` 定期删除（按 created_at 最旧优先，无每用户条数上限）。
+> 保留策略：仅保留 90 天，由后台任务 `cleanup_ai_logs` 定期删除（按 created_at 最旧优先，无每用户条数上限）。
 
 ### 3.15 ai_daily_quota_usage（AI 每日配额用量）
 
@@ -279,7 +280,7 @@
 | key_hash | text | N | 唯一索引 idx_api_keys_key_hash | SHA-256 |
 | expires_at | timestamptz | N | 索引 idx_api_keys_expires_at | 认证时不判过期，固定 9999-12-31 |
 | created_at | timestamptz | N | now() | |
-| api_key | text | N | | 明文存储（业务取舍） |
+| api_key | text | N | | 明文存储 |
 
 ### 3.17 auto_record_trajectories（GPS 轨迹点）
 
@@ -302,14 +303,15 @@
 | 字段 | 类型 | NULL | 默认 / 约束 | 说明 |
 |------|------|------|-------------|------|
 | id | text | N | PK | |
-| user_id | text | N | FK users(id) ON DELETE CASCADE；UNIQUE(user_id) | 被邀请人，一人一条 |
-| inviter_id | text | N | FK users(id) ON DELETE CASCADE | 邀请人 |
+| user_id | text | N→Y | FK users(id) ON DELETE **SET NULL**（000008：注销保留行）；UNIQUE(user_id) | 被邀请人，一人一条 |
+| inviter_id | text | Y | FK users(id) ON DELETE SET NULL（000011） | 邀请人；置空保留行（被邀请奖励墓碑与邀请人存续解耦） |
 | entry_count | integer | N | default 0 | |
+| user_open_id | text | Y | 000008 新增：被邀请人微信 openid（写入时冗余，历史回填） | 被邀请奖励终身一次判定依据 |
 | reward_inviter_at | timestamptz | Y | 部分索引 idx_user_invites_reward_inviter_at | 邀请人奖励下发时间 |
 | reward_invitee_at | timestamptz | Y | 部分索引 idx_user_invites_pending（reward_invitee_at IS NULL） | 被邀请人奖励下发时间 |
 | created_at | timestamptz | N | now() | |
 
-索引：idx_user_invites_inviter_created。
+索引：idx_user_invites_inviter_created、**uq_user_invites_user_open_id**（部分唯一 `(user_open_id) WHERE user_open_id IS NOT NULL AND reward_invitee_at IS NOT NULL`，被邀请奖励每微信主体终身一次）。
 
 ### 3.19 user_invite_codes（邀请短码）
 
@@ -350,6 +352,8 @@
 
 主键 (user_id, name)。无 FK 到 users（见 §4.1）。
 
+> 写入来源：后台任务 `common_address_summary`（每日 03:00）经 `db.SummarizeUserCommonAddresses` 汇总；`/user/common-addresses/refresh` 同底层。
+
 ### 3.22 user_avatar_markers（头像地图标记）
 
 | 字段 | 类型 | NULL | 默认 / 约束 | 说明 |
@@ -375,7 +379,7 @@
 
 > 保留策略：仅保留 30 天，由后台任务 `cleanup_client_ops_logs` 定期删除（任务总数 10）。
 >
-> 全库保留窗口汇总：ai_dialog_logs 90 天、auto_record_trajectories 7 天、client_ops_logs 30 天；孤儿文件扫描窗口为图片创建超 1 天且无引用、系统文件创建/更新均超 7 天且无封面引用（file.sql ScanOrphanFiles / ScanOldSystemFiles）。
+> 全库保留窗口汇总：ai_dialog_logs 90 天、auto_record_trajectories 7 天、client_ops_logs 30 天；孤儿文件扫描窗口为图片创建超 1 天且无引用、系统文件创建/更新均超 7 天且无封面引用、无 `user_avatar_markers.marker_path` 引用（file.sql ScanOrphanFiles / ScanOldSystemFiles）。
 
 ## 4. 数据归属说明
 
@@ -388,11 +392,11 @@
 | diary_entries | created_by | users(id) CASCADE | 级联删 |
 | memories | user_id | users(id) CASCADE | 级联删 |
 | user_vips | user_id | users(id) CASCADE | 级联删 |
-| user_vip_claims | user_id | users(id) CASCADE | 级联删 |
+| user_vip_claims | user_id（可空） | users(id) SET NULL（000008） | 置空保留墓碑行 |
 | api_keys | user_id | users(id) CASCADE | 级联删 |
 | auto_record_trajectories | user_id | users(id) CASCADE | 级联删 |
 | ai_dialog_logs | user_id | users(id) CASCADE | 级联删 |
-| user_invites | user_id、inviter_id | users(id) CASCADE | 双向级联删 |
+| user_invites | user_id（可空）、inviter_id（可空） | users(id) SET NULL（000008/000011） | 双向置空保留行（领取/被邀请奖励墓碑） |
 | user_invite_codes | user_id | users(id) CASCADE | 级联删 |
 | user_avatar_markers | user_id | users(id) CASCADE | 级联删 |
 | wx_mp_accounts | user_id（可空） | users(id) CASCADE | 级联删 |
@@ -403,7 +407,7 @@
 | ai_daily_quota_usage | user_id | **无 FK** | 需应用层清理 |
 | user_common_addresses | user_id | **无 FK** | 需应用层清理 |
 
-> `ai_daily_quota_usage` 与 `user_common_addresses` 的 `user_id` 无外键，注销清理依赖应用层（`family.DeleteAccount` / `CleanupAfterAccountDeletion`）。
+> `ai_daily_quota_usage` 与 `user_common_addresses` 的 `user_id` 无外键，注销清理依赖应用层（`family.DeleteAccount` / `user.CleanupAfterAccountDeletion`）。
 
 ### 4.2 无 user_id 归属表的豁免清单
 
@@ -425,7 +429,7 @@
 | 表.字段 | 允许值 | 源 |
 |---------|--------|----|
 | users.user_type | wechat | baseline CHECK |
-| users.lang | 默认 zh（无 CHECK，应用层允许 zh / zh-Hant / en） | user/handler.go:205 |
+| users.lang | 默认 zh（无 CHECK，应用层允许 zh / zh-Hant / en） | user/handler.go:202 |
 | family_members.role | owner / member | baseline CHECK |
 | diary_entries.color | 正则 ^#([0-9A-Fa-f]{3}\|[0-9A-Fa-f]{6}\|[0-9A-Fa-f]{8})$ | baseline CHECK |
 | family_daily_covers.cover_type | image / trajectory / default / manual | baseline CHECK |
@@ -444,8 +448,11 @@
                   |
                   +--> closed         (用户 cancel 或 1 分钟后台任务关闭 24h 未支付)
 
+    closed --(支付回调补记)--> paid    (MarkClosedOrderPaid，补发 VIP)
+
 - 只有 pending 可被 CloseOrder 关闭；已 closed/paid 的并发 cancel 返回 200（payment/handler.go:125-152）。
-- 后台关单（24h 未支付）跳过 `user_id IS NULL` 的无主订单——这些异常订单不会被自动关闭（jobs/runner.go:387-390）。
+- 已 closed 订单收到支付回调时由 `MarkClosedOrderPaid` 补记为 paid 并补发（payment/service.go `handleNotify`）。
+- 后台关单（24h 未支付）`runOrderClose`：先用 `CloseOwnerlessPendingOrders` 循环关闭 `user_id IS NULL` 的无主 pending 订单（每批 ≤1000），再按 `id ASC` 游标分批关闭有主 pending 订单（jobs/runner.go `runOrderClose`）。
 - 创建新订单前 `ClosePendingOrdersByUserAndVIP` 会先关闭同用户同 VIP、创建超 5 分钟的 pending 单（order.sql），防止重复挂单。
 - 支付回调以 transaction_id 唯一约束保证幂等（orders_transaction_id_key + 部分唯一索引）。
 
@@ -461,7 +468,7 @@
 - **无软删除**：所有表均为物理删除，无 deleted_at / is_deleted。
 - 删除用户走 family.DeleteAccount 事务 + 后台清理；orders.user_id 与 files.created_by 因 SET NULL 而保留孤儿记录。
 - ai_daily_quota_usage、user_common_addresses 无 FK，用户删除后需应用层显式清理（见 §4.1）。
-- 注销事务除 FK 级联外还**显式执行** NullifyOrdersByUser、DeleteAPIKeyByUser、DeleteUserInviteCodeByUserID（family/service.go:823-832）——api_keys/邀请码的清理不单靠 CASCADE。
+- 注销事务除 FK 级联外还**显式执行** NullifyOrdersByUser、DeleteAPIKeyByUser、DeleteUserInviteCodeByUserID（family/service.go:822-830）——api_keys/邀请码的清理不单靠 CASCADE。
 
 ### 5.5 并发控制（DB/Redis 侧一览，详见各 L2 分册）
 
@@ -475,7 +482,7 @@
 ## 6. 索引与约束要点
 
 - users 其他索引：idx_users_avatar_file_id（avatar_file_id 非空部分索引）、idx_users_personal_family（personal_family_id）。
-- 部分唯一索引：
+- 部分索引（含部分唯一索引）：
   - idx_users_phone_number、idx_users_unionid、idx_wx_mp_accounts_unionid（仅非空值唯一）。
   - uq_orders_transaction_id_not_null（transaction_id 非空且非空串时唯一）。
   - idx_orders_null_user（user_id IS NULL）。
@@ -489,7 +496,7 @@
 - 延迟约束：uq_family_members_user_id UNIQUE DEFERRABLE INITIALLY DEFERRED。
 - 函数与触发器：fix_cover_type_on_null_fk() + trg_family_daily_covers_fix_type（000002 重定义函数体）。
 
-## 7. 迁移变更记录（000001 ~ 000006）
+## 7. 迁移变更记录（000001 ~ 000011）
 
 | 编号 | 文件 | 变更 | down 行为 | 可逆性 |
 |------|------|------|-----------|--------|
@@ -499,6 +506,11 @@
 | 000004 | 000004_client_ops_logs.up.sql / .down.sql | CREATE TABLE IF NOT EXISTS client_ops_logs + 索引 idx_client_ops_logs_user_created | DROP TABLE IF EXISTS client_ops_logs | 可逆 |
 | 000005 | 000005_trajectory_idempotency.up.sql / .down.sql | 轨迹上报幂等：清理历史重复后建唯一索引 uq_auto_record_trajectories_point (user_id, recorded_at, lat, lon) | DROP INDEX IF EXISTS uq_auto_record_trajectories_point | 可逆 |
 | 000006 | 000006_drop_sys_configs.up.sql / .down.sql | 删除 `sys_configs` 表：配置改为环境变量（见 `ARCHITECTURE-INVARIANTS.md` §5） | 仅重建表结构（不回填种子；回滚到读 sys_configs 的旧代码前需按 000003 手工回填种子行） | 可逆 |
+| 000007 | 000007_enable_pg_stat_statements.up.sql / .down.sql | 创建 `pg_stat_statements` 扩展（供 `scripts/sql-top.sh` 慢 SQL 榜单） | 无表/数据变更；需 postgres command 含 `shared_preload_libraries`（deploy.sh 渲染）才有统计数据，扩展本身无前置 | 可逆 |
+| 000008 | 000008_vip_claim_openid_guard.up.sql / .down.sql | 注销循环权益收口（评审定稿）：`user_vip_claims` 加 `open_id`（回填存量）+ 部分唯一索引 `(open_id, vip_id) WHERE open_id IS NOT NULL`；`user_invites` 加 `user_open_id`（回填）+ 部分唯一索引 `(user_open_id) WHERE reward_invitee_at IS NOT NULL`（历史重复标记保留最早一条）；两表 `user_id` FK 由 CASCADE 改 **SET NULL**（注销保留领取/邀请墓碑行，`user_invites.user_id` 同时放开 NOT NULL） | down 恢复 CASCADE + NOT NULL；若墓碑行已存在需先人工清理，否则 SET NOT NULL 失败 | 可逆（墓碑行存在时 down 需人工） |
+| 000009 | 000009_family_covers_fk.up.sql / .down.sql | `family_daily_covers.family_id` 补外键（先防御性清孤儿行，`ON DELETE CASCADE`） | down 仅移除约束；CASCADE 已删行不恢复 | 可逆 |
+| 000010 | 000010_user_vip_claims_user_id_nullable.up.sql / .down.sql | 补 000008 遗漏：`user_vip_claims.user_id` DROP NOT NULL（否则注销触发 23502、领取墓碑行无法保留；逐文件扫描发现） | down 恢复 NOT NULL；若墓碑行已存在需先人工清理 | 可逆（墓碑行存在时 down 需人工） |
+| 000011 | 000011_user_invites_inviter_set_null.up.sql / .down.sql | `user_invites.inviter_id` FK CASCADE→SET NULL（列改可空）：被邀请奖励墓碑行与邀请人存续解耦，邀请人注销不再连带删除、「终身一次」持续成立（第三方评审发现） | down 先人工清理 `inviter_id IS NULL` 行再恢复 NOT NULL + CASCADE | 可逆（需人工清理墓碑行） |
 
 并行撞号规则（spec-standards 第六节）：同号不同名允许（slug 全局唯一），改同一张表需 rebase 确认顺序。
 
@@ -511,6 +523,6 @@
 5. 改 sqlc SQL 后必须 make sqlc-generate + make check-sqlc-sync。
 6. 部署顺序：先 migration 后代码。生产回滚**不以 down migration 为常规手段**：新代码有问题时回滚旧代码 + 用部署前备份恢复数据库；结构变更采用 expand → 兼容旧代码 → contract。`down` 脚本手工使用仅限本地/全新环境。唯一例外：deploy.sh **部署失败窗口内**的自动 `migrate goto/down`——它与旧代码/旧配置成对回退，是原子部署回滚的一部分，不作为数据回退手段。
 
-环境相关：DEPLOYMENT_MODE=open 时应用启动自动执行未应用迁移（main.go:104-114）；SaaS 由 deploy/deploy.sh 显式控制迁移时机。注意两套迁移记账**同名不同构、不可混用**：open 启动器自建 `schema_migrations(version TEXT PK, applied_at)`，而 golang-migrate CLI 使用 `schema_migrations(version BIGINT, dirty)`——同一数据库只能用其中一种机制管理迁移（migration/migrate.go:35-45）。
+环境相关：DEPLOYMENT_MODE=open 时应用启动自动执行未应用迁移（main.go:107-115）；SaaS 由 deploy/deploy.sh 显式控制迁移时机。注意两套迁移记账**同名不同构、不可混用**：open 启动器自建 `schema_migrations(version TEXT PK, applied_at)`，而 golang-migrate CLI 使用 `schema_migrations(version BIGINT, dirty)`——同一数据库只能用其中一种机制管理迁移（migration/migrate.go:35-45）。
 
 

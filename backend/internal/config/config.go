@@ -105,7 +105,7 @@ type Config struct {
 	WorkerSecret string
 
 	// MCPWorkerSecret 是 Cloudflare Worker 调用 /internal/mcp/rpc 的共享密钥。
-	// 可选：未配置时该内部端点返回 500，不影响其余服务。
+	// saas 模式必填（缺省启动校验失败）；open 模式不注册内部端点，留空。
 	MCPWorkerSecret string
 
 	// MCPPublicURL 是 MCP 客户端应使用的公开入口（Cloudflare Worker 地址）。
@@ -115,6 +115,10 @@ type Config struct {
 	// MCPEnabled 是否对外开启 MCP 功能（/system/config features.mcp，B6a-15）。
 	// 默认开启，可用 MCP_ENABLED=0 显式关闭。
 	MCPEnabled bool
+
+	// FreeVipEnabled 控制 /system/config 的 features.freeVip（小程序 VIP 页免费领取入口）。
+	// 默认开启；免费活动下线用 FREE_VIP_ENABLED=0，无需发版（VP-13）。
+	FreeVipEnabled bool
 
 	// OpenAPIKey 是开源版与 Cloudflare Worker 之间的共享密钥。
 	// Worker 转发请求时通过 X-Private-Api-Key 头部携带，开源版据此识别合法请求。
@@ -253,6 +257,7 @@ func Load() (*Config, error) {
 		MCPWorkerSecret:       os.Getenv("MCP_WORKER_SECRET"),
 		MCPPublicURL:          os.Getenv("MCP_PUBLIC_URL"),
 		MCPEnabled:            boolEnv("MCP_ENABLED", true),
+		FreeVipEnabled:        boolEnv("FREE_VIP_ENABLED", true),
 		OpenAPIKey:            os.Getenv("OPEN_API_KEY"),
 		StorageLocalPath:      defaultEnv("STORAGE_LOCAL_PATH", "/opt/pathmemos/uploads"),
 
@@ -365,6 +370,10 @@ func (c *Config) validate() error {
 		}
 		if c.WorkerSecret == "" {
 			return fmt.Errorf("WORKER_SECRET is required in saas mode")
+		}
+		// R-14：MCP Worker 共享密钥与 WORKER_SECRET 对齐，saas 缺省时启动即失败，避免运行时 500。
+		if c.MCPWorkerSecret == "" {
+			return fmt.Errorf("MCP_WORKER_SECRET is required in saas mode")
 		}
 		// SaaS 模式禁止静默回退内置微信凭据（B1-03）：必须显式配置 WECHAT_APPID/WECHAT_SECRET。
 		// 开源版仍可使用 wechatsecrets 内置凭据，机制保留。

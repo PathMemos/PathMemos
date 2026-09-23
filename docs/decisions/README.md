@@ -36,4 +36,6 @@
 | [0010](0010-open-family-invite-link.md) | 家庭邀请链接长期有效且无撤销 | 已接受 | 小规模家庭场景下成本收益不匹配，维持现状 |
 | [0011](0011-payment-callback-amount-policy.md) | 支付回调安全模型与金额策略 | 已接受 | 金额不作为漏发闸门（>0 即发货+告警）；无自动对账；体验版 403 为预期 |
 | [0012](0012-family-invite-owner-merge-risk.md) | 家庭邀请 owner 整家合并钓鱼风险 | 已接受 | 熟人小家庭场景下接受该风险，不增加防护 |
-| [0013](0013-deleted-image-cache-purge.md) | 已删除图片边缘缓存定期批量收敛 | 已接受（目标态） | 删除图片须最终不可达；定期批量 purge，不做同步清理 |
+| [0013](0013-deleted-image-cache-purge.md) | 已删除图片边缘缓存定期批量收敛 | 已接受 | 删除图片须最终不可达；定期批量 purge，不做同步清理 |
+| [0014](0014-pinned-deps-manual-upgrades.md) | 依赖固定版本、关闭自动依赖升级 | 已接受 | 不启用自动依赖更新；锁定版本，按需成套升级 |
+| [0015](0015-reliability-baseline-alerting-zerodowntime.md) | 运维可靠性基线：告警随部署装配、零停机切换、Redis 持久化与备份 RPO | 已接受 | 告警 cron 由 deploy.sh 装配 + webhook 必填；分层替换取代全站 rm -f；Redis noeviction+AOF；备份 1h/48 份带心跳告警 |

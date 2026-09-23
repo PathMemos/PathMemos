@@ -21,12 +21,13 @@
 | D2 | `ai.Service` 同时服务小程序 SSE 与公众号；公众号用 `ChatWithPromptUsingConfig(..., WECHAT_MP_PROMPT, ...)` 自定义 prompt | 业务逻辑与传输解耦，公众号与小程序共享配额/幂等/上游 | 无 |
 | D3 | 配额「先 Redis 闸门，后 DB 权威原子扣减；无有效回复必退款」 | Redis 仅作快速预检，DB 的 `WHERE used<quota` 才是权威；Redis 抖动 fail-open 不绕过配额 | 无 |
 | D4 | 幂等键优先取客户端 `request_id`（每轮生成、重连复用），缺失时回退消息内容哈希 | 精确覆盖「断线重连」，避免重复调用上游/扣配额/落库（`backend/internal/ai/service.go` `aiTurnKeys`） | 无 |
-| D5 | 上游为 OpenAI 兼容接口 `POST {baseUrl}/v1/chat/completions`，`stream:true` | 对接 DeepSeek 等兼容网关；thinking 由 `AI_THINKING_TYPE` 可选开启 | 无 |
+| D5 | 上游为 OpenAI 兼容接口 `POST {baseUrl}/v1/chat/completions`，`stream:true` + `stream_options.include_usage:true`（流末尾 usage chunk 记入 `msg="ai chat usage"` 结构化日志：`user_id`/`prompt_tokens`/`completion_tokens`，尽力而为不落库，`scripts/ai-cost.sh` 汇总）；上游建流失败/非 200/中途流错误且无回复时输出限频告警 `alert=ai_upstream_error`（5 分钟一次） | 对接 DeepSeek 等兼容网关；thinking 由 `AI_THINKING_TYPE` 可选开启；成本与上游故障此前不可见（ADR-0015） | 无 |
 | D6 | 上游流上下文用 `context.WithoutCancel` 派生，客户端断开后继续消费至 EOF 并写回放缓存 | 重连可零成本回放，避免重复扣费（`service.go`） | 无 |
 | D7 | 小程序不使用标准 EventSource；前端用 `wx.request` + `enableChunked` 自解析 SSE | 微信小程序无 EventSource/ReadableStream（`frontend/.../utils/eventSource.ts`） | 无 |
 | D8 | 对话日志异步落库，后台删除 **>90 天**的日志 | 控制表体积，日志仅用于调试 | 无 |
 | D9 | 本域**未使用 Redis pub/sub** | 全仓库未发现 Publish/Subscribe 调用；app 与 sse 仅通过同一 Redis 的键（session/配额/幂等/缓存）协作 | 无 |
 | D10 | AI 变现边界 = 每日配额（非 VIP 10 / VIP 100）+ 单次输入限制 + 基础限流，到此为止 | 不建 Token 余额、计费、精确成本核算体系；配额即全部 | 无 |
+| D11 | SSE 连接治理：数据/心跳/结束/错误事件串行写入；空闲每 25s 发 `: heartbeat`；单用户并发 2、进程内 `SSE_MAX_CONNS`（默认 200，仅约束本 sse 进程）；超限开流前 429；客户端断开立即释放名额，上游仍消费到 EOF 写回放缓存 | 防慢连接/断连泄漏占用；单轮为独立 POST、受 `AIStreamTimeout=180s` 约束，无跨轮长连接 | 无 |
 
 ## 3. 核心流程（用户故事 + 时序）
 
@@ -37,7 +38,7 @@
 验收标准：
 - 前端向 `{getSSEBaseURL()}/ai/chat` 发送 POST JSON（`AIDrawer.ts`），Authorization 为 `Bearer <sessionId>`；私有化模式附加 `X-Private-Api-Key`。
 - 后端先写 `Content-Type: text/event-stream`、`Cache-Control: no-cache`、`Connection: keep-alive`、HTTP 200 并 flush（`ai/handler.go`）。
-- 普通分片事件体为 `data: <line>`（多行内容逐行加前缀，事件间空行）；结束事件 `event: done`；错误事件 `event: error` + `{"code","biz_code","bizCode","message"}`（`bizCode` 为**常驻兼容字段**，与 `biz_code` 长期并存，供旧客户端读取；`ai/upstream.go`）。
+- 普通分片事件体为 `data: <line>`（多行内容逐行加前缀，事件间空行）；结束事件 `event: done`；错误事件 `event: error` + `{"code","biz_code","bizCode","message"}`（`bizCode` 为**过渡兼容字段**（代码注释：待新版本全量后移除），供旧客户端读取；`ai/upstream.go`）。
 - 校验失败在开流前返回普通 JSON：消息 trim 为空 `message is required`、>2500 code points `message too long`、`request_id` 不匹配 `^[A-Za-z0-9_-]{8,64}$` → `invalid request_id`、JSON 非法 → `invalid request body` 均 400 `code=4000`；body >32KB → 413 `code=4130`。
 - 全轮超时 `AIStreamTimeout=180s`。
 
@@ -47,7 +48,7 @@
 - 键：`aiTurnKeys(userID, message, requestID)` 对 `userID + 换行符 + (requestID 或 message)` 取 SHA-256；`ai:turn:<hex>`（TTL 240s，处理中标记）、`ai:reply:<hex>`（TTL 10min，完整回复）。
 - 命中 `ai:reply:<hex>`：按 `aiReplayChunkRunes=120` 字符/片回放，直接返回缓存，不扣配额、不落库。
 - 未命中且 `SETNX ai:turn` 成功：正常生成；失败（已在途）：每 `aiTurnPollInterval=200ms` 轮询，等待 `ai:reply` 出现或 `ai:turn` 消失，窗口 `aiTurnKeyTTL=240s`（实际受外层 180s 请求上下文约束）。
-- **等待超时或在途失败 → 直接返回 SSE error（`code=4290`、`biz_code=OPERATION_IN_PROGRESS`、`message="ai turn in progress, retry later"`），不回落生成、不扣配额、不落库**；旧「回落正常生成」行为已废止（它会造成同一 request_id 二次扣费/二次落库），残留标记由 TTL 兜底。
+- **等待超时或在途失败 → 直接返回 SSE error（`code=4290`、`biz_code=OPERATION_IN_PROGRESS`、`message="ai turn in progress, retry later"`），不回落生成、不扣配额、不落库**；残留标记由 TTL 兜底。
 - 上游流以 EOF 完整结束且回复非空时，先写 `ai:reply` 再删 `ai:turn`（顺序固定）。
 - 断言：同一 `request_id` 重发，`ai_daily_quota_usage.used` 不额外 +1，`ai_dialog_logs` 不额外新增行（含在途冲突分支）。
 - 边界：不带 `request_id` 的调用方（公众号）在 10 分钟内主动重复发送同一消息会命中回放（`service.go` 注释，已接受）。
@@ -59,9 +60,10 @@
 - POST：`msg_signature` 存在即走加密模式，必须校验加密签名（不回退明文签名），解密后 `appid` 必须等于 `WECHAT_MP_APPID`（配置非空时）；否则走明文 `signature` 校验。`ToUserName` 与 `WECHAT_MP_GHID` 不一致则返回 `success` 丢弃。
 - 去重：text/voice 且 `MsgId` 非空时 Redis `wxmp:msgid:<MsgId>` SetNX TTL 60s；重复消息被动回复「正在思考，请稍候…」，避免触发重复 AI。
 - text：立即被动回复「正在思考，请稍候…」，后台 goroutine 内先 `resolveUser`（未绑定则异步发引导）再调用 AI（超时 `AIStreamTimeout+30s`）；回复按 `wxmpKfTextByteLimit=2000` 字节拆分为客服消息（`SendKfMessage`）推送，发送前 `stripMarkdown`。
-- 客服消息各分段发送失败时记录 `[ALERT] wx mp all kf segments failed` 日志。
+- 客服消息**全部分段均失败**时记录 `[ALERT] wx mp all kf segments failed` 日志（部分失败仅计数，不告警）。
+- 其他兜底分支：非 text/voice/event 消息与空文本回「暂只支持文字和语音消息…」；AI 调用失败（非配额类）回「服务繁忙，请稍后再试。」；去重检查 Redis 故障时降级为继续处理（不丢弃消息）。
 - voice：使用微信识别结果 `Recognition`；为空回「未能识别这段语音…」。
-- 未绑定用户：被动回「您尚未在小程序中登录…」并异步推送小程序卡片（`WechatAppID` + `pages/index/index`）。
+- 未绑定用户：被动回复仍是 `wxmpReplyThinking`「正在思考，请稍候…」，后台 `resolveUser` 失败后以客服消息 `wxmpReplyNoUser`「您尚未在小程序中登录…」异步推送，并异步推送小程序卡片（`WechatAppID` + `pages/index/index`）。
 - 配额超限：客服消息回「您当天的对话额度已用完，请明天再试。」。
 - event：`subscribe` 更新 `wx_mp_accounts.subscribed=true`、异步 `resolveUser`、异步推送小程序卡片、回欢迎语；`unsubscribe` 置 false，返回空回复。
 
@@ -82,7 +84,7 @@
 验收标准：
 - 背景：`user.CurrentFamilyID` 为空返回空串；否则 Redis `ai:family_summary:<familyID>`（TTL `backgroundCacheTTL=30min`）命中即用；miss 时 `ListAIBackgroundEntries(familyID, maxBackgroundEntries=2000)`（家庭维度 LIMIT 2000；子查询每用户近 90 天最多 500 条，格式 `YYYYMMDD HH24时 | 地址 | 文本`），拼 `昵称:\n内容`，超 `maxBackgroundLen=20000` runes 截断（按上游窗口保守预算）；无记录写入并返回「暂无日记记录」。
 - 不可信数据（I7 落地断言）：日记背景文本仅作为**引用资料**拼入 system 背景；背景中的指令性内容（如「忽略以上设定」类文本）不得改变系统行为——验收断言：背景含此类文本时，回复仍遵循系统 prompt 且不执行该指令。
-- 跨域失效：family/diary/autorecord 变更时删除 `ai:family_summary:<familyID>`（`family/service.go:48`、`autorecord/service.go:153`、`diary/service.go:2760`）。
+- 跨域失效：family/diary/autorecord 变更时删除 `ai:family_summary:<familyID>`（`family/service.go`、`autorecord/service.go`、`diary/service.go`）。
 - 近期上下文：`ListRecentDialogLogs(userID, 20)`（created_at > now()-7 days，DESC）→ `buildMessages` 从新到旧累计，单条计入 rune 数，累计 >2000 runes 或 ≥20 条停止，合并为一条 system「近期对话上下文（最近 7 天）：」。
 - messages 顺序：system(系统 prompt + 背景/占位替换) → 可选 system(「当前提问者是：<nickname>…」) → 可选 system(近期上下文) → user。顺序不得改变（DeepSeek 前缀缓存，`upstream.go` 注释）。
 - 占位符：`{nowDate}` → `YYYY年MM月DD日`（上海）；`{userNickname}` → 「当前用户」；`{userDiaryDetails}`/`{familyDiaryDetails}` → 背景；systemPrompt 为空时用「你是一个日记助手。」。
@@ -172,6 +174,7 @@
 | 超时 | 200(SSE) | `5001` | — | `timeout` |
 | 上游错误 | 200(SSE) | `5001` | — | `upstream error` |
 | IP 限流 | 429 | `4290` | `RATE_LIMITED` | `too many requests` |
+| SSE 并发超限（单用户 >2 或全局 >`SSE_MAX_CONNS`） | 429 | `4290` | `RATE_LIMITED` | `too many concurrent ai chat connections` |
 | 未认证（SaaS） | 401 | `4010` | `SESSION_INVALID` | 由 Session 中间件给出 |
 | 未认证（open） | 401 | `4010` | `SESSION_INVALID` | 由 OpenAuth 中间件给出 |
 
@@ -203,9 +206,9 @@
 | 背景查询 | 家庭 LIMIT 2000；子查询每用户 500 条 / 近 90 天 | `ai.sql` `ListAIBackgroundEntries` |
 | 历史上下文 | ≤2000 runes 且 ≤20 条；查询近 7 天 | `upstream.go` `buildMessages`；`ai.sql` `ListRecentDialogLogs` |
 | 上游解析容错 | JSON 失败累计 >3 次报错 | `upstream.go` |
-| 上游 HTTP 客户端超时 | 5min；Scanner 缓冲上限 2MB | `config.SSEHTTPClient()`、`upstream.go` |
+| 上游 HTTP 客户端上限 | 5min（安全上限；实际生效上限为 `AIStreamTimeout=180s`；该 client 仅 `ai/upstream.go` 流式调用使用）；Scanner 缓冲上限 2MB | `config.SSEHTTPClient()`、`upstream.go` |
 | 对话日志保留 | 删除 >90 天；批 1000 | `jobs/runner.go` `runCleanupAILogs`；`ai.sql` |
-| 清理任务间隔 | 默认 24h，首次延迟 10min，PG advisory lock `lock:background:cleanup_ai_logs` | `jobs/runner.go`；`JOB_INTERVAL_CLEANUP_AI_LOGS` |
+| 清理任务间隔 | 默认 24h（ticker 首次在 interval 后触发），PG advisory lock `lock:background:cleanup_ai_logs` | `jobs/runner.go`；`JOB_INTERVAL_CLEANUP_AI_LOGS` |
 | 前端输入上限 | 2500 字符（与后端 `maxMessageCodePoints` 统一） | `AIDrawer.ts`；`ai/handler.go` |
 | 前端 SSE 缓冲 | 64KB；`wx.request` timeout 200s；传输类失败自动重连 1 次 | `utils/eventSource.ts` |
 
@@ -240,12 +243,13 @@
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `AI_API_KEY` | 无（必填，缺省启动校验失败） | 上游 `Authorization: Bearer` |
-| `AI_BASE_URL` / `AI_MODEL` | 空 | AI 上游地址与模型（唯一来源） |
+| `AI_BASE_URL` / `AI_MODEL` | 无（必填，缺省启动校验失败） | AI 上游地址与模型（唯一来源） |
 | `DEPLOYMENT_MODE` | `saas` | `saas` / `open` |
 | `WORKER_SECRET` | 空 | sseRouter 与 apiRouter 的 `WorkerAuth` 共享密钥；SaaS 必填（空则启动校验失败），open 模式必须留空 |
 | `REDIS_ADDR` / `REDIS_PASSWORD` | — | 配额/幂等/缓存/session |
 | `HTTP_BIND`/`HTTP_PORT` | `127.0.0.1`/`8080` | app |
 | `SSE_BIND`/`SSE_PORT` | `127.0.0.1`/`8081` | sse |
+| `SSE_MAX_CONNS` | `200` | 本进程 SSE 并发连接上限（单用户固定 2） |
 | `WECHAT_MP_APPID` / `WECHAT_MP_SECRET` / `WECHAT_MP_GHID` | 空 | 公众号；未配置时 `IsConfigured()=false` 不刷新资料 |
 | `WECHAT_MSG_TOKEN` / `WECHAT_ENCODING_AES_KEY` | 空 | 回调验签 / 加密模式 |
 

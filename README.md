@@ -169,8 +169,9 @@ docker compose up -d app
 # 备份数据库
 docker compose exec postgres pg_dump -U papafeiji -d papafeiji > backup.sql
 
-# 自动备份（后台容器，每 6 小时备份数据库（pg_dump gz）与 uploads 目录，
-# 默认保留 7 份（可用 `BACKUP_KEEP` 调整），文件在 ./backups/）
+# 自动备份（后台容器，每 24 小时备份数据库（pg_dump gz）与 uploads 目录，
+# 默认保留 14 份（可用 `BACKUP_KEEP` 调整份数、`BACKUP_INTERVAL` 调整间隔秒数），
+# 文件在 ./backups/）
 ```
 
 ## 更换自己的小程序（可选）
