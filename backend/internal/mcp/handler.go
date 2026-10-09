@@ -195,11 +195,10 @@ func (h *Handler) CreateKey(w http.ResponseWriter, r *http.Request) {
 		}
 
 		created, err := q.CreateAPIKey(ctx, sqlc.CreateAPIKeyParams{
-			ID:        keyID,
-			UserID:    userID,
-			KeyHash:   hashKey(newKey),
-			ApiKey:    newKey,
-			ExpiresAt: pgtype.Timestamptz{Time: expiresAt, Valid: true},
+			ID:      keyID,
+			UserID:  userID,
+			KeyHash: hashKey(newKey),
+			ApiKey:  newKey,
 		})
 		if err != nil {
 			if stderrors.Is(err, pgx.ErrNoRows) {
@@ -208,7 +207,6 @@ func (h *Handler) CreateKey(w http.ResponseWriter, r *http.Request) {
 					return fmt.Errorf("get existing api key after conflict: %w", getErr)
 				}
 				rawKey = existing.ApiKey
-				expiresAt = existing.ExpiresAt.Time
 				return nil
 			}
 			return fmt.Errorf("create api key: %w", err)
@@ -249,7 +247,7 @@ func (h *Handler) GetKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := h.keyInfoResponse(key.ApiKey, key.ExpiresAt.Time)
+	resp := h.keyInfoResponse(key.ApiKey, apiKeyNeverExpires)
 	resp["hasKey"] = true
 	middleware.JSON(w, r, http.StatusOK, resp)
 }
@@ -294,11 +292,10 @@ func (h *Handler) RotateKey(w http.ResponseWriter, r *http.Request) {
 			return fmt.Errorf("generate api key id: %w", err)
 		}
 		created, err := q.CreateAPIKey(ctx, sqlc.CreateAPIKeyParams{
-			ID:        keyID,
-			UserID:    userID,
-			KeyHash:   hashKey(newKey),
-			ApiKey:    newKey,
-			ExpiresAt: pgtype.Timestamptz{Time: expiresAt, Valid: true},
+			ID:      keyID,
+			UserID:  userID,
+			KeyHash: hashKey(newKey),
+			ApiKey:  newKey,
 		})
 		if err != nil {
 			return fmt.Errorf("create api key: %w", err)

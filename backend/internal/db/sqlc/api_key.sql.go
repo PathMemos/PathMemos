@@ -12,18 +12,17 @@ import (
 )
 
 const createAPIKey = `-- name: CreateAPIKey :one
-INSERT INTO api_keys (id, user_id, key_hash, api_key, expires_at, created_at)
-VALUES ($1, $2, $3, $4, $5, now())
+INSERT INTO api_keys (id, user_id, key_hash, api_key, created_at)
+VALUES ($1, $2, $3, $4, now())
 ON CONFLICT (user_id) DO NOTHING
-RETURNING id, user_id, key_hash, api_key, expires_at, created_at
+RETURNING id, user_id, key_hash, api_key, created_at
 `
 
 type CreateAPIKeyParams struct {
-	ID        string             `json:"id"`
-	UserID    string             `json:"userId"`
-	KeyHash   string             `json:"keyHash"`
-	ApiKey    string             `json:"apiKey"`
-	ExpiresAt pgtype.Timestamptz `json:"expiresAt"`
+	ID      string `json:"id"`
+	UserID  string `json:"userId"`
+	KeyHash string `json:"keyHash"`
+	ApiKey  string `json:"apiKey"`
 }
 
 type CreateAPIKeyRow struct {
@@ -31,17 +30,16 @@ type CreateAPIKeyRow struct {
 	UserID    string             `json:"userId"`
 	KeyHash   string             `json:"keyHash"`
 	ApiKey    string             `json:"apiKey"`
-	ExpiresAt pgtype.Timestamptz `json:"expiresAt"`
 	CreatedAt pgtype.Timestamptz `json:"createdAt"`
 }
 
+// expires_at 由列 DEFAULT 填充（恒 9999-12-31，000015），代码不再显式写入。
 func (q *Queries) CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (CreateAPIKeyRow, error) {
 	row := q.db.QueryRow(ctx, createAPIKey,
 		arg.ID,
 		arg.UserID,
 		arg.KeyHash,
 		arg.ApiKey,
-		arg.ExpiresAt,
 	)
 	var i CreateAPIKeyRow
 	err := row.Scan(
@@ -49,7 +47,6 @@ func (q *Queries) CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (Cre
 		&i.UserID,
 		&i.KeyHash,
 		&i.ApiKey,
-		&i.ExpiresAt,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -65,7 +62,7 @@ func (q *Queries) DeleteAPIKeyByUser(ctx context.Context, userID string) error {
 }
 
 const getAPIKeyByHash = `-- name: GetAPIKeyByHash :one
-SELECT id, user_id, key_hash, api_key, expires_at, created_at FROM api_keys WHERE key_hash = $1
+SELECT id, user_id, key_hash, api_key, created_at FROM api_keys WHERE key_hash = $1
 `
 
 type GetAPIKeyByHashRow struct {
@@ -73,7 +70,6 @@ type GetAPIKeyByHashRow struct {
 	UserID    string             `json:"userId"`
 	KeyHash   string             `json:"keyHash"`
 	ApiKey    string             `json:"apiKey"`
-	ExpiresAt pgtype.Timestamptz `json:"expiresAt"`
 	CreatedAt pgtype.Timestamptz `json:"createdAt"`
 }
 
@@ -85,14 +81,13 @@ func (q *Queries) GetAPIKeyByHash(ctx context.Context, keyHash string) (GetAPIKe
 		&i.UserID,
 		&i.KeyHash,
 		&i.ApiKey,
-		&i.ExpiresAt,
 		&i.CreatedAt,
 	)
 	return i, err
 }
 
 const getAPIKeyByUser = `-- name: GetAPIKeyByUser :one
-SELECT id, user_id, key_hash, api_key, expires_at, created_at FROM api_keys WHERE user_id = $1
+SELECT id, user_id, key_hash, api_key, created_at FROM api_keys WHERE user_id = $1
 `
 
 type GetAPIKeyByUserRow struct {
@@ -100,7 +95,6 @@ type GetAPIKeyByUserRow struct {
 	UserID    string             `json:"userId"`
 	KeyHash   string             `json:"keyHash"`
 	ApiKey    string             `json:"apiKey"`
-	ExpiresAt pgtype.Timestamptz `json:"expiresAt"`
 	CreatedAt pgtype.Timestamptz `json:"createdAt"`
 }
 
@@ -112,7 +106,6 @@ func (q *Queries) GetAPIKeyByUser(ctx context.Context, userID string) (GetAPIKey
 		&i.UserID,
 		&i.KeyHash,
 		&i.ApiKey,
-		&i.ExpiresAt,
 		&i.CreatedAt,
 	)
 	return i, err

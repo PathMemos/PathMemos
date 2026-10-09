@@ -19,7 +19,7 @@
 | D1 | MCP 采用 Streamable HTTP（spec 2024-11-05），每次请求为无状态 POST，无持久连接/无 in-memory session | 降低源站连接与协议解析开销，免 session 清理（`backend/internal/mcp/server.go`） | 无 |
 | D2 | SaaS 唯一公网入口为 Cloudflare Worker `mcp.pathmemos.com`；源站仅暴露 `/internal/mcp/*`（`X-Worker-Secret` 保护） | 隐藏源站 IP、获得边缘接入（`docs/ARCHITECTURE.md` `2.3`） | 无 |
 | D3 | 开源版（`DEPLOYMENT_MODE=open`）源站直接注册公开 `/mcp`、`/mcp/diary`、`/mcp/memories`；`/internal/mcp/*` 仅在 SaaS 模式注册 | 不依赖 Worker 也能用（`main.go` `run` open 分支 `mcpHandler.RegisterPublic`；`mcp/rpc.go` `RegisterPublic`） | 无 |
-| D4 | API Key 同时存明文（`api_keys.api_key`，产品要求永久展示）与 SHA-256（`key_hash`，认证用）；永不过期（`expires_at=9999-12-31T23:59:59Z` 占位） | 满足「永久展示」需求；认证只查 hash，不校验过期（`mcp/handler.go` `apiKeyNeverExpires`） | ADR-0007 |
+| D4 | API Key 同时存明文（`api_keys.api_key`，产品要求永久展示）与 SHA-256（`key_hash`，认证用）；永不过期——响应中的 `expiresAt` 为 `apiKeyNeverExpires` 常量（9999-12-31），DB 过期列已移除（000016 死列清理） | 满足「永久展示」需求；认证只查 hash，不校验过期（`mcp/handler.go` `apiKeyNeverExpires`） | ADR-0007 |
 | D5 | Worker 边缘直接响应静态方法（`tools/list`、`prompts/list`、`prompts/get`），动态方法回源；GET 查询在 Worker 边缘缓存 | 减少回源与握手延迟（`mcp-worker/src/index.ts`） | 无 |
 | D6 | GET 缓存键叠加「记忆写版本」，`store_memory` 成功后换版本，使该 Key 全部查询缓存整体失效 | 让近期查询也可安全缓存，消除 store 后 30 分钟脏读（`mcp-worker/src/index.ts`） | 无 |
 | D7 | 小程序私有化后端由 api-worker 按 `X-Private-Api-Key` 查 KV 路由到用户自部署后端 | 用 API Key 作路由键，避免 session 刷新导致路由失效（`api-worker/src/index.ts`） | 无 |
@@ -119,7 +119,7 @@
 
 | 表 | 关键字段 / 约束 | 说明 |
 |----|----------------|------|
-| `api_keys` | `id` 主键；`user_id` NOT NULL 且 `UNIQUE`、FK `users ON DELETE CASCADE`；`key_hash` NOT NULL 且 `UNIQUE INDEX idx_api_keys_key_hash`；`api_key` NOT NULL（明文）；`expires_at` NOT NULL；`created_at`；索引 `idx_api_keys_expires_at` | 一用户至多一 key；明文供展示，hash 供认证 |
+| `api_keys` | `id` 主键；`user_id` NOT NULL 且 `UNIQUE`、FK `users ON DELETE CASCADE`；`key_hash` NOT NULL 且 `UNIQUE INDEX idx_api_keys_key_hash`；`api_key` NOT NULL（明文）；`created_at` | 一用户至多一 key；明文供展示，hash 供认证（过期列已随死列清理移除，000016） |
 | `memories` | `id` 主键；`user_id` FK CASCADE；`record_time timestamptz NOT NULL`；`record_date date NOT NULL`；`title text NOT NULL`；`content text NOT NULL`；`created_at`；覆盖索引 `idx_memories_query_covering(user_id, record_date DESC, record_time DESC) INCLUDE (title, content)` | 手动保存的记忆；写入同时 upsert 当日 diary 行 |
 | `diaries` | `(user_id, record_date)` 唯一（`UpsertDiary` ON CONFLICT DO NOTHING） | 记忆写入时确保当日 diary 行存在 |
 | `diary_entries` / `users` | — | MCP 查询日记条目与昵称 |

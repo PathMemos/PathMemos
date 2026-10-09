@@ -267,7 +267,6 @@
 | `short_code` | text | **UNIQUE**；8 位，字符集 `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`；索引 `idx_user_invite_codes_short_code_lookup` |
 | `created_at` | timestamptz | 默认 now() |
 | `expires_at` | timestamptz | 可空；**当前代码从不写入（恒为 NULL）**，解析 SQL 判 `expires_at IS NULL OR expires_at > now()` |
-| `used_at` | timestamptz | 可空；解析已改纯读（`ResolveInviterFromCode` 为纯 SELECT，全库无写入点），列保留备将来过期策略启用 |
 
 ### 4.4 `wx_mp_accounts`（本域只读）
 

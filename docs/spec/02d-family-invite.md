@@ -42,7 +42,7 @@
 | D3 | 家庭成员上限 **6 人**；owner 携原家庭加入时按「源 + 目标总数 ≤ 6」校验 | 控制共享规模 | 无 |
 | D4 | 家庭变更使用家庭级 PostgreSQL advisory lock `lock:family:{id}`（ADR-0005，无 TTL），多锁按字典序获取；未抢到立即失败（429） | 成员上限是「先 count 再 insert」的跨请求竞态，RR 重试无法覆盖 | 无 |
 | D5 | **owner 携家庭加入他人家庭 = 整家合并**：源家庭全体成员迁入目标、源家庭解散、封面迁移。前端打开链接即自动加入、无二次确认；「owner 被诱导整家合并」的钓鱼风险为**已接受取舍**（ADR-0012，熟人小家庭场景不增加防护） | `/family/invite-link/join`；代码注释声明这是预期行为 | ADR-0012 |
-| D6 | 邀请短码 8 位（字符集 `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`），一用户一码、永久有效、可重复解析；解析为纯读（`used_at` 写副作用已移除，列保留待将来过期策略启用） | 稳定分享码，简单优先 | 无 |
+| D6 | 邀请短码 8 位（字符集 `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`），一用户一码、永久有效、可重复解析；解析为纯读（恒真过期谓词与死列 `used_at` 已随 000016 移除） | 稳定分享码，简单优先 | 无 |
 | D7 | 家庭邀请链接直接使用 `linkId = familyId`；任何成员均可生成；**长期有效、无撤销**（已接受取舍，ADR-0010） | 无需额外邀请令牌表；familyId 为 UUID v7 | ADR-0010 |
 | D8 | 家庭变更 / 加入 / 解散 / 链接奖励事务使用 `WithTxDeferrable`（邀请二维码文件记录替换用 `WithTx`）；缓存失效与物理文件删除在事务提交之后 | 非幂等副作用在事务提交后执行 | 无 |
 | D9 | 封面迁移与成员迁移在同一事务内完成 | 保证数据一致，避免孤儿封面 | 无 |
@@ -325,7 +325,7 @@
 
 字段定义与约束见 PP-02A §4.2 / §4.3（同一批迁移）。本域使用要点：
 
-- `user_invite_codes`：一人一码、`short_code` 唯一、`expires_at` 恒 NULL、`used_at` 列保留但不再写入（解析已改纯读）。
+- `user_invite_codes`：一人一码、`short_code` 唯一、`expires_at` 恒 NULL（列保留作重启过期策略的锚点）、`used_at` 已移除（000016 死列清理）。
 - `user_invites`：`user_id` 唯一（一人一个邀请人；000008 起可空、FK `SET NULL`——被邀请人注销保留 openid 墓碑行），`reward_inviter_at` / `reward_invitee_at` 控制奖励幂等；`inviter_id` 可空、FK `SET NULL`（000011：邀请人注销保留被邀请人墓碑行，`user_open_id` 部分唯一索引继续阻断重复领取被邀请奖励；跨渠道删号重注册可绕过的边界见 ADR-0016）。
 
 ### 4.5 `files`（邀请二维码使用）

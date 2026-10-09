@@ -59,13 +59,12 @@ RETURNING *;
 SELECT short_code FROM user_invite_codes WHERE user_id = $1;
 
 -- name: ResolveInviterFromCode :one
--- 邀请码是邀请人的稳定分享码，可被多个被邀请人多次解析（不限制一次性），
--- 过期语义由 user_invite_codes.expires_at（baseline 000001）决定：过期后解析失败。
--- 解析为纯读（used_at 死遥测写副作用移除；列保留，将来做过期策略再启用）。
+-- 邀请码是邀请人的稳定分享码，可被多个被邀请人多次解析（不限制一次性）。
+-- 解析为纯读；短码自 000013 起永久有效（expires_at 全量为 NULL），
+-- 恒真过期谓词已移除（列保留，将来重启过期策略时再加回）。
 SELECT user_id
 FROM user_invite_codes
-WHERE short_code = $1
-  AND (expires_at IS NULL OR expires_at > now());
+WHERE short_code = $1;
 
 -- name: DeleteUserInviteCodeByUserID :exec
 DELETE FROM user_invite_codes WHERE user_id = $1;

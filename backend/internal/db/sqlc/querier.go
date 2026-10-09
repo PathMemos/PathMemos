@@ -49,6 +49,7 @@ type Querier interface {
 	CountFamilyMembers(ctx context.Context, familyID string) (int64, error)
 	CountInviterMonthlyRewardDays(ctx context.Context, arg CountInviterMonthlyRewardDaysParams) (int32, error)
 	CountWeeklyDiaryEntriesByUsers(ctx context.Context, arg CountWeeklyDiaryEntriesByUsersParams) (int64, error)
+	// expires_at 由列 DEFAULT 填充（恒 9999-12-31，000015），代码不再显式写入。
 	CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (CreateAPIKeyRow, error)
 	CreateAutoRecordEntry(ctx context.Context, arg CreateAutoRecordEntryParams) error
 	CreateDiaryEntry(ctx context.Context, arg CreateDiaryEntryParams) (DiaryEntry, error)
@@ -225,9 +226,9 @@ type Querier interface {
 	NullifyOrdersByUser(ctx context.Context, userID pgtype.Text) error
 	RecordRemovedMember(ctx context.Context, arg RecordRemovedMemberParams) error
 	RenameUserCommonAddress(ctx context.Context, arg RenameUserCommonAddressParams) error
-	// 邀请码是邀请人的稳定分享码，可被多个被邀请人多次解析（不限制一次性），
-	// 过期语义由 user_invite_codes.expires_at（baseline 000001）决定：过期后解析失败。
-	// 解析为纯读（used_at 死遥测写副作用移除；列保留，将来做过期策略再启用）。
+	// 邀请码是邀请人的稳定分享码，可被多个被邀请人多次解析（不限制一次性）。
+	// 解析为纯读；短码自 000013 起永久有效（expires_at 全量为 NULL），
+	// 恒真过期谓词已移除（列保留，将来重启过期策略时再加回）。
 	ResolveInviterFromCode(ctx context.Context, shortCode string) (string, error)
 	// 邀请二维码/分享海报豁免：invite/qrcode.go generate 写入的海报记录 metadata 恒含 'raw' 键
 	//（轨迹图为 {family_id, record_date}、头像 marker 为 {}，均无该键，故 'raw' 是 invite 资产唯一识别特征）。

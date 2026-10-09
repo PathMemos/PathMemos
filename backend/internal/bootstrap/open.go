@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"papafeiji/backend/internal/config"
 	"papafeiji/backend/internal/db"
@@ -110,10 +109,6 @@ func SeedOpenBackend(ctx context.Context, cfg *config.Config, pool *db.Pool, ses
 				UserID:  user.ID,
 				KeyHash: keyHash,
 				ApiKey:  cfg.OpenAPIKey,
-				ExpiresAt: pgtype.Timestamptz{
-					Time:  time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC),
-					Valid: true,
-				},
 			})
 			if err != nil {
 				return fmt.Errorf("create open api key: %w", err)
@@ -144,10 +139,6 @@ func SeedOpenBackend(ctx context.Context, cfg *config.Config, pool *db.Pool, ses
 		UserID:  user.ID,
 		KeyHash: keyHash,
 		ApiKey:  cfg.OpenAPIKey,
-		ExpiresAt: pgtype.Timestamptz{
-			Time:  time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC),
-			Valid: true,
-		},
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

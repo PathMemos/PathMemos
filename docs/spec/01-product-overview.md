@@ -70,7 +70,6 @@ papafeiji（拍拍照记记）是一款以「时间轴 + 地图轨迹」自动�
 
 | 项 | 说明 |
 |----|------|
-| 死列/死索引清理（contract 迁移） | `api_keys.expires_at`（恒 9999-12-31、认证不判过期）、`idx_api_keys_expires_at` 死索引、`user_invite_codes.used_at`（无写入点）与恒真过期谓词。drop 列属 contract DDL，按 04 §8 硬纪律须两次部署：**第一步部署**代码停读停写该列（行为中性）；**第二步部署**（第一步已在线上运行后）执行 drop 迁移。**触发**：下次规划 schema 变更时顺带执行两步序列 |
 | 技术债（已评估暂缓） | `GET /auto-record/config` 读用户 DB 失败降级 200 `{enabled:false}`（PUT 失败为 500）的语义再评估。**触发**：出现因 200 降级导致前端误判开关状态或排障困扰的实际案例；无案例维持现状（02c §5 已登记该降级行为） |
 | sprintf-js ReDoS（无上游补丁） | jest/eslint 工具链传递依赖（devDeps，无运行时攻击面）；上游未发布补丁版本。**触发**：上游发布修复版时随工具链升级 |
 | 旧版 bizCode 兼容移除 | `backend/internal/ai/upstream.go` 同时下发 snake/camelCase bizCode；移除 camel 分支。**触发**：2027-01-01 复查——届时线上最低 versionCode 高于下发 camelCase 的版本引入号即移除，否则顺延一年再复查 |
