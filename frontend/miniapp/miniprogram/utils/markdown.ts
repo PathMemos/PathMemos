@@ -1,12 +1,17 @@
 
 const _MAX_MD_LENGTH = 5000;
 
+// 降级路径（超长/解析异常）：转义后仅保留换行结构，不做 markdown 解析。
+function _escapePlainText(text: string): string {
+  return escapeHtml(text).replace(/\n/g, '<br>');
+}
+
 export function markdownToHtml(md: string): string {
   try {
     return _markdownToHtml(md);
   } catch (e) {
     console.error('markdown parse error', e);
-    return (md || '').replace(/\n/g, '<br>');
+    return _escapePlainText(md || '');
   }
 }
 
@@ -15,13 +20,15 @@ function _markdownToHtml(md: string): string {
 
   
   if (md.length > _MAX_MD_LENGTH) {
-    return md.replace(/\n/g, '<br>');
+    // 超长降级：不做 markdown 解析，但仍需转义（rich-text 标签白名单兜底之外的
+    // 意外标签渲染/样式注入面），与正常路径的 escapeHtml 同语义。
+    return _escapePlainText(md);
   }
 
   let html = md;
 
   
-  // R2-F03：占位符加随机后缀，防止用户文本/AI 输出碰撞导致内容错乱。
+  // 占位符加随机后缀，防止用户文本/AI 输出碰撞导致内容错乱。
   const placeholderSuffix = Math.random().toString(36).slice(2, 8);
   const codeBlocks: string[] = [];
   html = html.replace(/```([\s\S]*?)```/g, (_, code) => {

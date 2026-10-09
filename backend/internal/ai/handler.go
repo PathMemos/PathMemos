@@ -31,7 +31,7 @@ const (
 	dailyQuotaKeyPrefix  = "ai:daily_chat"
 	maxChatBodySize      = 32 * 1024 // 32KB，足以覆盖 2500 code points 及 JSON 开销
 
-	// R-08：SSE 心跳与并发连接上限（单轮本身受 AIStreamTimeout=180s 约束，无跨轮长连接）。
+	// SSE 心跳与并发连接上限（单轮本身受 AIStreamTimeout=180s 约束，无跨轮长连接）。
 	sseHeartbeatInterval = 25 * time.Second
 	sseMaxPerUser        = 2
 	defaultSSEMaxConns   = 200
@@ -56,7 +56,7 @@ func (h *Handler) Register() {
 	h.router.Post("/ai/chat", h.Chat)
 }
 
-// --- R-08 SSE 连接治理 ---
+// --- SSE 连接治理 ---
 
 type sseConnLimiter struct {
 	mu      sync.Mutex
@@ -148,6 +148,16 @@ func (lw *lockedSSEWriter) done() {
 	lw.closed = true
 }
 
+// notice 下发非终止性提示（如超时截断），不改变 closed 状态——随后仍以 done 收尾。
+func (lw *lockedSSEWriter) notice(payload string) {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	if lw.closed {
+		return
+	}
+	_ = writeSSENotice(lw.w, lw.f, payload) //nolint:errcheck // stream close is best-effort
+}
+
 func (lw *lockedSSEWriter) errorEvent(code, bizCode, message string) {
 	lw.mu.Lock()
 	defer lw.mu.Unlock()
@@ -185,13 +195,13 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 		middleware.JSONError(w, r, http.StatusBadRequest, errors.CodeBadRequest, "message too long", errors.BizTextTooLong)
 		return
 	}
-	// R4：request_id 为客户端幂等标识（断线重连复用），限定字符集与长度防止脏键/超大键。
+	// request_id 为客户端幂等标识（断线重连复用），限定字符集与长度防止脏键/超大键。
 	if req.RequestID != "" && !requestIDPattern.MatchString(req.RequestID) {
 		middleware.JSONError(w, r, http.StatusBadRequest, errors.CodeBadRequest, "invalid request_id")
 		return
 	}
 
-	// R-08：超限在开流前返回 429；客户端断开时立即释放名额（上游仍消费到 EOF 写回放缓存）。
+	// 超限在开流前返回 429；客户端断开时立即释放名额（上游仍消费到 EOF 写回放缓存）。
 	if !chatLimiter.acquire(userID) {
 		slog.WarnContext(ctx, "ai chat connection limit reached", slog.String("user_id", userID))
 		middleware.JSONError(w, r, http.StatusTooManyRequests, errors.CodeTooManyRequests, "too many concurrent ai chat connections", errors.BizRateLimited)
@@ -234,7 +244,7 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 	streamCtx, cancel := context.WithTimeout(ctx, AIStreamTimeout)
 	defer cancel()
 
-	_, err := h.service.Chat(streamCtx, userID, msg, req.RequestID, func(chunk string) error {
+	reply, truncated, err := h.service.Chat(streamCtx, userID, msg, req.RequestID, func(chunk string) error {
 		if werr := lw.data(chunk); werr != nil {
 			releaseOnce()
 			return werr
@@ -262,5 +272,12 @@ func (h *Handler) Chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 截断的部分回复照常计费与落库（02f AI-6），done 前下发 notice 提示回答不完整；
+	// 客户端断开（clientGone）时写失败为 best-effort。
+	if truncated {
+		slog.WarnContext(ctx, "ai chat reply truncated by stream timeout",
+			slog.String("user_id", userID), slog.Int("reply_bytes", len(reply)))
+		lw.notice(`{"type":"truncated"}`)
+	}
 	lw.done()
 }

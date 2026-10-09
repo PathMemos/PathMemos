@@ -5,8 +5,8 @@
 # 由本脚本一并纳入扫描面；ALERT_WEBHOOK_URL 从 /opt/papafeiji/.env 读取。
 #
 # 增量读取（防旧告警无限重推）：主机日志文件只喂"上次扫描之后新增的行"——
-# 此前用 tail -N，而这些日志仅在异常时写入、几乎不增长，恢复后旧行会长期留在
-# tail 窗口内，叠加 alert-watch 的 5 分钟去重过期，导致同一告警每 5 分钟重推。
+# 这些日志仅在异常时写入、几乎不增长，按行数取尾窗会让恢复前的旧行
+# 长期留在窗口内，叠加 alert-watch 的 5 分钟去重过期，导致同一告警每 5 分钟重推。
 # offset 状态存 /var/lib/papafeiji/alert-cron-offsets/<file>.offset：
 #   - 首次见到某文件：初始化 offset 为当前大小（不回放历史，只看未来）；
 #   - 文件被截断/轮转（size < offset）：重置为 0 全量重读。

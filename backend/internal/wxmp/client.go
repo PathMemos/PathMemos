@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 
 	"mime/multipart"
 	"net/http"
@@ -67,7 +68,10 @@ func (c *Client) GetAccessToken(ctx context.Context) (string, error) {
 		if err == nil && cached != "" {
 			return cached, nil
 		}
-
+		if err != nil && err != goredis.Nil {
+			// 缓存读失败（非 miss）降级回源微信，但记 warn 与 getThumbMediaID 同型，避免排障缺一环。
+			slog.WarnContext(ctx, "read wechat mp access token cache failed", slog.Any("error", err))
+		}
 	}
 
 	// Use the stable access token endpoint to avoid token invalidation races.

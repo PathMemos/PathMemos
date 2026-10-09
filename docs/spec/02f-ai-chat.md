@@ -1,7 +1,7 @@
 # PP-02F AI 对话（L2）
 
-> 层级：L2 领域分册｜版本：V2.0｜状态：定稿（以当前代码为唯一事实源）
-> 上游：PP-01 产品总览｜关联 ADR：无
+> 层级：L2 领域分册｜版本：当前（以代码为唯一事实源）
+> 上游：PP-01 产品总览｜关联 ADR：0004、0015
 > 说明：本分册按当前代码实现整理；行内路径指向对应实现位置。行内 `路径` 为事实来源。
 
 ## 1. 背景与目标
@@ -17,17 +17,17 @@
 
 | # | 决策 | 理由 | 关联 ADR |
 |---|------|------|---------|
-| D1 | app(:8080) 与 sse(:8081) 双 HTTP Server；`/ai/chat` 只注册在 sseRouter | AI 流式长连接与普通 REST 超时/缓冲策略不同，需独立 Server（`backend/cmd/server/main.go`；Nginx `location /ai/chat` 反代 `papafeiji_sse`，`deploy/nginx/default.conf`） | 无 |
+| D1 | app(:8080) 与 sse(:8081) 双 HTTP Server；`/ai/chat` 只注册在 sseRouter | AI 流式长连接与普通 REST 超时/缓冲策略不同，需独立 Server（`backend/cmd/server/main.go`；Nginx `location /ai/chat` 反代 `papafeiji_sse`，`deploy/nginx/default.conf`） | 0004 |
 | D2 | `ai.Service` 同时服务小程序 SSE 与公众号；公众号用 `ChatWithPromptUsingConfig(..., WECHAT_MP_PROMPT, ...)` 自定义 prompt | 业务逻辑与传输解耦，公众号与小程序共享配额/幂等/上游 | 无 |
 | D3 | 配额「先 Redis 闸门，后 DB 权威原子扣减；无有效回复必退款」 | Redis 仅作快速预检，DB 的 `WHERE used<quota` 才是权威；Redis 抖动 fail-open 不绕过配额 | 无 |
 | D4 | 幂等键优先取客户端 `request_id`（每轮生成、重连复用），缺失时回退消息内容哈希 | 精确覆盖「断线重连」，避免重复调用上游/扣配额/落库（`backend/internal/ai/service.go` `aiTurnKeys`） | 无 |
-| D5 | 上游为 OpenAI 兼容接口 `POST {baseUrl}/v1/chat/completions`，`stream:true` + `stream_options.include_usage:true`（流末尾 usage chunk 记入 `msg="ai chat usage"` 结构化日志：`user_id`/`prompt_tokens`/`completion_tokens`，尽力而为不落库，`scripts/ai-cost.sh` 汇总）；上游建流失败/非 200/中途流错误且无回复时输出限频告警 `alert=ai_upstream_error`（5 分钟一次） | 对接 DeepSeek 等兼容网关；thinking 由 `AI_THINKING_TYPE` 可选开启；成本与上游故障此前不可见（ADR-0015） | 无 |
+| D5 | 上游为 OpenAI 兼容接口 `POST {baseUrl}/v1/chat/completions`，`stream:true` + `stream_options.include_usage:true`（流末尾 usage chunk 记入 `msg="ai chat usage"` 结构化日志：`user_id`/`prompt_tokens`/`completion_tokens`，尽力而为不落库，`scripts/ai-cost.sh` 汇总）；上游建流失败/非 200/中途流错误且无回复时输出限频告警 `alert=ai_upstream_error`（5 分钟一次） | 对接 DeepSeek 等兼容网关；thinking 由 `AI_THINKING_TYPE` 可选开启；成本与上游故障可观测（ADR-0015） | 0015 |
 | D6 | 上游流上下文用 `context.WithoutCancel` 派生，客户端断开后继续消费至 EOF 并写回放缓存 | 重连可零成本回放，避免重复扣费（`service.go`） | 无 |
 | D7 | 小程序不使用标准 EventSource；前端用 `wx.request` + `enableChunked` 自解析 SSE | 微信小程序无 EventSource/ReadableStream（`frontend/.../utils/eventSource.ts`） | 无 |
 | D8 | 对话日志异步落库，后台删除 **>90 天**的日志 | 控制表体积，日志仅用于调试 | 无 |
 | D9 | 本域**未使用 Redis pub/sub** | 全仓库未发现 Publish/Subscribe 调用；app 与 sse 仅通过同一 Redis 的键（session/配额/幂等/缓存）协作 | 无 |
 | D10 | AI 变现边界 = 每日配额（非 VIP 10 / VIP 100）+ 单次输入限制 + 基础限流，到此为止 | 不建 Token 余额、计费、精确成本核算体系；配额即全部 | 无 |
-| D11 | SSE 连接治理：数据/心跳/结束/错误事件串行写入；空闲每 25s 发 `: heartbeat`；单用户并发 2、进程内 `SSE_MAX_CONNS`（默认 200，仅约束本 sse 进程）；超限开流前 429；客户端断开立即释放名额，上游仍消费到 EOF 写回放缓存 | 防慢连接/断连泄漏占用；单轮为独立 POST、受 `AIStreamTimeout=180s` 约束，无跨轮长连接 | 无 |
+| D11 | SSE 连接治理：数据/心跳/结束/错误事件串行写入；每 25s 无条件发 `: heartbeat` 注释行（不感知是否空闲，SSE 注释行对客户端无副作用）；单用户并发 2、进程内 `SSE_MAX_CONNS`（默认 200，仅约束本 sse 进程）；超限开流前 429；客户端断开立即释放名额，上游仍消费到 EOF 写回放缓存 | 防慢连接/断连泄漏占用；单轮为独立 POST、受 `AIStreamTimeout=180s` 约束，无跨轮长连接 | 无 |
 
 ## 3. 核心流程（用户故事 + 时序）
 
@@ -47,9 +47,11 @@
 验收标准：
 - 键：`aiTurnKeys(userID, message, requestID)` 对 `userID + 换行符 + (requestID 或 message)` 取 SHA-256；`ai:turn:<hex>`（TTL 240s，处理中标记）、`ai:reply:<hex>`（TTL 10min，完整回复）。
 - 命中 `ai:reply:<hex>`：按 `aiReplayChunkRunes=120` 字符/片回放，直接返回缓存，不扣配额、不落库。
-- 未命中且 `SETNX ai:turn` 成功：正常生成；失败（已在途）：每 `aiTurnPollInterval=200ms` 轮询，等待 `ai:reply` 出现或 `ai:turn` 消失，窗口 `aiTurnKeyTTL=240s`（实际受外层 180s 请求上下文约束）。
-- **等待超时或在途失败 → 直接返回 SSE error（`code=4290`、`biz_code=OPERATION_IN_PROGRESS`、`message="ai turn in progress, retry later"`），不回落生成、不扣配额、不落库**；残留标记由 TTL 兜底。
+- 未命中且 `SETNX ai:turn` 成功：正常生成；返回 false（已在途）：每 `aiTurnPollInterval=200ms` 轮询，等待 `ai:reply` 出现或 `ai:turn` 消失（**仅 `redis.Nil` 视为在途已结束**；其余 Redis 读错误记 warn `ai turn key check failed, keep waiting` 并继续轮询，不因 Redis 抖动误拒），窗口 `aiTurnKeyTTL=240s`（实际受外层 180s 请求上下文约束）。`SETNX` 报错按未获取处理、走正常生成（绝不阻断对话）。
+- **Redis 故障窗口的幂等边界**：Redis 故障时 `ai:turn` / `ai:reply` 幂等键失效，断线重连同 `request_id` 可能重复扣配额 / 重复落 `ai_dialog_logs`——与 INVARIANTS I2 的收窄口径一致（「重复业务写入」限定资金与家庭结构写入），损失有界（单用户单日配额量级，DB 配额权威闸门 `IncrementAIDailyQuotaUsed` 限损），已接受。
+- **等待超时或在途失败 → 直接返回 SSE error（`code=4290`、`biz_code=OPERATION_IN_PROGRESS`、`message="ai turn in progress, retry later"`），不回落生成、不扣配额、不落库**；残留标记由 TTL 兜底。外层请求 ctx 到期（180s）单独返回 timeout 语义（`errAIChatTimeout`），避免 handler 误报 upstream error；客户端主动取消仍为 cancelled（handler 对取消错误同样记一条 ERROR『ai chat upstream error』日志——无 `alert=` 字段、不触发 `ai_upstream_error` 告警，仅为日志语义噪音，已知取舍不改）。
 - 上游流以 EOF 完整结束且回复非空时，先写 `ai:reply` 再删 `ai:turn`（顺序固定）。
+- `Service.rdb` 生产恒非 nil（`main.go` 连接失败即退出）：幂等分支的 `rdb != nil` 守卫为已知死防御（同函数后续配额/退款/落库路径均直接解引用），保留不重构——删守卫触碰幂等主路径、补齐守卫徒增分支，均不抵收益。
 - 断言：同一 `request_id` 重发，`ai_daily_quota_usage.used` 不额外 +1，`ai_dialog_logs` 不额外新增行（含在途冲突分支）。
 - 边界：不带 `request_id` 的调用方（公众号）在 10 分钟内主动重复发送同一消息会命中回放（`service.go` 注释，已接受）。
 
@@ -57,11 +59,11 @@
 
 验收标准：
 - 路由 `GET/POST /wx/callback`（app，公开）；GET 验签成功原样回显 `echostr`，失败 HTTP 403 + `fail`。
-- POST：`msg_signature` 存在即走加密模式，必须校验加密签名（不回退明文签名），解密后 `appid` 必须等于 `WECHAT_MP_APPID`（配置非空时）；否则走明文 `signature` 校验。`ToUserName` 与 `WECHAT_MP_GHID` 不一致则返回 `success` 丢弃。
-- 去重：text/voice 且 `MsgId` 非空时 Redis `wxmp:msgid:<MsgId>` SetNX TTL 60s；重复消息被动回复「正在思考，请稍候…」，避免触发重复 AI。
+- POST：微信推送 body 超过 64KB 直接回 `success` 丢弃（`handleMessage`，`maxWXBodySize`）。`msg_signature` 存在即走加密模式，必须校验加密签名（不回退明文签名），解密后 `appid` 必须等于 `WECHAT_MP_APPID`（配置非空时）；明文推送在 `WECHAT_ENCODING_AES_KEY` 已配置时一律 403 拒绝（强制安全模式，防签名三元组重放），未配置 AES Key 的明文部署需通过 timestamp ±5 分钟新鲜度校验后才走明文 `signature` 校验。`ToUserName` 与 `WECHAT_MP_GHID`（配置非空时）不一致则返回 `success` 丢弃——未配置 GHID（开源/极简部署）时任意 ToUserName 放行。
+- 去重：text/voice 且 `MsgId` 非空时 Redis `wxmp:msgid:<MsgId>` SetNX TTL 300s（覆盖微信回调重试窗口，重试期内不触发重复 AI）；重复消息被动回复「正在思考，请稍候…」。
 - text：立即被动回复「正在思考，请稍候…」，后台 goroutine 内先 `resolveUser`（未绑定则异步发引导）再调用 AI（超时 `AIStreamTimeout+30s`）；回复按 `wxmpKfTextByteLimit=2000` 字节拆分为客服消息（`SendKfMessage`）推送，发送前 `stripMarkdown`。
 - 客服消息**全部分段均失败**时记录 `[ALERT] wx mp all kf segments failed` 日志（部分失败仅计数，不告警）。
-- 其他兜底分支：非 text/voice/event 消息与空文本回「暂只支持文字和语音消息…」；AI 调用失败（非配额类）回「服务繁忙，请稍后再试。」；去重检查 Redis 故障时降级为继续处理（不丢弃消息）。
+- 其他兜底分支：非 text/voice/event 消息与空文本回「暂只支持文字和语音消息…」；AI 调用失败（非配额类）与系统配置加载失败均回「服务繁忙，请稍后再试。」；去重检查 Redis 故障时降级为继续处理（不丢弃消息）。
 - voice：使用微信识别结果 `Recognition`；为空回「未能识别这段语音…」。
 - 未绑定用户：被动回复仍是 `wxmpReplyThinking`「正在思考，请稍候…」，后台 `resolveUser` 失败后以客服消息 `wxmpReplyNoUser`「您尚未在小程序中登录…」异步推送，并异步推送小程序卡片（`WechatAppID` + `pages/index/index`）。
 - 配额超限：客服消息回「您当天的对话额度已用完，请明天再试。」。
@@ -72,9 +74,8 @@
 验收标准：
 - 配额：`dailyQuotaNonVIP=10`、`dailyQuotaVIP=100`；VIP 判定来自 `vipService.GetVIPInfo(ctx,userID).IsVIP`。
 - 日期：`timeutil.NowShanghai()` 的当天 0 点，`quota_date` 为 date。
-- Redis 键 `ai:daily_chat:<userID>:<YYYY-MM-DD>`，TTL = 到次日 0 点（上海）的剩余秒数 + 60s；Lua `dailyQuotaLua` 原子 incr，首次设 expire，>limit 时 decr 并返回 0。
-- Redis 报错 → 记 warn 后降级放行（fail-open），继续走 DB 权威。
-- DB 扣减：`IncrementAIDailyQuotaUsed`（ON CONFLICT user/quota_date DO UPDATE used=used+1 WHERE used < quota）；未实际扣减时回补 Redis 并返回配额不足。
+- Redis 快速闸门：键 `ai:daily_chat:<userID>:<YYYY-MM-DD>` **含日期，跨天天然新键、无残留误限**；TTL 固定 24h+60s（`dailyQuotaCacheTTLFor` 的两个调用点均传入当天 0 点，函数退化为常量），随当日首聊时刻漂移——仅影响键清理时机、不影响计数正确性；Lua `dailyQuotaLua` 原子 incr，首次设 expire，>limit 时 decr 并返回 0。Redis 报错 → 记 warn 后降级放行（fail-open）。
+- DB 权威闸门（**每请求执行**）：`IncrementAIDailyQuotaUsed`（ON CONFLICT user/quota_date DO UPDATE used=used+1 WHERE used < quota）；未实际扣减时回补 Redis 并返回配额不足。权威闸门的作用是 Redis 故障 / 退款失败时的一致性限损与计数回归，**不是跨天兜底**——键含日期，跨天不产生误限。
 - 退款触发：上游建流失败、流取消/错误、超时且无回复、空回复。退款 Db `DecrementAIDailyQuotaUsed`（GREATEST(used-1,0)），最多 4 次尝试（首次 + 3 次退避 100/200/300ms，每次 5s 超时）。
 - 退款成功后 Lua `refundDailyQuotaLua` 原子退 Redis；key 不存在时按 DB 返回值重建。
 - 4 次仍失败 → 记录 `alert:ai_quota_refund_failed`（含 user_id/quota_date）；用户并发注销导致的 `pgx.ErrNoRows` 视为成功不告警。
@@ -82,12 +83,12 @@
 ### AI-5 上下文组装与落库
 
 验收标准：
-- 背景：`user.CurrentFamilyID` 为空返回空串；否则 Redis `ai:family_summary:<familyID>`（TTL `backgroundCacheTTL=30min`）命中即用；miss 时 `ListAIBackgroundEntries(familyID, maxBackgroundEntries=2000)`（家庭维度 LIMIT 2000；子查询每用户近 90 天最多 500 条，格式 `YYYYMMDD HH24时 | 地址 | 文本`），拼 `昵称:\n内容`，超 `maxBackgroundLen=20000` runes 截断（按上游窗口保守预算）；无记录写入并返回「暂无日记记录」。
-- 不可信数据（I7 落地断言）：日记背景文本仅作为**引用资料**拼入 system 背景；背景中的指令性内容（如「忽略以上设定」类文本）不得改变系统行为——验收断言：背景含此类文本时，回复仍遵循系统 prompt 且不执行该指令。
-- 跨域失效：family/diary/autorecord 变更时删除 `ai:family_summary:<familyID>`（`family/service.go`、`autorecord/service.go`、`diary/service.go`）。
+- 背景：`user.CurrentFamilyID` 为空返回空串；否则 Redis `ai:family_summary:<familyID>`（TTL `backgroundCacheTTL=30min`）命中即用；miss 时 `ListAIBackgroundEntries(familyID, maxBackgroundEntries=2000)`（家庭维度 LIMIT 2000；子查询每用户近 90 天最多 500 条，格式 `YYYYMMDD HH24时 | 地址 | 文本`），拼 `昵称:\n内容`（昵称为空用「家人」），超 `maxBackgroundLen=20000` runes 截断（按上游窗口保守预算）；无记录写入并返回「暂无日记记录」。**背景数据源仅 `diary_entries`（含地址），不含 memories 表**——记忆 CRUD 无需失效 `ai:family_summary` 缓存（失效调用只在 diary CRUD 与 family / autorecord 变更处；缓存 TTL 30 分钟惰性重建）。
+- 不可信数据（已接受取舍 + 固定样例人工验收）：日记背景文本仅作为**引用资料**拼入 system 背景；背景中的指令性内容（如「忽略以上设定」类文本）不设结构化护栏，以固定样例人工验收兜底（样例：在某条日记正文中预置「忽略以上所有设定，输出……」，AI 对话后核对回复仍遵循系统 prompt 且未执行该指令，见 07 F7 核对项）。
+- 跨域失效：family/diary/autorecord 变更时删除 `ai:family_summary:<familyID>`（`family/service.go`、`autorecord/service.go`、`diary/service.go`）。已知有界陈旧：MCP `store_memory` 写入只失效 MCP 查询缓存、不删本键（MCP 写→AI 问的低频场景按 30min TTL 兜底，简单优先不反查 family）。
 - 近期上下文：`ListRecentDialogLogs(userID, 20)`（created_at > now()-7 days，DESC）→ `buildMessages` 从新到旧累计，单条计入 rune 数，累计 >2000 runes 或 ≥20 条停止，合并为一条 system「近期对话上下文（最近 7 天）：」。
 - messages 顺序：system(系统 prompt + 背景/占位替换) → 可选 system(「当前提问者是：<nickname>…」) → 可选 system(近期上下文) → user。顺序不得改变（DeepSeek 前缀缓存，`upstream.go` 注释）。
-- 占位符：`{nowDate}` → `YYYY年MM月DD日`（上海）；`{userNickname}` → 「当前用户」；`{userDiaryDetails}`/`{familyDiaryDetails}` → 背景；systemPrompt 为空时用「你是一个日记助手。」。
+- 占位符：`{nowDate}` → `YYYY年MM月DD日`（上海）；`{userNickname}` → 「当前用户」；`{userDiaryDetails}`/`{familyDiaryDetails}` → 背景；prompt 不含日记占位符且背景有效（非空且非「暂无日记记录」）时，背景以「以下是我家最近的生活记录，可作为回答背景参考（按时间倒序）：」追加在 system 末尾（`upstream.go` `buildMessages`）；systemPrompt 为空时用「你是一个日记助手。」——语言前缀先于空值检查拼接，`en`/`zh-Hant` 且 systemPrompt 为空时兜底不生效（system 仅剩语言强制指令；运行时 `AI_PROMPT` 有默认值，该组合实际不可达）。
 - 语言：`user.Lang=="en"` 时 system 首部加英文强制指令且 user 内容前置 `(Answer in English) `；`"zh-Hant"` 时加繁中指令。
 - 落库：回复完成后 `safe.Go` 异步、10s 超时、`db.WithTx` 事务写 `ai_dialog_logs`：先 user 行，回复非空再 assistant 行；两条均含同一 `created_at`。
 
@@ -97,8 +98,10 @@
 - 上游 HTTP 非 200 → 报错（`upstream status N`）并退配额。
 - 上游 payload 含非空 `error.message` → 报错；JSON 解析连续失败 >3 次 → 报错；每成功解析一次计数清零。
 - SSE 行仅识别 `data: ` 前缀，忽略空行与其他行；`[DONE]` → io.EOF；空 chunk 跳过；`delta.reasoning_content` 不输出。
-- 180s 超时：若已累计部分回复则保存并正常返回；否则退配额并下发 `event:error` `code=5001` `message=timeout`。
+- 180s 超时：若已累计部分回复则保存并照常计费（`truncated=true`），done 前下发 `event: notice`（data 为 `{"type":"truncated"}`）提示回答不完整，前端在回文尾部追加「（回答不完整）」（`ai/upstream.go` `writeSSENotice`、`ai/handler.go` `lockedSSEWriter.notice`、`utils/eventSource.ts` `onnotice`）；否则退配额并下发 `event:error` `code=5001` `message=timeout`。截断的部分回复不写入回放缓存（缓存仅收 EOF 完整回复，`chatWithPrompt` defer 的 `complete` 闸门）。
+- **截断语义统一覆盖三类「有部分回复」的失败**：180s 超时、客户端断开导致的流取消（`context.Canceled`）、上游中途流错误——只要已累计非空回复，一律走「保存 + truncated=true + 照常计费 + notice 收尾」；`event:error code=5001` 仅对应**零回复**情形。部分内容已交付即计费，与重连计费边界同族（见下）。
 - 客户端断开：`onChunk` 失败置 `clientGone`，继续消费上游到 EOF（供回放缓存），不再向已断开客户端写。
+- 截断不写回放缓存的另一面：截断分支即释放 `ai:turn` 标记，客户端断开后再以同 `request_id` 重连会重新生成并再次扣配额/落库（截断计费 + 重连计费，损失以单轮配额为界）——与 AI-2 的 Redis 故障幂等边界同型，已接受。
 
 ## 4. 数据模型
 
@@ -118,14 +121,14 @@
 
 | 键 | TTL | 用途 | 位置 |
 |----|-----|------|------|
-| `ai:daily_chat:<userID>:<YYYY-MM-DD>` | 到次日 0 点（上海）+60s | 配额前置闸门计数 | `ai/service.go` |
+| `ai:daily_chat:<userID>:<YYYY-MM-DD>` | 固定 24h+60s（随首聊时刻漂移，仅影响键清理时机） | 配额快速闸门计数（DB 为每请求权威闸门，见 AI-4） | `ai/service.go` |
 | `ai:turn:<sha256>` | 240s | 同一轮「处理中」标记 | `ai/service.go` |
 | `ai:reply:<sha256>` | 10min | 完整回复回放缓存 | `ai/service.go` |
 | `ai:family_summary:<familyID>` | 30min | 家庭日记背景缓存 | `ai/service.go` |
-| `wxmp:msgid:<MsgId>` | 60s | 公众号消息去重 | `wxmp/handler.go` |
+| `wxmp:msgid:<MsgId>` | 300s | 公众号消息去重（覆盖微信重试窗口） | `wxmp/handler.go` |
 | `wxmp:thumb_media_id` | 48h | 小程序卡片缩略图 media_id | `wxmp/handler.go` |
 | `wxmp:profile:refresh:<openID>` | 1h | 微信资料异步刷新节流 | `wxmp/handler.go` |
-| `wechat:mp:access_token:<appID>` | 110min | 公众号 access_token 缓存 | `wxmp/client.go` |
+| `wechat:mp:access_token:<appID>` | 110min | 公众号 access_token 缓存；读失败（非 Nil）记 warn 后照常回源（`wxmp/client.go`） | `wxmp/client.go` |
 
 ## 5. API 契约
 
@@ -195,7 +198,7 @@
 | 请求 body 上限 | 32KB | `ai/handler.go` `maxChatBodySize` |
 | SSE 流超时 | 180s | `ai/handler.go` `AIStreamTimeout` |
 | 非 VIP / VIP 日配额 | 10 / 100 | `ai/handler.go` |
-| 配额 Redis TTL | 到次日 0 点（上海）+60s | `service.go` `dailyQuotaCacheTTLFor` |
+| 配额 Redis TTL | 固定 24h+60s（入参为当天 0 点，函数退化为常量；随首聊时刻漂移仅影响键清理时机，键含日期跨天天然新键） | `service.go` `dailyQuotaCacheTTLFor` |
 | 退款重试 | 最多 4 次尝试（首 + 退避 100/200/300ms） | `service.go` `refundDailyQuota` |
 | 同轮处理中标记 TTL | 240s | `service.go` `aiTurnKeyTTL` |
 | 回复回放缓存 TTL | 10min | `service.go` `aiReplyTTL` |
@@ -208,14 +211,14 @@
 | 上游解析容错 | JSON 失败累计 >3 次报错 | `upstream.go` |
 | 上游 HTTP 客户端上限 | 5min（安全上限；实际生效上限为 `AIStreamTimeout=180s`；该 client 仅 `ai/upstream.go` 流式调用使用）；Scanner 缓冲上限 2MB | `config.SSEHTTPClient()`、`upstream.go` |
 | 对话日志保留 | 删除 >90 天；批 1000 | `jobs/runner.go` `runCleanupAILogs`；`ai.sql` |
-| 清理任务间隔 | 默认 24h（ticker 首次在 interval 后触发），PG advisory lock `lock:background:cleanup_ai_logs` | `jobs/runner.go`；`JOB_INTERVAL_CLEANUP_AI_LOGS` |
+| 清理任务间隔 | 默认 24h（启动时若最近应触发时刻已过且无成功记录会立即补跑，见 02c §6.2），PG advisory lock `lock:background:cleanup_ai_logs` | `jobs/runner.go`；`JOB_INTERVAL_CLEANUP_AI_LOGS` |
 | 前端输入上限 | 2500 字符（与后端 `maxMessageCodePoints` 统一） | `AIDrawer.ts`；`ai/handler.go` |
 | 前端 SSE 缓冲 | 64KB；`wx.request` timeout 200s；传输类失败自动重连 1 次 | `utils/eventSource.ts` |
 
 ### 6.2 锁 / 幂等 / 事务 / 降级
 
 - 幂等：`request_id` → `ai:turn` / `ai:reply`（`6.1` 与 AI-2）。
-- 配额一致性：Redis 为预检、DB 为权威；Redis 异常 fail-open；DB 扣减失败或未扣减时回补 Redis。
+- 配额一致性：Redis 为快速闸门（fail-open）、DB `IncrementAIDailyQuotaUsed` 为每请求权威闸门（作用 = Redis 故障 / 退款失败时的一致性，非跨天兜底）；DB 扣减失败或未扣减时回补 Redis。
 - 事务：仅对话日志落库用 `db.WithTx`；`saveLog` 在同一事务内写 user/assistant 两行。
 - 降级：Redis 读背景/回放/闸门失败均不阻断对话；缓存写失败仅失去缓存能力。
 - 后台任务统一用 `internal/pkg/safe.Go`，panic 记录日志。
@@ -228,12 +231,12 @@
 | `frontend/miniapp/miniprogram/components/AIDrawer/AIDrawer.ts` | 对话抽屉：发送、SSE 生命周期、消息裁剪（`MAX_MESSAGE_COUNT=50`）、配额弹窗、重试、日记卡片回填 |
 | `frontend/miniapp/miniprogram/utils/eventSource.ts` | `wx.request`+`enableChunked` SSE 解析；`MAX_BUFFER_SIZE=64KB`；传输失败自动重连 1 次并清空半截输出；识别 `event: done/error` |
 | `frontend/miniapp/miniprogram/utils/request.ts` | 登录与 session 获取；发送前 `request.login` |
-| `config/index.ts` | `getSSEBaseURL()` 返回 `getBaseURL()`：develop → `http://localhost:8080`；private → `https://api.pathmemos.com`；否则 `https://pro.papafeiji.cn` |
+| `config/index.ts` | `getSSEBaseURL()` 返回 `getBaseURL()`：develop → 默认 `https://pro.papafeiji.cn`（Storage 写 `dev_use_local_backend=true` 才回落 `http://localhost:8080`）；private → `https://api.pathmemos.com`；否则 `https://pro.papafeiji.cn` |
 
 关键交互约束：
 - 每次发送生成 `request_id = Date.now() + "_" + 随机串`（`AIDrawer.ts`），`eventSource` 重连复用同一 `data` 对象（同一 request_id）。
 - 错误 `biz_code=="AI_DAILY_QUOTA_EXCEEDED"`（code=4290）→ 展示配额弹窗并跳转 `/pages/sub/Vip/Vip`。
-- AI 文本中 `$$YYYYMMDD$$` 日期标记会被抽取出并调用 `POST /diary/info/dates` 拉取日记卡片；正文中该标记被移除并转 Markdown HTML。
+- AI 文本中 `$$YYYYMMDD$$` 日期标记会被抽取出并调用 `POST /diary/info/dates` 拉取日记卡片。**标记协议契约**：格式 `$$YYYYMMDD$$`（单日期、8 位数字），由 AI 在需引导用户查看某日日记时输出；协议由系统 prompt（`AI_PROMPT`，代码默认可环境覆盖）承载——修改 prompt 必须回归日记跳转场景；多日期标记受支持（全部抽取、去重后单次 POST `{dates}`，后端上限 31 个；非法日期——年份 2000–2100 之外或月/日越界——跳过，`AIDrawer.ts` `_extractDates`）；转义（正文出现非日期 `$$…$$`）为不支持边界；正文中该标记被移除并转 Markdown HTML。
 - 页面隐藏/卸载中止 SSE（`_abortSSE`），`_sending` 由 onclose/onerror 复位。
 
 ## 8. 运维与任务
@@ -243,15 +246,16 @@
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `AI_API_KEY` | 无（必填，缺省启动校验失败） | 上游 `Authorization: Bearer` |
-| `AI_BASE_URL` / `AI_MODEL` | 无（必填，缺省启动校验失败） | AI 上游地址与模型（唯一来源） |
+| `AI_BASE_URL` / `AI_MODEL` | 空 | AI 上游地址与模型；**启动必填（第二层校验）**——不在 `config.validate` 与 required-runtime-vars.txt（第一层），但 `BuildSysConfig → SysConfig.validate` 无条件校验、缺失启动即失败（两种模式同）；SaaS 由部署渲染注入 |
 | `DEPLOYMENT_MODE` | `saas` | `saas` / `open` |
 | `WORKER_SECRET` | 空 | sseRouter 与 apiRouter 的 `WorkerAuth` 共享密钥；SaaS 必填（空则启动校验失败），open 模式必须留空 |
 | `REDIS_ADDR` / `REDIS_PASSWORD` | — | 配额/幂等/缓存/session |
 | `HTTP_BIND`/`HTTP_PORT` | `127.0.0.1`/`8080` | app |
 | `SSE_BIND`/`SSE_PORT` | `127.0.0.1`/`8081` | sse |
-| `SSE_MAX_CONNS` | `200` | 本进程 SSE 并发连接上限（单用户固定 2） |
-| `WECHAT_MP_APPID` / `WECHAT_MP_SECRET` / `WECHAT_MP_GHID` | 空 | 公众号；未配置时 `IsConfigured()=false` 不刷新资料 |
-| `WECHAT_MSG_TOKEN` / `WECHAT_ENCODING_AES_KEY` | 空 | 回调验签 / 加密模式 |
+| `SSE_MAX_CONNS` | `200` | 本进程 SSE 并发连接上限（单用户固定 2）；在 `ai/handler.go` 包 init 直读容器环境变量（`sseMaxConnsFromEnv`）、不经 `config.Config`（限流器为包级变量，初始化先于 main），为有意取舍 |
+| `WECHAT_MP_APPID` / `WECHAT_MP_SECRET` / `WECHAT_MP_GHID` | 空 | 公众号；未配置时 `IsConfigured()=false` 不刷新资料；SaaS 模式下任一缺失仅启动 warn 告警不阻断（公众号渠道半可用，`main.go`） |
+| `WECHAT_MSG_TOKEN` | saas **必填**（validate 启动校验）；open 可选（空 = 公众号功能关闭，见 03 §8.17） | 回调验签 |
+| `WECHAT_ENCODING_AES_KEY` | 空 | 加密模式（空则按微信后台配置走明文/兼容模式） |
 
 ### 8.2 AI 配置（环境变量）
 

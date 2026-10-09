@@ -64,26 +64,6 @@ func (q *Queries) DeleteAPIKeyByUser(ctx context.Context, userID string) error {
 	return err
 }
 
-const deleteExpiredAPIKeys = `-- name: DeleteExpiredAPIKeys :execrows
-DELETE FROM api_keys
-WHERE id IN (
-    SELECT id FROM api_keys
-    WHERE expires_at < now()
-    ORDER BY id ASC
-    LIMIT $1::bigint
-)
-`
-
-// PPJ-J05：当前产品要求 API Key 永不过期（mcp/apiKeyNeverExpires=9999-12-31），本查询暂无调用；
-// 保留作为未来「Key 可过期」能力的预留，接线时挂到后台清理任务即可。
-func (q *Queries) DeleteExpiredAPIKeys(ctx context.Context, dollar_1 int64) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteExpiredAPIKeys, dollar_1)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 const getAPIKeyByHash = `-- name: GetAPIKeyByHash :one
 SELECT id, user_id, key_hash, api_key, expires_at, created_at FROM api_keys WHERE key_hash = $1
 `

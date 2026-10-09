@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -38,7 +39,7 @@ const (
 	wxmpReplyThinking      = "正在思考，请稍候…"
 
 	wxmpKfTextByteLimit = 2000
-	wxmpMsgIDCacheTTL   = 60 * time.Second
+	wxmpMsgIDCacheTTL   = 300 * time.Second
 
 	wxmpMiniProgramPath = "pages/index/index"
 
@@ -169,6 +170,24 @@ func (h *Handler) handleMessage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
+		// 明文模式收紧(与 payment 侧对齐):AES Key 已配置即强制安全模式,拒绝明文——
+		// 明文签名 sha1(sort([token,timestamp,nonce])) 不绑定消息体,捕获一组合法
+		// 签名三元组即可重放(伪造 FromUserName 触发 AI 对话/翻转订阅状态)。
+		if h.cfg.WechatEncodingAESKey != "" {
+			slog.WarnContext(ctx, "alert=wxmp_plaintext_rejected: secure mode is configured, plaintext callback not allowed")
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("fail")) //nolint:errcheck
+			return
+		}
+		// 无 AES Key 的明文部署:校验 timestamp 新鲜度(±5 分钟),压缩重放窗口。
+		if ts, tsErr := strconv.ParseInt(timestamp, 10, 64); tsErr != nil || time.Now().Unix()-ts > 300 || time.Now().Unix()-ts < -300 {
+			slog.WarnContext(ctx, "wx mp callback stale timestamp")
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("fail")) //nolint:errcheck
+			return
+		}
 		signature := q.Get("signature")
 		if !wechatcrypto.CheckSignature(h.cfg.WechatMsgToken, signature, timestamp, nonce) {
 			slog.WarnContext(ctx, "invalid wx mp callback signature")
@@ -320,7 +339,7 @@ func (h *Handler) handleTextMessage(ctx context.Context, w http.ResponseWriter, 
 		return
 	}
 
-	// FP-P2-05：先立即写非空被动回复（避免微信因空内容重试导致后台 AI 被多次触发），
+	// 先立即写非空被动回复（避免微信因空内容重试导致后台 AI 被多次触发），
 	// 满足微信 5s 被动回复窗口；resolveUser 可能含微信 FetchUserInfo HTTP，放到后台执行。
 	// 完整答案仍通过客服消息异步分段推送；未绑定用户改为异步发引导 + 小程序卡片。
 	h.writeReply(ctx, w, fromOpenID, toUserName, wxmpReplyThinking, timestamp, nonce, encrypted)

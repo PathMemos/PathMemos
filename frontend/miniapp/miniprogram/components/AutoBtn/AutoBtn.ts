@@ -1,5 +1,6 @@
 import request from '../../utils/request';
 import { closeAutoRecord, openAutoRecord } from '../../utils/autoRecord';
+import { isAppEnv } from '../../utils/appPermission';
 import { logger } from '../../utils/logger';
 import i18nBehavior from '../../behaviors/i18n';
 
@@ -123,10 +124,13 @@ Component({
                     (this as any)._changing = false;
                     return;
                   }
-                  if ((this as any).properties.disableSubscribe) {
-                    (this as any).triggerEvent('subscribeprompt', { visible: true });
-                  } else {
-                    (this as any)._safeSetData({ showSubscribePrompt: true });
+                  // App 端通知已裁撤：不弹订阅授权、不记订阅（02g/06）
+                  if (!isAppEnv()) {
+                    if ((this as any).properties.disableSubscribe) {
+                      (this as any).triggerEvent('subscribeprompt', { visible: true });
+                    } else {
+                      (this as any)._safeSetData({ showSubscribePrompt: true });
+                    }
                   }
                   finish(true);
                 })

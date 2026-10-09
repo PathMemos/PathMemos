@@ -298,3 +298,48 @@
     border-radius: 40rpx;
   }
 }
+
+.logout-wrap {
+  padding: 48rpx 32rpx 64rpx;
+
+  .logout-btn {
+    width: 100%;
+    height: 92rpx;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 32rpx;
+    color: #ffffff;
+    background-color: #f6353b;
+    border-radius: 46rpx;
+    box-sizing: border-box;
+
+    &:active {
+      opacity: 0.85;
+    }
+  }
+}
+
+/* 互引行:Cell 的 suffix 具名插槽,右侧"对方 logo + 灰字"组合。
+   用 flex:1 + flex-end 贴右——箭头 .iconfont 自带 margin-left:auto,
+   若这里也用 auto 外边距,flex 会把剩余空间平分给两个 auto,组合被顶到中间。
+   padding-right 对齐本页 .suffix 覆盖值(10rpx),与我的称呼/深色模式等行观感一致。 */
+.app-suffix {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 10rpx;
+}
+
+.app-suffix-logo {
+  width: 36rpx;
+  height: 36rpx;
+  border-radius: 8rpx;
+  margin-right: 8rpx;
+}
+
+.app-suffix-name {
+  font-size: 28rpx;
+  color: var(--ppfj-text-tertiary);
+}

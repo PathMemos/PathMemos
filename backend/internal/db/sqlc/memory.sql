@@ -24,7 +24,7 @@ ORDER BY record_time ASC
 LIMIT 500;
 
 -- name: UpdateMemory :one
--- B2-08：参数按使用顺序连续编号，避免 $6 跳跃误导。
+-- 参数按使用顺序连续编号，避免 $6 跳跃误导。
 UPDATE memories SET title = $1, content = $2, record_time = $3, record_date = $4
 WHERE id = $5 AND user_id = $6
 RETURNING id, user_id, record_time, record_date, title, content, created_at;
@@ -32,9 +32,6 @@ RETURNING id, user_id, record_time, record_date, title, content, created_at;
 -- name: GetMemory :one
 SELECT id, user_id, record_time, record_date, title, content, created_at
 FROM memories WHERE id = $1 AND user_id = $2;
-
--- name: CountMemoriesByUserAndDate :one
-SELECT COUNT(*) FROM memories WHERE user_id = $1 AND record_date = $2::date;
 
 -- name: DeleteMemory :execrows
 DELETE FROM memories WHERE id = $1 AND user_id = $2;

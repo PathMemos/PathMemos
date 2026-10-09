@@ -5,6 +5,7 @@ import (
 
 	"net/http"
 
+	"papafeiji/backend/internal/config"
 	"papafeiji/backend/internal/db"
 	"papafeiji/backend/internal/db/sqlc"
 	"papafeiji/backend/internal/middleware"
@@ -19,15 +20,27 @@ type Handler struct {
 	router  chi.Router
 	pool    *db.Pool
 	service *Service
+	cfg     *config.Config
 }
 
-// NewHandler 创建 VIP 路由处理器（B6b-06：移除未使用的 rdb 参数——防重由 DB 唯一约束保证）。
-func NewHandler(router chi.Router, pool *db.Pool, service *Service) *Handler {
+// NewHandler 创建 VIP 路由处理器（防重由 DB 唯一约束保证）。
+func NewHandler(router chi.Router, pool *db.Pool, service *Service, cfg *config.Config) *Handler {
 	return &Handler{
 		router:  router,
 		pool:    pool,
 		service: service,
+		cfg:     cfg,
 	}
+}
+
+// freeVipDisabled 检查免费 VIP 是否已下线（FREE_VIP_ENABLED=0）。
+// 下线语义为端点不可用（404）而非仅隐藏前端入口：直调 API 的旧客户端同样被拒
+func (h *Handler) freeVipDisabled(w http.ResponseWriter, r *http.Request) bool {
+	if h.cfg != nil && !h.cfg.FreeVipEnabled {
+		middleware.JSONError(w, r, http.StatusNotFound, errors.CodeNotFound, "free vip disabled")
+		return true
+	}
+	return false
 }
 
 func (h *Handler) Register() {
@@ -57,6 +70,9 @@ func (h *Handler) ListPaidVIP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListFreeVIP(w http.ResponseWriter, r *http.Request) {
+	if h.freeVipDisabled(w, r) {
+		return
+	}
 	ctx := r.Context()
 
 	rows, err := h.pool.Queries().ListActiveFreeVIPs(ctx)
@@ -78,6 +94,9 @@ func (h *Handler) ListFreeVIP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ClaimFreeVIP(w http.ResponseWriter, r *http.Request) {
+	if h.freeVipDisabled(w, r) {
+		return
+	}
 	ctx := r.Context()
 	userID := middleware.UserID(ctx)
 
@@ -110,6 +129,9 @@ func (h *Handler) ClaimFreeVIP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CheckFreeVIP(w http.ResponseWriter, r *http.Request) {
+	if h.freeVipDisabled(w, r) {
+		return
+	}
 	ctx := r.Context()
 	userID := middleware.UserID(ctx)
 	vipID := r.URL.Query().Get("vipId")
@@ -137,6 +159,10 @@ func (h *Handler) ClaimTrialVIP(w http.ResponseWriter, r *http.Request) {
 		switch err {
 		case ErrTrialVIPAlreadyClaimed:
 			middleware.JSONBizError(w, r, errors.BizTrialVipAlreadyClaimed, err.Error())
+		case ErrTrialVIPDisabled:
+			// 对齐 free 档下线闸门（freeVipDisabled）：商品下线为端点不可用（404），
+			// 直调 API 的旧客户端同样被拒；已领取的 409 语义不受影响。
+			middleware.JSONError(w, r, http.StatusNotFound, errors.CodeNotFound, "trial vip disabled")
 		default:
 
 			middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "failed to claim trial vip")

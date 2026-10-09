@@ -45,7 +45,7 @@ Component({
     },
     onInput(e: any) {
       const value = e.detail.value;
-      // F3-18：受控回写竞态——父组件把 value 回传（observer）与本地输入可能交错，
+      // 受控回写竞态——父组件把 value 回传（observer）与本地输入可能交错，
       // 值未变化时跳过 setData，避免重复设置 textarea value 导致光标跳动/丢字。
       if (this.data.data !== value) {
         (this as any)._safeSetData({ data: value });

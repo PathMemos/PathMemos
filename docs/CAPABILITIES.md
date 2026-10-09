@@ -3,21 +3,23 @@
 > 全平台能力实时清单（按域分组）。新增/变更能力时同步本条（见 [`spec-standards.md`](spec-standards.md) §一、§九）。
 > 行为细节以对应 L2 分册为准；本表只做**能力登记 + 测试映射**。
 > 测试/验收口径：自动化仅**后端 Go 单测**；小程序/Worker/端到端为**人工验收**（L7 场景号）。存量前端 Jest / Worker vitest 为资产、非门禁。
-> 状态：V2.1（以当前代码为唯一事实源）。
+> 状态：当前（以代码为唯一事实源）。
 
 ## 认证 / 账号（02a）
 
 | 能力 | 入口 / 实现 | 测试/验收 |
 |------|------------|------------|
 | 微信登录（新用户自动注册） | `POST /auth/login` | auth/handler_test.go |
+| 微信登录：小程序走 `/auth/login`（jscode2session）；多端 App 走 `/auth/login/app`（`wx.weixinAppLogin` 直接拉起微信授权 → 服务端 `donut/code2verifyinfo` 换用户标识，unionid 打通账号，无中间页） | `POST /auth/login`、`POST /auth/login/app` | Go 单测 + 人工（L7 F13） |
 | 登出 | `POST /auth/logout` | auth 包单测 |
+| 主动退出/注销停留页：置 `papafeiji:logged_out` 标记，首页不再静默登录、落登录页等手动点击；仅 Login 页手动登录成功清除（静默登录路径不清标记）。注销同落登录页 | 小程序端（index onShow / Set._performLogout / About 注销 / Login 手动登录） | — |
 | 手机号绑定（原子日限 + IP 限流） | `POST /auth/phone/bind` | auth/handler_phone_test.go |
-| 手机号解绑（保留 phone_bind_time） | `POST /auth/phone/unbind` | auth/handler_phone_test.go |
 | 手机号查询（canModifyToday） | `GET /auth/phone` | auth/handler_phone_test.go |
 | 登录后补绑邀请人 | `POST /auth/inviter` | — |
 | 邀请奖励（注册期 / 补绑共用） | `applyInviteRewardsWithTx` | — |
 | 用户资料 / 语言 | `GET /user/profile`、`PUT /user/nickname`、`PUT /user/lang` | — |
 | 账号注销（session/文件清理） | `DELETE /auth/account` | — |
+| 家庭移除冷却（被移出成员 7 天内禁经链接重入，ADR-0019） | `POST /family/invite-link/join` 事务内 `checkRejoinCooldown`（含整家合并路径） | family/service_test.go |
 | 会话管理（Redis，滑动+绝对 TTL） | middleware/session.go | middleware/session_test.go |
 
 ## 日记（02b）
@@ -27,22 +29,24 @@
 | 时间线卡片列表（游标分页） | `GET /diary/info` | — |
 | 按日期批量取卡 | `POST /diary/info/dates` | — |
 | 日记详情（offset 分页 + count + memories） | `GET /diary/details` | diary/service_test.go |
-| 手动条目增删改 | `POST/PUT/DELETE /diary/details` | — |
+| 手动条目增删改（PUT 支持跨天改期：条目迁移至目标日期日记，源日记空且当日无记忆时删除） | `POST/PUT/DELETE /diary/details` | diary/service_test.go |
 | 记忆（随手记）CRUD | `/diary/details/memory` | — |
 | 手动封面设置 / 清除 | `PUT /diary/info` | — |
 | 整日删除（仅本人当日） | `DELETE /diary/info` | — |
 | 封面降级（manual>image>trajectory>default）/ 异步刷新 / 轮询 | diary/service.go、`GET /diary/cover-url` | — |
 | 日记统计 | `GET /diary/stats` | — |
+| 分享卡服务端渲染（内容寻址缓存，小程序/App 同图；App 端分享前预览+确认） | `POST /diary/share-card` | — |
 
 ## 自动记录（02c）
 
 | 能力 | 入口 / 实现 | 测试/验收 |
 |------|------------|------------|
-| 开关自动记录 | `PUT /auto-record/config` | — |
+| 读取 / 开关自动记录 | `GET` / `PUT /auto-record/config` | — |
+| 活跃心跳触点 | `PUT /auto-record/active` | — |
 | 轨迹上报（服务端幂等，迁移 000005） | `POST /auto-record/trajectories` | 迁移/真实库验证 |
 | 驻留点聚类 | autorecord/service.go | autorecord/merge_test.go |
 | 逆地理编码 | `GET /location/reverse` | location/client_test.go |
-| 常用地址替换 / 摘要 | autorecord、后台任务 | — |
+| 常用地址替换 / 摘要 / 手动刷新 | `GET /user/common-addresses`、`POST /user/common-addresses/refresh`、`PUT /user/common-addresses/{name}`（user/handler.go）；autorecord、后台任务 | — |
 | 自动成文（后台 + 首次即时，互斥锁） | `POST /diary/details/auto` | diary/auto_lock_test.go |
 | 候选公平轮转 / 逆地理终态 | keyset 游标 `job:cursor:auto_record`；`geocode_attempts>=10` 终态排除 | autorecord/scheduler_test.go |
 | 新地点提醒 / 异常告警 | 后台任务 | — |
@@ -53,7 +57,7 @@
 | 能力 | 入口 / 实现 | 测试/验收 |
 |------|------------|------------|
 | 家庭信息 / 创建 / 解散 | `GET/POST/DELETE /family` | — |
-| 邀请链接生成 / 加入 / 奖励（奖励窗口统一注册后 7 天；被邀请奖励按 openid 终身一次） | `POST /family/invite-link`、`/family/invite-link/join` | — |
+| 邀请链接生成 / 加入 / 奖励（奖励窗口统一注册后 7 天；被邀请奖励按 openid 终身一次，跨渠道绕过边界见 ADR-0016；注销重注册整体不发奖——+3/+7 均不发） | `POST /family/invite-link`、`/family/invite-link/join` | — |
 | 退出 / 移除成员 | `POST /family/leave`、`DELETE /family/members/{userId}` | — |
 | 个人邀请短码解析 / 列表 | `GET /invite/resolve`、`/invite/list` | invite/qrcode_test.go |
 | 个人邀请二维码 | `POST /invite/qrcode` | — |
@@ -64,7 +68,7 @@
 |------|------------|------------|
 | VIP 查询 | `GET /user/vip`、`GET /vip` | — |
 | 新用户试用自动领取 | `POST /vip/new-user` | vip/service_test.go |
-| 免费 VIP 领取 / 查重（trial/free 按微信主体 openid 终身一次，注销墓碑行防重注册重领；check 优先按 openid 判） | `GET /vip/free`、`POST /vip/free/claim`、`GET /vip/free/check` | vip/service_test.go |
+| 免费 VIP 领取 / 查重（trial/free 按首登渠道 openid 终身一次，注销墓碑行防重注册重领——跨渠道删号重注册可绕过，ADR-0016 已接受；check 优先按 openid 判） | `GET /vip/free`、`POST /vip/free/claim`、`GET /vip/free/check` | vip/service_test.go |
 | 虚拟支付下单（沙箱闸门） | `POST /payment/virtual/request` | payment/request_test.go |
 | 回调验签解密 + receive_id 校验 | `POST /api/prod/payment/virtualPayNotify` | payment/notify_crypto_test.go |
 | 幂等发货 / 已关闭订单补发 | payment/service.go | payment/handler_test.go |
@@ -93,8 +97,8 @@
 | 孤儿文件清理 | 后台任务 | — |
 | 公众号验证 / 去重 / 客服消息 | `/wx/callback` | 人工（L7 F7） |
 | 异常告警推送 / 新地点提醒 | 后台任务 | — |
-| 订阅记录 | `POST /subscribe/record` | — |
-| 已删图片边缘缓存批量收敛（ADR-0013） | `CDN_REFRESH_ENABLED=1` 时：删除 OSS 对象记录 `purge:oss:pending`，`purge_deleted_objects` 任务（默认 24h）分批调阿里云 CDN 刷新 | purge 包单测 |
+| 订阅记录 | `POST /subscribe/record` | 仅小程序 `wx.requestSubscribeMessage`（异常提醒模板；App 端通知已裁撤，不弹不记） |
+| 已删图片边缘缓存批量收敛（**休眠能力**，机制/形态/启用条件见 ADR-0013 单点登记） | `CDN_REFRESH_ENABLED=1` 启用 | purge 包单测 |
 | 前端上传部分失败仅补传失败项 | utils/http.ts | 人工（L7 F2；存量 uploadFile.test.ts 非门禁） |
 | 支付失败/取消关单 | utils/pay.ts | 人工（L7 F6；存量 pay.test.ts 非门禁） |
 
@@ -125,7 +129,8 @@
 | 部署契约（零停机分层切换） | deploy/deploy.sh | — |
 | Cloudflare 入口自动装配（API/官网域名 A 记录 DNS-only 装配 + api/mcp Worker 自动部署与 secret 同源同步，`--skip-workers` 可跳过） | deploy/deploy.sh | — |
 | OSS 连接自检（五项成组校验、bucket 缺失自动创建、默认静态资源上传） | deploy/deploy.sh | — |
-| 官网静态站（`papafeiji.cn`/`www`，Astro 构建产物随部署发布，nginx 按 Host 与 API 共用端口；证书 certbot 独立 lineage；构建失败仅警告跳过、不阻断后端部署） | `website/`、deploy/deploy.sh、deploy/nginx/*.conf | — |
-| 告警通道（随部署装配：alert-cron 每 2 分钟 / alert-p95 每 15 分钟 / cert-check 每小时 / 控制机 uptime-check / watchdog 容器 CPU 异常 `papafeiji_cpu_high`；`CFG_ALERT_WEBHOOK_URL` 强烈建议必配） | scripts/alert-cron.sh、alert-p95.sh、deploy/cert-check.sh、scripts/uptime-check.sh、deploy/watchdog.sh（ADR-0015） | — |
+| 官网静态站（`papafeiji.cn`/`www`，Astro 构建产物随部署发布，nginx 按 Host 与 API 共用端口；证书 certbot 独立 lineage；构建失败仅警告跳过、不阻断后端部署；`public/` 独立静态页随发布，如 `/auto-record-overview.html`） | `website/`、deploy/deploy.sh、deploy/nginx/*.conf | — |
+| 多端应用 APK 云构建与官网分发（测试通道：miniprogram-ci buildApk 云构建 + tsc ES2018 预编译降级 → keytool 验签 → 上传 `papafeiji.cn/downloads/`，version 单调校验；官网 rsync `--exclude=/downloads` 保护分发目录；流程详见 AGENTS.md「多端应用 APK 构建与分发」） | scripts/build-apk-ci.js、scripts/release-apk.sh | 人工（L7 F13） |
+| 告警通道（随部署装配：alert-cron 每 2 分钟 / alert-p95 每 15 分钟 / cert-check 每小时 / 控制机 uptime-check 四面拨测 / watchdog 容器自愈告警——含 `papafeiji_cpu_high`，**当前生产无限额该检查休眠中**；`CFG_ALERT_WEBHOOK_URL` 强烈建议必配） | scripts/alert-cron.sh、alert-p95.sh、deploy/cert-check.sh、scripts/uptime-check.sh、deploy/watchdog.sh（ADR-0015） | — |
 | L7 滥用防护（nginx 限流 + 单 IP 连接上限 + fail2ban 限流打穿自动封禁） | deploy/nginx/default.conf、deploy/deploy.sh 远端 fail2ban jail 装配 | — |
 | 慢 SQL 榜单 / 迁移预演 / AI 成本观测 | scripts/sql-top.sh（pg_stat_statements，迁移 000007）、scripts/rehearse-migration.sh、scripts/ai-cost.sh（`msg="ai chat usage"` 日志） | — |

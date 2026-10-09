@@ -155,7 +155,7 @@ func withRedis(run func(*goredis.Client)) {
 	run(rdb)
 }
 
-// printJobStatus 打印每个后台任务的最近成功/失败时间与连续失败次数（R-03）。
+// printJobStatus 打印每个后台任务的最近成功/失败时间与连续失败次数。
 func printJobStatus(ctx context.Context, rdb *goredis.Client) {
 	orDash := func(s string) string {
 		if s == "" {
@@ -179,7 +179,7 @@ func printJobStatus(ctx context.Context, rdb *goredis.Client) {
 	}
 }
 
-// triggerJob 写入一次性触发键；常驻 app 的 watchJobHealth 在 1 分钟内读取并复用锁+幂等执行（R-03）。
+// triggerJob 写入一次性触发键；app/sse 两容器 Runner 的 watchJobHealth GETDEL 竞争消费（advisory lock 保证单执行） 在 1 分钟内读取并复用锁+幂等执行。
 func triggerJob(ctx context.Context, rdb *goredis.Client, name string) {
 	known := false
 	for _, n := range jobs.KnownJobNames() {

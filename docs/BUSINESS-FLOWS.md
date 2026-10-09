@@ -10,7 +10,7 @@
 微信小程序 ──登录/记录/家庭/VIP/AI──▶ pro.papafeiji.cn (Go app+sse) ──▶ Postgres/Redis
 微信公众号 ────────── AI 对话 ──────▶ /wx/callback
 第三方 AI 工具 ──MCP──▶ mcp.pathmemos.com (Worker) ──▶ 源站 /internal/mcp/*
-私有化/开源版 ──▶ api.pathmemos.com (Worker) ──▶ 自建后端
+私有化/开源版 ──▶ 直连自建后端(tunnel/caddy) 或 api.pathmemos.com (Worker) ──▶ 自建后端
 ```
 
 | 流程 | 名称 | 入口 |
@@ -27,6 +27,7 @@
 | F10 | 推送与异常告警 | 后台任务 |
 | F11 | 图片上传与配额 | 记录/头像 |
 | F12 | 私有化后端接入 | 设置页（开源版） |
+| F13 | 多端应用登录与 APK 分发 | App 登录页 / 官网下载（登录复用 F1 链路） |
 
 ---
 
@@ -34,11 +35,11 @@
 
 | 项 | 内容 |
 |----|------|
-| 触发 | 用户打开小程序 |
-| 主流程 | ① `wx.login` 取 code → ② `POST /auth/login` → ③ 后端 `api.weixin.qq.com` 换 openid → ④ 建/更新用户 → ⑤ 返回 sessionId+userInfo，session 写 Redis → ⑥ 前端存 sessionId → ⑦ `GET /auto-record/config` 拉自动记录配置 |
-| 涉及 | 表 `users`；前端 `utils/auth.ts`、`pages/index` |
+| 触发 | 用户打开小程序 / App，登录态校验失败进入登录页 |
+| 主流程 | 微信通道：小程序环境 ① `wx.login` 取 code → ② `POST /auth/login` → ③ 后端 jscode2session 换 openid/unionid → ④ 建/更新用户 → ⑤ 返回 sessionId+userInfo，session 写 Redis → ⑥ 前端存 sessionId → ⑦ `GET /auto-record/config` 拉自动记录配置。App 环境：`wx.weixinAppLogin` 拉起微信授权取 code → `POST /auth/login/app`（服务端 donut/code2verifyinfo 换标识），其余同 |
+| 涉及 | 表 `users`；前端 `utils/auth.ts`、`pages/Login`、`pages/index` |
 | 期望 | 登录后进入首页；新用户标记 `needShowXPa`，引导页 `pages/Guide`；老用户直接首页 |
-| 异常 | code 失效/微信不可达 → 登录失败提示；401 → 清 session 重新登录 |
+| 异常 | code 失效/微信不可达 → 登录失败提示并跳转登录页（`app.ts _redirectToLogin`）；401 → 清 session 重新登录 |
 
 ## F2 手动记录日记
 
@@ -66,7 +67,7 @@
 |----|------|
 | 触发 | 首页按日期/家庭筛选点开日记 |
 | 主流程 | ① `GET /diary/info`（cursor 分页）→ ② 详情 `GET /diary/details`（offset 分页）→ ③ 统计 `GET /diary/stats`、日期 `POST /diary/info/dates` → ④ 编辑/删除 `PUT/DELETE /diary/details` 或 `DELETE /diary/info` → ⑤ 分享生成图片（含二维码） |
-| 涉及 | 前端 `pages/index`、`pages/NoteDetail`、`components/NoteItem/RecordItem` |
+| 涉及 | 前端 `pages/index`、`pages/NoteDetail`、`components/NoteItem`、`components/RecordItem` |
 | 期望 | 列表/详情一致，删除后计数与封面同步 |
 | 异常 | 详情页 offset 分页在并发增删下可能重复/漏条 |
 
@@ -126,14 +127,14 @@
 | 触发 | 用户订阅后，后台任务按条件触发 |
 | 主流程 | ① `POST /subscribe/record` 记录订阅 → ② 后台 abnormal_alert 任务扫描（8:00–22:00）→ ③ 模板消息/客服消息下发 |
 | 期望 | 仅订阅用户收到；异常告警限频 |
-| 异常 | 发送失败记录日志，下轮重试 |
+| 异常 | 发送失败仅记日志，当日不重发（占位不回滚），次日窗口重试 |
 
 ## F11 图片上传与配额
 
 | 项 | 内容 |
 |----|------|
 | 触发 | 写日记选图 / 更换头像 |
-| 主流程 | ① 前端压缩（quality 按大小 50/65/80）→ ② `POST /file/upload?type=recordImg\|avatar`（并发 3，单文件 ≤10MB、总量 ≤50MB、≤9 张）→ ③ 配额原子扣减 `users.image_storage_bytes` → ④ 返回 `{fileId,url}` |
+| 主流程 | ① 前端压缩（quality 分档规则见 02g §F-1、数值在 02g §7）→ ② `POST /file/upload?type=recordImg\|avatar`（并发 3，单文件 ≤10MB、总量 ≤50MB、≤9 张）→ ③ 配额原子扣减 `users.image_storage_bytes` → ④ 返回 `{fileId,url}` |
 | 期望 | 白名单 jpg/jpeg/png/gif/webp；DB 记录与配额同事务；任一分片失败整请求回滚 |
 | 异常 | 类型/大小超限 → 400（biz_code=INVALID_FILE_TYPE/FILE_SIZE_EXCEEDED）；配额不足 → USER_IMAGE_STORAGE_LIMIT_EXCEEDED 弹升级；超时 → 原始包 `{"code":"5001"}` |
 
@@ -146,6 +147,15 @@
 | 期望 | 注册成功后清本地强制重登；`/system/config` features 按目标后端返回（payment=false） |
 | 异常 | Worker 错误码 4000/4001/4002/4003 → 对应文案；未注册 4031 不回退 SaaS |
 
+## F13 多端应用登录与 APK 分发
+
+| 项 | 内容 |
+|----|------|
+| 触发 | 用户在 App（Donut 多端应用）内登录，或从官网下载安装测试 APK |
+| 主流程 | ① App 微信一键登录：`wx.weixinAppLogin` 拉起微信授权取 code → `POST /auth/login/app`（服务端 donut/code2verifyinfo 换用户标识，unionid 打通账号） |
+| 期望 | App 与小程序同微信主体归一账号；`papafeiji.cn/downloads/` APK 覆盖安装要求 version/versionCode 单调递增 |
+| 异常 | 多端应用未绑定移动应用 → 授权拉起失败（无网络请求）；授权页版本不含授权配置 → 唤起异常 |
+
 ---
 
 ## 覆盖登记（需求编号 → flow）
@@ -156,10 +166,10 @@
 | PP-01 O2 商业变现 | F6 | 虚拟支付 |
 | PP-01 O3 AI 使用率 | F7 | 小程序+公众号 |
 | PP-01 O4 开放生态 | F8 | MCP/API Key |
-| PP-02a 账号 | F1/F9 | 登录与注销 |
+| PP-02a 账号 | F1/F9/F13 | 登录（小程序/App 同链路）与注销 |
 | PP-02d 家庭 | F5 | 家庭与邀请 |
 | PP-02g 推送 | F10 | 模板/客服消息 |
 | PP-02g 文件 | F11 | 上传/配额/头像 |
 | PP-02h 私有化 | F12 | api-worker 路由 |
 
-> 各 flow 对应 `docs/spec/07-acceptance-flows.md` 场景 F1~F12。
+> 各 flow 对应 `docs/spec/07-acceptance-flows.md` 场景 F1~F13。

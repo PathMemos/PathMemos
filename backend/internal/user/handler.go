@@ -32,18 +32,16 @@ const maxUserRequestBodySize = 8 << 10 // 8KB
 type Handler struct {
 	router        chi.Router
 	pool          *db.Pool
-	bgPool        *db.Pool
 	vipService    vip.InfoProvider
 	avatarService *avatar.Service
 	storage       *file.Storage
 	defaultAvatar string
 }
 
-func NewHandlerWithBackgroundPool(router chi.Router, pool *db.Pool, bgPool *db.Pool, vipService vip.InfoProvider, avatarService *avatar.Service, storage *file.Storage, defaultAvatarURL string) *Handler {
+func NewHandler(router chi.Router, pool *db.Pool, vipService vip.InfoProvider, avatarService *avatar.Service, storage *file.Storage, defaultAvatarURL string) *Handler {
 	return &Handler{
 		router:        router,
 		pool:          pool,
-		bgPool:        bgPool,
 		vipService:    vipService,
 		avatarService: avatarService,
 		storage:       storage,
@@ -333,7 +331,7 @@ func (h *Handler) UpdateCommonAddressName(w http.ResponseWriter, r *http.Request
 	}
 
 	err := db.WithTx(ctx, h.pool.Pool(), func(ctx context.Context, q *sqlc.Queries) error {
-		// B6a-13：对源行加行锁（FOR UPDATE），串行化同一地址的并发合并/重命名。
+		// 对源行加行锁（FOR UPDATE），串行化同一地址的并发合并/重命名。
 		if _, err := q.GetUserCommonAddressForUpdate(ctx, sqlc.GetUserCommonAddressForUpdateParams{
 			UserID: userID,
 			Name:   name,

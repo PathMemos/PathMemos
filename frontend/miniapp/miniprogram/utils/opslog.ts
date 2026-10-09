@@ -2,6 +2,7 @@
 // 在打开小程序时批量上报到后端 /ops/client-log，用于排查“App 端操作了但服务器未收到”
 // 的数据问题（如记录丢失）。detail 只保留非敏感摘要（计数/标识/错误码），不包含用户正文。
 import request from './request';
+import { getSessionId } from './storage';
 
 export interface OpsEvent {
   t: string; // 客户端本地 ISO 时间
@@ -51,6 +52,9 @@ export const opsLogFail = (type: string, error: any, extra?: Record<string, any>
 
 /** 批量上报本地队列；成功才清空对应批次，失败保留等待下次打开再报 */
 export const flushOpsLog = async (): Promise<void> => {
+  // 上报端点需要登录态：未登录（冷启动登录尚在途）时请求必然 401，徒增一条失败
+  // 请求与控制台噪音；事件留在队列，由登录成功路径的 flushOpsLog 或下次启动补报。
+  if (!getSessionId()) return;
   const q = _readQueue();
   if (q.length === 0) return;
   const batch = q.slice(0, MAX_BATCH);

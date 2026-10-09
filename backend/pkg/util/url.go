@@ -27,7 +27,7 @@ type dnsCacheEntry struct {
 	expiresAt time.Time
 }
 
-// dnsCache 进程内 DNS 结果缓存（R3）：IsPublicHTTPSURL 处于保存头像/图片等热路径，
+// dnsCache 进程内 DNS 结果缓存：IsPublicHTTPSURL 处于保存头像/图片等热路径，
 // 每次同步解析最多阻塞 1.5s；缓存后命中路径零延迟。多实例各自缓存，语义正确。
 var dnsCache = struct {
 	sync.Mutex
@@ -94,8 +94,8 @@ func IsPublicHTTPSURL(rawURL string) bool {
 		return !isForbiddenIP(ip)
 	}
 
-	// B2-15：域名形式需解析 DNS 并校验所有解析结果均非内网/回环，缓解 SSRF。
-	// R3：解析结果进程内缓存（成功 60s / 失败 5s），热路径不再被 DNS 抖动拖累。
+	// 域名形式需解析 DNS 并校验所有解析结果均非内网/回环，缓解 SSRF。
+	// 解析结果进程内缓存（成功 60s / 失败 5s），热路径不被 DNS 抖动拖累。
 	// 保存时校验；DNS 重绑定窗口由抓取侧超时与响应大小限制兜底。
 	ctx, cancel := context.WithTimeout(context.Background(), dnsLookupTimeout)
 	defer cancel()

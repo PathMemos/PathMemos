@@ -46,6 +46,7 @@ import (
 	"papafeiji/backend/internal/purge"
 	"papafeiji/backend/internal/push"
 	"papafeiji/backend/internal/redis"
+	"papafeiji/backend/internal/sharecard"
 	"papafeiji/backend/internal/system"
 	"papafeiji/backend/internal/user"
 	"papafeiji/backend/internal/vip"
@@ -76,7 +77,7 @@ func run() error {
 	logger := newLogger(cfg.LogLevel)
 	slog.SetDefault(logger)
 
-	// FP-P2-03：SaaS 公众号密钥不完整时不会启动失败，但公众号渠道会静默半可用；
+	// SaaS 公众号密钥不完整时不会启动失败，但公众号渠道会静默半可用；
 	// 启动时显式告警便于排查（不 fail-closed，避免非核心渠道阻断主服务）。
 	if cfg.DeploymentMode == "saas" {
 		var missingMP []string
@@ -192,7 +193,7 @@ func run() error {
 	diaryService.SetNewPlaceAlerter(pushService)
 	autoRecordService := autorecord.NewService(pool, rdb, cfg, diaryService, pushService)
 	bgAutoRecordService := autorecord.NewService(bgPool, rdb, cfg, diaryService, pushService)
-	jobRunner := jobs.NewRunner(pool, bgPool, bgAutoRecordService, storage, pushService, cfg, purgeQueue, cdnPurger, rdb)
+	jobRunner := jobs.NewRunner(bgPool, bgAutoRecordService, storage, pushService, cfg, purgeQueue, cdnPurger, rdb)
 	jobRunner.Start(ctx)
 
 	httpRouter := chi.NewRouter()
@@ -255,12 +256,12 @@ func run() error {
 		// 账号注销单独注册，加 IP 限流 5 次/小时（绕过 session 认证后仍有必要防护）
 		accountDeleteLimiter := mw.NewIPRateLimiter(5, time.Hour, cfg.TrustedProxyCIDR)
 		r.With(accountDeleteLimiter.Handler).Delete("/auth/account", authHandler.DeleteAccount)
-		// A-FIX-04：手机号绑定每次都会调用微信 GetPhoneNumber（失败也计费/耗额度），
+		// 手机号绑定每次都会调用微信 GetPhoneNumber（失败也计费/耗额度），
 		// 单独加 IP 限流 10 次/分钟，避免高频消耗微信额度（日限只拦成功绑定）。
 		bindPhoneLimiter := mw.NewIPRateLimiter(10, time.Minute, cfg.TrustedProxyCIDR)
 		r.With(bindPhoneLimiter.Handler).Post("/auth/phone/bind", authHandler.BindPhone)
 
-		userHandler := user.NewHandlerWithBackgroundPool(r, pool, bgPool, vipService, avatarService, storage, sysCfg.DefaultAvatarURL)
+		userHandler := user.NewHandler(r, pool, vipService, avatarService, storage, sysCfg.DefaultAvatarURL)
 		userHandler.Register()
 
 		familyHandler := family.NewHandler(r, pool, rdb, lock, sysCfg.DefaultAvatarURL, vipService)
@@ -268,7 +269,7 @@ func run() error {
 
 		fileHandler := file.NewHandler(r, pool, bgPool, rdb, storage, cfg, vipService)
 		fileHandler.Register()
-		// FP-P2-02：上传限流（60 次/分钟/IP）。配额只按字节计，恶意用户可反复上传小图
+		// 上传限流（60 次/分钟/IP）。配额只按字节计，恶意用户可反复上传小图
 		// 在配额内制造海量 files 行，耗尽 DB 行/inode；限流先于超时中间件执行。
 		uploadLimiter := mw.NewIPRateLimiter(60, time.Minute, cfg.TrustedProxyCIDR)
 		fileHandler.RegisterUpload(
@@ -279,7 +280,7 @@ func run() error {
 			},
 		)
 
-		vipHandler := vip.NewHandler(r, pool, vipService)
+		vipHandler := vip.NewHandler(r, pool, vipService, cfg)
 		vipHandler.Register()
 
 		paymentHandler := payment.NewHandler(r, pool, cfg, vipService)
@@ -300,6 +301,17 @@ func run() error {
 
 		diaryHandler := diary.NewHandler(r, pool, vipService, diaryService)
 		diaryHandler.Register()
+
+		// 分享卡服务端渲染：渲染含外部图片抓取，单独 60s 超时（< WriteTimeout 310s）
+		// + IP 限流 30 次/分钟（渲染峰值内存高，防叠加）。
+		shareCardHandler := sharecard.NewHandler(r, sharecard.NewService(storage, rdb))
+		shareCardLimiter := mw.NewIPRateLimiter(30, time.Minute, cfg.TrustedProxyCIDR)
+		shareCardHandler.Register(
+			shareCardLimiter.Handler,
+			func(next http.Handler) http.Handler {
+				return http.TimeoutHandler(next, 60*time.Second, `{"code":"5001","message":"render timeout"}`)
+			},
+		)
 
 		opslogHandler := opslog.NewHandler(r, pool)
 		opslogHandler.Register()
@@ -393,7 +405,6 @@ func run() error {
 	}
 
 	shuttingDown.Store(true)
-	baseCancel()
 
 	jobRunner.Stop()
 
@@ -402,6 +413,10 @@ func run() error {
 
 	_ = httpServer.Shutdown(shutdownCtx) //nolint:errcheck
 	_ = sseServer.Shutdown(shutdownCtx)  //nolint:errcheck
+
+	// 必须在两个 Shutdown 排空在途请求之后再取消 BaseContext：提前 baseCancel 会立即
+	// 打断全部在途请求的 ctx，架空 Shutdown(30s) 优雅关闭窗口（5min 上传/SSE 收尾）。
+	baseCancel()
 
 	healthLimiter.Stop()
 	publicLimiter.Stop()
@@ -447,7 +462,7 @@ func newLogger(level string) *slog.Logger {
 }
 
 func newHealthHandler(pool *db.Pool, rdb *goredis.Client, shutdownFlag *atomic.Bool) http.HandlerFunc {
-	// R4：Redis 降级节流告警——外部轮询 /health 返回体不是可靠的告警通道，
+	// Redis 降级节流告警——外部轮询 /health 返回体不是可靠的告警通道，
 	// 由进程自己按每 5 分钟一条 ERROR 日志（alert=redis_down）接入现有日志监控。
 	var lastRedisAlertAt atomic.Int64
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -469,7 +484,7 @@ func newHealthHandler(pool *db.Pool, rdb *goredis.Client, shutdownFlag *atomic.B
 			code = http.StatusServiceUnavailable
 		}
 
-		// R3：Redis 故障不再判死容器。AI 链路对 Redis 抖动已 fail-open，
+		// Redis 故障不判死容器：AI 链路对 Redis 抖动已 fail-open，
 		// 若健康检查仍 503 会被 watchdog 反复重启，雪上加霜。
 		// 降级为 200 + "degraded"，由日志/监控告警兜底；数据库故障仍判死。
 		if err := rdb.Ping(ctx).Err(); err != nil {

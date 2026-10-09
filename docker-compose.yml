@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: deploy/Dockerfile
+    # 让 SIGTERM 后的 Shutdown(30s) 跑完，在途请求不被默认 10s grace 截断。
+    stop_grace_period: 35s
     environment:
       - DATABASE_URL=postgres://papafeiji:${DB_PASSWORD}@postgres:5432/papafeiji?sslmode=disable
       - REDIS_ADDR=redis:6379
@@ -21,6 +23,8 @@ services:
       - WECHAT_VIRTUAL_CALLBACK_TOKEN=${WECHAT_VIRTUAL_CALLBACK_TOKEN:-}
       - WECHAT_VIRTUAL_CALLBACK_AES_KEY=${WECHAT_VIRTUAL_CALLBACK_AES_KEY:-}
       - TENCENT_MAP_KEY=${TENCENT_MAP_KEY}
+      - DONUT_APPID=${DONUT_APPID:-}
+      - DONUT_APPSECRET=${DONUT_APPSECRET:-}
       - AI_API_KEY=${AI_API_KEY:-}
       - AI_BASE_URL=${AI_BASE_URL:-https://api.deepseek.com}
       - AI_MODEL=${AI_MODEL:-deepseek-chat}
@@ -117,18 +121,19 @@ services:
         [ "$$INTERVAL" -lt 1 ] && INTERVAL=3600
         OUTPUT="/backups"
         mkdir -p "$$OUTPUT" || exit 1
-        rm -f "$$OUTPUT"/.db_*.sql "$$OUTPUT"/.db_*.sql.gz "$$OUTPUT"/.uploads_*.tar.gz
+        rm -f "$$OUTPUT"/.db_*.sql "$$OUTPUT"/.db_*.sql.gz "$$OUTPUT"/.db_*.sql.gz.tmp "$$OUTPUT"/.uploads_*.tar.gz
         echo "[backup] loop started: keep=$$KEEP interval=$${INTERVAL}s"
         while true; do
           TS=$$(date +%Y%m%d_%H%M%S)
           echo "[backup] db -> $$OUTPUT/db_$$TS.sql.gz"
           DB_TMP="$$OUTPUT/.db_$$TS.sql"
-          if PGPASSWORD="$${DB_PASSWORD:-}" pg_dump -h postgres -U papafeiji papafeiji > "$$DB_TMP" && gzip -c "$$DB_TMP" > "$$OUTPUT/db_$$TS.sql.gz"; then
+          GZ_TMP="$$OUTPUT/.db_$$TS.sql.gz.tmp"
+          if PGPASSWORD="$${DB_PASSWORD:-}" pg_dump -h postgres -U papafeiji papafeiji > "$$DB_TMP" && gzip -c "$$DB_TMP" > "$$GZ_TMP" && mv -f "$$GZ_TMP" "$$OUTPUT/db_$$TS.sql.gz"; then
             rm -f "$$DB_TMP"
             echo "[backup] db ok"
           else
-            rm -f "$$DB_TMP" "$$OUTPUT/db_$$TS.sql.gz"
-            echo "[backup] db FAILED" >&2
+            rm -f "$$DB_TMP" "$$GZ_TMP" "$$OUTPUT/db_$$TS.sql.gz"
+            echo "[backup] db FAILED alert=backup_failed" >&2
           fi
           echo "[backup] uploads -> $$OUTPUT/uploads_$$TS.tar.gz"
           UP_TMP="$$OUTPUT/.uploads_$$TS.tar.gz"
@@ -136,7 +141,7 @@ services:
             echo "[backup] uploads ok"
           else
             rm -f "$$UP_TMP"
-            echo "[backup] uploads FAILED" >&2
+            echo "[backup] uploads FAILED alert=backup_uploads_failed" >&2
           fi
           for prefix in db_ uploads_; do
             ls -1t "$$OUTPUT"/$${prefix}* 2>/dev/null | tail -n +$$((KEEP + 1)) | while read -r f; do

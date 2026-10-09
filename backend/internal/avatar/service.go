@@ -146,7 +146,7 @@ func (s *Service) downloadAvatar(ctx context.Context, rawURL string) ([]byte, er
 	if !util.IsPublicHTTPSURL(rawURL) {
 		return nil, fmt.Errorf("avatar url is not a public https url")
 	}
-	// 图床/CDN 挂起时必须有明确时限，避免核心换头像路径无限阻塞（GenerateMarkerTimeout 此前定义但未使用）。
+	// 图床/CDN 挂起时必须有明确时限，避免核心换头像路径无限阻塞。
 	ctx, cancel := context.WithTimeout(ctx, GenerateMarkerTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)

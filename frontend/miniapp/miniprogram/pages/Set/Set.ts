@@ -4,7 +4,9 @@ import { logger } from '../../utils/logger';
 import { themeManager, ThemeMode } from '../../utils/theme';
 import { i18n, LanguageMode } from '../../utils/i18n';
 import { getSystemInfo } from '../../utils/util';
-import { getBackendMode } from '../../utils/storage';
+import { clearUserData, getBackendMode, setLoggedOut } from '../../utils/storage';
+import { closeAutoRecord } from '../../utils/autoRecord';
+import { resetVipCache } from '../../utils/vip';
 import { getHelpBaseURL } from '../../config/index';
 import themeBehavior from '../../behaviors/theme';
 import i18nBehavior from '../../behaviors/i18n';
@@ -62,6 +64,9 @@ Page({
 
   onShow() {
     (this as any)._isDestroyed = false;
+    // 多端 App：open-type 的微信开放能力（getPhoneNumber/chooseAvatar）不可用，
+    // 隐藏手机号绑定/解绑与改头像入口（头像随微信登录资料自动带出）。
+    (this as any)._safeSetData({ isAppEnv: !!(getApp() as any)?.globalData?.isAppEnv });
     (this as any)._isHidden = false;
     (this as any)._applyPendingSetData();
     (this as any)._safeSetData({ isPrivateBackend: getBackendMode() === 'private' });
@@ -214,6 +219,39 @@ Page({
     wx.navigateTo({ url: '/pages/CommonAddresses/CommonAddresses' });
   },
 
+  onLogoutTap() {
+    const self = this as any;
+    wx.showModal({
+      title: self.$t('set.logout'),
+      content: self.$t('set.logoutConfirm'),
+      confirmText: self.$t('set.logout'),
+      cancelText: self.$t('common.cancel'),
+      confirmColor: '#f6353b',
+      success: async (res: any) => {
+        if (!res.confirm || self._isDestroyed) return;
+        await self._performLogout();
+      },
+    });
+  },
+
+  async _performLogout() {
+    // 停自动记录必须最先：关停前的末批上报依赖有效会话，放在登出请求之后会 401
+    // 触发静默重登（服务端残留 30 天会话、停留标记被清）。与 About 注销对齐。
+    await closeAutoRecord().catch(() => {});
+    try {
+      await request.post('/auth/logout', { data: {} }, true, 10000, true);
+    } catch (e: any) {
+      logger.warn('logout server session failed', e);
+    }
+    // VIP 内存缓存随用户态清理：防 60 秒 TTL 内换账号命中旧账号 isVip/到期时间。
+    resetVipCache();
+    clearUserData();
+    // 置停留标记：首页冷启动不再静默登录，落登录页等手动点击（登录页主动登录时清除）
+    setLoggedOut(true);
+    // 落登录页给出明确的已退出状态；小程序点微信一键即静默重登，App 走官方授权页。
+    wx.reLaunch({ url: '/pages/Login/Login' });
+  },
+
   onThemeTap() {
     const options = getThemeOptions();
     const itemList = options.map((o) => o.label);
@@ -260,30 +298,6 @@ Page({
         const errMsg = err?.errMsg || '';
         if (errMsg.includes('cancel')) return;
         wx.showToast({ title: (this as any).$t('error.DEFAULT'), icon: 'none' });
-      },
-    });
-  },
-
-  // R4：解绑手机号——不消耗微信认证费用、不受每天一次日限约束，
-  // 绑错号码当天即可解绑（重新绑定仍受日限与费用约束，属产品要求）。
-  onUnbindPhoneTap() {
-    const self = this as any;
-    if (!self.data.phone) return;
-    wx.showModal({
-      title: self.$t('set.unbindPhone'),
-      content: self.$t('set.unbindPhoneConfirm'),
-      confirmText: self.$t('set.unbindPhone'),
-      cancelText: self.$t('common.cancel'),
-      success: async (res: any) => {
-        if (!res.confirm || self._isDestroyed) return;
-        try {
-          await request.post('/auth/phone/unbind', { data: {} }, true);
-          (self as any)._safeSetData({ phone: '', canModifyToday: true });
-          wx.showToast({ title: self.$t('set.unbindPhoneSuccess'), icon: 'success' });
-        } catch (e: any) {
-          if (self._isDestroyed) return;
-          wx.showToast({ title: getErrorMessage(e, self.$t('error.DEFAULT')), icon: 'none' });
-        }
       },
     });
   },
@@ -416,6 +430,18 @@ Page({
     } else {
       this._showDesktopGuide(false);
     }
+  },
+
+  /** 跳转姊妹小程序「爬爬家庭助手」:必须由用户点击触发(微信自动弹确认框);全屏跳转无需 appid 名单声明 */
+  toFamilyApp() {
+    wx.navigateToMiniProgram({
+      appId: 'wx66f181d33f61a691',
+      path: 'pages/map/map',
+      fail: (res) => {
+        if ((res.errMsg || '').includes('cancel')) return; // 用户在确认框点了取消
+        wx.showToast({ title: (this as any).$t('error.DEFAULT'), icon: 'none' });
+      },
+    });
   },
 
   _showDesktopGuide(canOpenSettings: boolean) {

@@ -1,11 +1,11 @@
 {
-	"ios": {
-		"name": "爬爬记忆助手"
-	},
-	"android": {
-		"name": "爬爬记忆助手"
-	},
-	"common": {
-		"name": "爬爬记忆助手"
-	}
+  "ios": {
+    "name": "记忆助手"
+  },
+  "android": {
+    "name": "记忆助手"
+  },
+  "common": {
+    "name": "记忆助手"
+  }
 }

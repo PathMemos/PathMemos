@@ -16,6 +16,21 @@ const VIP_CACHE_TTL_MS = 60 * 1000;
 
 let _vipInfoCache: any = null;
 let _vipInfoCacheAt = 0;
+let _vipGeneration = 0;
+
+// 退出/注销/切后端时调用：内存缓存、在途请求与 storage 副本随用户态一起清理——
+// 否则 60 秒 TTL 内换账号会命中旧账号的 isVip/到期时间（VIP 门禁被旧状态放行），
+// 在途请求的写回也会把旧账号数据带进新账号视角。
+export const resetVipCache = () => {
+  _vipGeneration += 1;
+  _fetchVipPromise = null;
+  _vipInfoCache = null;
+  _vipInfoCacheAt = 0;
+  try {
+    wx.removeStorageSync('papafeiji:vipInfo');
+  } catch {
+  }
+};
 
 const _setVipCache = (info: any) => {
   _vipInfoCache = info;
@@ -33,20 +48,27 @@ export const fetchVipInfo = async () => {
   }
 
   _fetchVipPromise = (async () => {
-    const { data: vipInfo } = await get('/user/vip', {}, true);
+    const gen = _vipGeneration;
+    // 两个查询无依赖，并行以省一个串行 RTT（处于启动/回前台关键路径）；
+    // free/check 失败不阻断（receivedFreeVip 降级 false），/user/vip 失败整体上抛（语义同前）。
+    const [vipRes, freeRes] = await Promise.all([
+      get('/user/vip', {}, true),
+      get('/vip/free/check', { params: { vipId: NEW_USER_FREE_VIP_ID } }, true).catch((e: any) => {
+        logger.error('查询免费 VIP 领取状态失败', e);
+        return null;
+      }),
+    ]);
+    const vipInfo = vipRes?.data;
     const info = {
-      receivedFreeVip: false,
+      receivedFreeVip: !!((freeRes as any)?.data?.claimed),
       isVip: vipInfo?.isVip ?? 0,
       vipExpireTime: vipInfo?.expireTime ?? '',
       _fetchTime: Date.now(),
     };
-    try {
-      const { data: receivedFreeVip } = await get('/vip/free/check', { params: { vipId: NEW_USER_FREE_VIP_ID } }, true);
-      info.receivedFreeVip = !!receivedFreeVip?.claimed;
-    } catch (e) {
-      logger.error('查询免费 VIP 领取状态失败', e);
+    // 用户态已切换（resetVipCache）：丢弃旧账号结果，不写缓存与 storage。
+    if (gen === _vipGeneration) {
+      _setVipCache(info);
     }
-    _setVipCache(info);
     return info;
   })();
 

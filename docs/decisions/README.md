@@ -16,7 +16,7 @@
 
 - 命名 `NNNN-<slug>.md`，四位递增，小写连字符；序号可有意留空洞。
 - 状态四态：`提议` / `已接受` / `已取代` / `已废弃`。
-- **已接受不可改写**：改了决策要新增一条，并把旧条标记为 `已取代`、新条写 `取代：<旧序号>`。
+- 变更形态两可：默认「新增一条 + 旧条标记 `已取代`、新条写 `取代：<旧序号>`」；小幅修正优先直接改写正文并保持结论稳定。
 - 本索引与 `decisions/` 目录必须双向同步（`spec-check.sh` 阻断级）。
 
 ## 索引
@@ -34,8 +34,12 @@
 | [0008](0008-unified-error-code.md) | 错误响应词汇统一 | 已接受 | code 固定枚举，语义码一律 biz_code，同码同 HTTP |
 | [0009](0009-open-source-embedded-wechat-secret.md) | 开源版内置加密微信 AppID/Secret | 已接受 | 轻量混淆换取开箱即用 |
 | [0010](0010-open-family-invite-link.md) | 家庭邀请链接长期有效且无撤销 | 已接受 | 小规模家庭场景下成本收益不匹配，维持现状 |
-| [0011](0011-payment-callback-amount-policy.md) | 支付回调安全模型与金额策略 | 已接受 | 金额不作为漏发闸门（>0 即发货+告警）；无自动对账；体验版 403 为预期 |
+| [0011](0011-payment-callback-amount-policy.md) | 支付回调安全模型与金额策略 | 已接受 | 金额不作为漏发闸门（>0 即发货+告警）；无自动对账；仅开发版走沙箱（PAYMENT_ALLOW_SANDBOX 闸门），体验版与正式版现网实付 |
 | [0012](0012-family-invite-owner-merge-risk.md) | 家庭邀请 owner 整家合并钓鱼风险 | 已接受 | 熟人小家庭场景下接受该风险，不增加防护 |
 | [0013](0013-deleted-image-cache-purge.md) | 已删除图片边缘缓存定期批量收敛 | 已接受 | 删除图片须最终不可达；定期批量 purge，不做同步清理 |
 | [0014](0014-pinned-deps-manual-upgrades.md) | 依赖固定版本、关闭自动依赖升级 | 已接受 | 不启用自动依赖更新；锁定版本，按需成套升级 |
-| [0015](0015-reliability-baseline-alerting-zerodowntime.md) | 运维可靠性基线：告警随部署装配、零停机切换、Redis 持久化与备份 RPO | 已接受 | 告警 cron 由 deploy.sh 装配 + webhook 必填；分层替换取代全站 rm -f；Redis noeviction+AOF；备份 1h/48 份带心跳告警 |
+| [0015](0015-reliability-baseline-alerting-zerodowntime.md) | 运维可靠性基线：告警随部署装配、零停机切换、Redis 持久化与备份 RPO | 已接受 | 告警 cron 由 deploy.sh 装配 + webhook 未配置响亮警告（不阻断）；分层替换取代全站 rm -f；Redis noeviction+AOF；备份 1h/48 份带心跳告警 |
+| [0016](0016-open-id-cross-channel-tombstone-bypass.md) | open_id 首注渠道语义；跨端删号重注册绕过权益墓碑 | 已接受 | open_id=首次注册渠道标识（unionid 归一双端）；跨端对抗性绕过登记为已接受风险，触发条件出现再改 unionid 墓碑键 |
+| [0017](0017-family-join-exposes-personal-history.md) | 加入家庭即反向暴露个人全部历史日记 | 已接受 | 家庭功能核心前提；视图语义（退出即收回、在期副本不可追回）；不加确认/预览（过度防御） |
+| [0018](0018-oss-versioning-data-retention.md) | OSS 用户图片开启版本化——对象数据保留与防删策略 | 已接受 | 不可再生用户数据的唯一防误删解；deploy.sh 幂等开启；跨区复制/清单备份不做（成本不值）；同机凭证泄露残余已接受 |
+| [0019](0019-family-removed-rejoin-cooldown.md) | 家庭移除冷却：被 owner 移出的成员 7 天内禁止经邀请链接重新加入 | 已接受 | families.removed_members jsonb + join 事务内检查（含整家合并路径）；小号重入与误操作恢复残余已登记 |

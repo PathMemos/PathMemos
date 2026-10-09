@@ -1,4 +1,26 @@
 .confirm-dialog {
+  // root-portal 搬出到页面根后继承不到 page/.BasePage 的主题变量，组件内自持
+  // 一套（值与 app.less 全局定义一致）；data-theme 由 themeBehavior 全局同步。
+  --ppfj-bg: #f7f7f8;
+  --ppfj-card-bg: #ffffff;
+  --ppfj-text: #23262f;
+  --ppfj-text-secondary: #777e90;
+  --ppfj-text-tertiary: #939393;
+  --ppfj-border: #e6e8ec;
+  --ppfj-input-bg: #faf8f5;
+  --ppfj-mask: rgba(0, 0, 0, 0.33);
+
+  &[data-theme="dark"] {
+    --ppfj-bg: #0f0f10;
+    --ppfj-card-bg: #1a1a1c;
+    --ppfj-text: #f0f0f2;
+    --ppfj-text-secondary: #989aa2;
+    --ppfj-text-tertiary: #6c6c70;
+    --ppfj-border: #2d2d30;
+    --ppfj-input-bg: #141415;
+    --ppfj-mask: rgba(0, 0, 0, 0.55);
+  }
+
   position: fixed;
   top: 0;
   left: 0;

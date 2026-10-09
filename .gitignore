@@ -18,7 +18,6 @@ api-worker/node_modules
 api-worker/node_modules/
 api-worker/.wrangler/
 deploy/private.*.key
-deploy/miniapp-uploader/node_modules/
 dump.rdb
 backups/
 uploads/
@@ -29,3 +28,4 @@ website/node_modules/
 website/out/
 website/.astro/
 deploy/key/
+.docs-sync/

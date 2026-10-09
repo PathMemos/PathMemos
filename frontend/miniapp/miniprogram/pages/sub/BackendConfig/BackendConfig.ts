@@ -13,6 +13,8 @@ import {
 import { WORKER_BASE_URL, getHelpBaseURL } from '../../../config/index';
 import { openUrl } from '../../../utils/util';
 import { logger } from '../../../utils/logger';
+import { closeAutoRecord } from '../../../utils/autoRecord';
+import { resetVipCache } from '../../../utils/vip';
 import themeBehavior from '../../../behaviors/theme';
 import i18nBehavior from '../../../behaviors/i18n';
 import type { CancelToken } from '../../../utils/http';
@@ -67,7 +69,7 @@ Page({
     });
   },
 
-  onShow() {
+  async onShow() {
     (this as any)._isHidden = false;
     (this as any)._applyPendingSetData();
     this.updateNavTitle();
@@ -75,6 +77,10 @@ Page({
     // 否则旧 session 会持续请求新后端直到手动重启。
     if ((this as any)._pendingReLogin) {
       (this as any)._pendingReLogin = false;
+      // 停自动记录与清 VIP 缓存必须先于清用户态：防旧后端的驻留点经静默重登
+      // 写入新后端新账号、60 秒 TTL 内 VIP 门禁命中旧账号状态（与登出/注销对齐）。
+      await closeAutoRecord().catch(() => {});
+      resetVipCache();
       clearUserData();
       wx.reLaunch({ url: '/pages/index/index' });
     }
@@ -127,13 +133,13 @@ Page({
   },
 
   openHomepage() {
-    // R2-F16：官方站点链接收敛到 config 集中管理。
+    // 官方站点链接收敛到 config 集中管理。
     openUrl(getHelpBaseURL());
   },
 
   async testConnection() {
     if ((this as any)._isDestroyed) return;
-    // F5-10：与保存互斥（两者共用 _cancelToken，并发会互相取消对方在途请求）。
+    // 与保存互斥（两者共用 _cancelToken，并发会互相取消对方在途请求）。
     if (this.data.testing || this.data.saving) return;
     const { backendUrl, apiKey } = this.data;
     let url = backendUrl.trim();
@@ -244,7 +250,7 @@ Page({
 
   async save() {
     if ((this as any)._isDestroyed) return;
-    // F5-10：与测试互斥（两者共用 _cancelToken，并发会互相取消对方在途请求）。
+    // 与测试互斥（两者共用 _cancelToken，并发会互相取消对方在途请求）。
     if (this.data.saving || this.data.testing) return;
     const { enabled, backendUrl, apiKey } = this.data;
     let normalizedUrl = backendUrl.trim();
@@ -270,6 +276,10 @@ Page({
           return;
         }
         await this._registerPrivateBackend(sessionId, normalizedUrl, apiKey.trim());
+        // 停自动记录必须先于 mode/URL 写入：写入后 getBaseURL() 即指向新后端，
+        // 此刻 closeAutoRecord 的末批上报会 401 触发静默重登新后端（串号/幽灵账号）。
+        await closeAutoRecord().catch(() => {});
+        resetVipCache();
         safeSetStorage(STORAGE_KEY_URL, normalizedUrl);
         safeSetStorage(STORAGE_KEY_API_KEY, apiKey.trim());
         safeSetStorage(STORAGE_KEY_MODE, 'private');
@@ -284,6 +294,9 @@ Page({
             logger.warn('注销私有后端失败，继续切回 SaaS', err);
           }
         }
+        // 同上：停记录先于 mode 写入
+        await closeAutoRecord().catch(() => {});
+        resetVipCache();
         safeSetStorage(STORAGE_KEY_URL, '');
         safeSetStorage(STORAGE_KEY_API_KEY, '');
         safeSetStorage(STORAGE_KEY_MODE, 'saas');
@@ -299,7 +312,10 @@ Page({
         title: (this as any).$t('backendConfig.saveSuccess'),
         content: (this as any).$t('backendConfig.reloginTip'),
         showCancel: false,
-        success: () => {
+        success: async () => {
+          // 停自动记录与清 VIP 缓存先于清用户态（同 onShow 补执行路径的对齐说明）。
+          await closeAutoRecord().catch(() => {});
+          resetVipCache();
           clearUserData();
           wx.reLaunch({ url: '/pages/index/index' });
         },

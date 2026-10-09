@@ -90,9 +90,6 @@ WHERE d.user_id = ANY($1::text[])
 ORDER BY de.record_time ASC NULLS LAST, de.created_at ASC
 LIMIT 200;
 
--- name: CountDiaryEntriesByDiaryID :one
-SELECT COUNT(*) FROM diary_entries WHERE diary_id = $1;
-
 -- name: CountDiaryEntries :one
 SELECT COUNT(*)
 FROM diary_entries de
@@ -125,8 +122,20 @@ DELETE FROM diary_entry_images
 WHERE diary_entry_id IN (SELECT id FROM diary_entries WHERE diary_id = $1)
 RETURNING file_id;
 
--- name: DeleteDiaryByID :exec
-DELETE FROM diaries WHERE id = $1;
+-- name: LockDiaryByIDForUpdate :one
+SELECT id FROM diaries WHERE id = $1 FOR UPDATE;
+
+-- name: DeleteDiaryIfEmpty :execrows
+-- 条件删除：头行 FOR UPDATE（LockDiaryByIDForUpdate）与本语句配合，
+-- 与并发新增条目（FK KEY SHARE）串行化，关闭「计数后删行」窗口内
+-- 并发已提交条目被级联删除的丢失路径（docs/OBJECTIVES A1）。
+DELETE FROM diaries AS d
+WHERE d.id = $1
+  AND NOT EXISTS (SELECT 1 FROM diary_entries e WHERE e.diary_id = d.id)
+  AND NOT EXISTS (SELECT 1 FROM memories m WHERE m.user_id = d.user_id AND m.record_date = d.record_date);
+
+-- name: DeleteDiaryEntriesByDiaryID :execrows
+DELETE FROM diary_entries WHERE diary_id = $1;
 
 -- name: FindTrajectoryCovers :many
 SELECT id, path, storage_type FROM files

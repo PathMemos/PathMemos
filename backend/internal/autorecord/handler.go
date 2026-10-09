@@ -90,7 +90,7 @@ func (h *Handler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 // TouchActive 记录用户活跃时间；异常告警候选 SQL 据此跳过最近活跃用户（last_active_at 条件），
-// 并不直接重置 abnormal_alert_sent_at（PPJ-C02 注释与实现对齐）。
+// 并不直接重置 abnormal_alert_sent_at。
 func (h *Handler) TouchActive(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userID := middleware.UserID(ctx)
@@ -122,7 +122,7 @@ func (h *Handler) UploadTrajectories(w http.ResponseWriter, r *http.Request) {
 			Lon        *float64 `json:"lon"`
 			RecordedAt string   `json:"recordedAt"`
 		} `json:"points"`
-		// BatchSeq 由前端生成，仅用于观测（PPJ-C04）；服务端幂等以自然键唯一索引为准。
+		// BatchSeq 由前端生成，仅用于观测；服务端幂等以自然键唯一索引为准。
 		BatchSeq int `json:"batchSeq"`
 	}
 	if err := middleware.ReadJSONBody(w, r, &req, maxUploadBodySize); err != nil {

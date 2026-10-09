@@ -19,7 +19,7 @@ export default Behavior({
       const self = this as any;
       if (self._timer) { clearTimeout(self._timer); self._timer = null; }
       if (self._maskTimer) { clearTimeout(self._maskTimer); self._maskTimer = null; }
-      // R2-F10：_attachedTimer 一并清理，避免 detached 后 300ms 仍触发一次过渡回调。
+      // _attachedTimer 一并清理，避免 detached 后 300ms 仍触发一次过渡回调。
       if (self._attachedTimer) { clearTimeout(self._attachedTimer); self._attachedTimer = null; }
     },
     _triggerMaskTransition() {

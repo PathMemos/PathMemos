@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spec-check.sh — PathMemos-SaaS spec 门禁（见 docs/spec-standards.md §九）
+# spec-check.sh — PathMemos-SaaS spec 门禁（校验项清单见 docs/spec-standards.md §八）
 # 用法：bash scripts/spec-check.sh [--warn]
 #   --warn：把「spec 随代码变更」从阻断降级为提示（默认阻断）
 # 退出码：0 全部通过；1 存在阻断项。
@@ -85,7 +85,7 @@ BASE="origin/main"
 if ! git rev-parse --verify -q "$BASE" >/dev/null 2>&1; then BASE="HEAD~1"; fi
 if git rev-parse --verify -q "$BASE" >/dev/null 2>&1; then
   CHANGED="$(git diff --name-only "$BASE"...HEAD 2>/dev/null || true)"
-  CODE="$(printf '%s\n' "$CHANGED" | grep -E '^(backend/|api-worker/src/|mcp-worker/src/)' || true)"
+  CODE="$(printf '%s\n' "$CHANGED" | grep -E '^(backend/|api-worker/|mcp-worker/)' | grep -v 'package-lock.json' || true)"
   SPEC="$(printf '%s\n' "$CHANGED" | grep -E '^(docs/spec/|docs/CAPABILITIES\.md)' || true)"
   MSG="$(git log --format=%B "$BASE"..HEAD 2>/dev/null || true)"
   if [[ -n "$CODE" && -z "$SPEC" ]] && ! grep -qi 'spec:nochange' <<< "$MSG"; then
@@ -128,7 +128,7 @@ for f in backend/migrations/*.down.sql; do
 done
 
 # 11. 能力索引反向差异（提示）
-for f in docs/spec/02?.md; do
+for f in docs/spec/02[a-z]*.md; do
   [[ -f "$f" ]] || continue
   n="$(basename "$f" | cut -c1-3)"
   grep -q "$n" docs/CAPABILITIES.md || warn "领域分册未登记能力索引: $f"
@@ -171,6 +171,7 @@ bad = []
 for (path, line) in refs:
     fp = resolve(path)
     if fp is None:
+        bad.append(f"{path}(文件不存在)")
         continue
     n = sum(1 for _ in fp.open(encoding="utf-8"))
     if line > n:
@@ -181,18 +182,31 @@ PY
 if [[ -z "$LINEREF" ]]; then ok "spec file:line 引用在范围内"; else warn "file:line 引用失效: $LINEREF"; fi
 
 # 13. docs 无过程产物/评审残留（阻断）— SR-13
-ARTIFACTS="$(grep -rnE '\bR-[0-9]{2}\b|plans/|第三步整改' docs/ --exclude='spec-standards.md' 2>/dev/null || true)"
+ARTIFACTS="$(grep -rnE '\bR-[0-9]{2}\b|plans/|第三步整改|[A-Z]{2}-P[0-9]+-[0-9]+' docs/ --exclude='spec-standards.md' 2>/dev/null || true)"
 if [[ -z "$ARTIFACTS" ]]; then ok "docs 无过程产物（R-xx / plans / 第三步整改）"; else
   block "docs 含过程产物/评审残留（应放入 plans/，保持 docs 为代码终态）"
   printf '%s\n' "$ARTIFACTS" | head -20
 fi
 
-# 11. MCP 静态方法双源对账（提示）— SR-11
+# SR-11. MCP 静态方法双源对账（提示）
 if [[ -f scripts/check_mcp_static_sync.py ]]; then
   MCP_OUT="$(python3 scripts/check_mcp_static_sync.py 2>&1)"; MCP_RC=$?
   if [[ $MCP_RC -eq 0 ]]; then ok "MCP 静态方法双源一致"; else warn "MCP 静态方法漂移: $(tr '\n' ';' <<< "$MCP_OUT")"; fi
 else
   warn "缺少 scripts/check_mcp_static_sync.py，跳过 MCP 静态方法对账"
+fi
+
+# SR-14. contract DDL 提醒（提示）——up 脚本含破坏性/收窄性 DDL 时提示：
+# 部署失败窗口内「旧代码 + 新 schema」仅在 expand-only 前提下可运行（04 §8 硬纪律），
+# contract 类迁移要求旧代码彻底下线后的后续部署分两步走。
+CONTRACT_HITS=""
+for f in backend/migrations/*.up.sql; do
+  if grep -qiE 'DROP COLUMN|DROP TABLE|ALTER COLUMN .* TYPE|SET NOT NULL|DROP NOT NULL' "$f"; then
+    CONTRACT_HITS="$CONTRACT_HITS $(basename "$f")"
+  fi
+done
+if [[ -n "$CONTRACT_HITS" ]]; then
+  warn "迁移含 contract DDL（部署失败窗口的旧代码兼容性依赖分步发布，见 04 §8）:$CONTRACT_HITS"
 fi
 
 if [[ $FAIL -eq 0 ]]; then printf '%s=== spec-check: PASS ===%s\n' "$GRN" "$RST"; else printf '%s=== spec-check: FAIL ===%s\n' "$RED" "$RST"; fi

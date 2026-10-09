@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"strconv"
+	"strings"
 
 	"papafeiji/backend/internal/db"
 	"papafeiji/backend/internal/db/sqlc"
@@ -22,7 +23,7 @@ import (
 var (
 	ErrInvalidVIP = errors.New("invalid vip")
 	// errNotifyRejected 表示回调的业务性拒绝（订单不存在/金额不符/事件不支持等）：
-	// 重试无法改变结果，应回 200 终止微信重试（B6b-04）。
+	// 重试无法改变结果，应回 200 终止微信重试。
 	// 其余错误视为瞬时故障，回非 2xx 触发微信重试。
 	errNotifyRejected = errors.New("notify business rejected")
 )
@@ -75,7 +76,7 @@ func (h *Handler) createOrder(ctx context.Context, userID, vipID string, env int
 			return fmt.Errorf("close pending orders: %w", err)
 		}
 
-		outTradeNo, err = GenerateOutTradeNo(userID, vipID)
+		outTradeNo, err = GenerateOutTradeNo()
 		if err != nil {
 			return fmt.Errorf("generate out trade no: %w", err)
 		}
@@ -89,7 +90,6 @@ func (h *Handler) createOrder(ctx context.Context, userID, vipID string, env int
 			VipID:      vipID,
 			OutTradeNo: outTradeNo,
 			Amount:     amount,
-			PrepayID:   pgtype.Text{},
 		})
 		if err != nil {
 			return fmt.Errorf("create order: %w", err)
@@ -172,6 +172,18 @@ func parseNotifyAmount(v interface{}) (int64, bool) {
 }
 
 func (h *Handler) handleNotify(ctx context.Context, payload map[string]interface{}) error {
+	// 数据回调 URL 同时承载微信消息推送（订阅消息弹窗/变更/发送结果与发货事件共用同一 URL）。
+	// 订阅消息系列事件属正常用户触达，固定成功签收即可——不进入发货解析，
+	// 更不打 payment_notify_business_rejected 资金告警（subscribe_msg_popup_event
+	// 曾触发误报，见 DEPLOYMENT 告警白名单口径）。
+	if evt := eventType(payload); evt != "xpay_goods_deliver_notify" {
+		if strings.HasPrefix(evt, "subscribe_msg_") {
+			slog.InfoContext(ctx, "payment notify ignored (subscribe event)", slog.String("event", evt))
+			return nil
+		}
+		return fmt.Errorf("%w: unsupported payment event: %s", errNotifyRejected, evt)
+	}
+
 	outTradeNo := getStringAny(payload, "OutTradeNo", "out_trade_no")
 	transactionID := getNestedStringAny(payload, "WeChatPayInfo", "", "TransactionId", "transaction_id")
 	if transactionID == "" {
@@ -183,10 +195,6 @@ func (h *Handler) handleNotify(ctx context.Context, payload map[string]interface
 	if transactionID == "" {
 		slog.ErrorContext(ctx, "notify missing transaction_id", slog.String("out_trade_no", outTradeNo))
 		return fmt.Errorf("%w: missing transaction_id", errNotifyRejected)
-	}
-
-	if evt := eventType(payload); evt != "xpay_goods_deliver_notify" {
-		return fmt.Errorf("%w: unsupported payment event: %s", errNotifyRejected, evt)
 	}
 
 	order, err := h.pool.Queries().GetOrderByOutTradeNo(ctx, outTradeNo)
@@ -214,7 +222,7 @@ func (h *Handler) handleNotify(ctx context.Context, payload map[string]interface
 			slog.Int64("order_amount", int64(order.Amount)))
 		return fmt.Errorf("%w: amount missing", errNotifyRejected)
 	}
-	// VP-P1-01：回调已通过验签，金额不可解析才拒绝。金额与订单标价不一致多来自
+	// 回调已通过验签，金额不可解析才拒绝。金额与订单标价不一致多来自
 	// 平台立减/优惠券，此时用户已实际扣款，拒绝会静默漏发；按「支付成功即到账」
 	// 照常发货，仅打告警供对账。非正数金额视为异常拒绝。
 	if notifyAmount <= 0 {
@@ -265,6 +273,9 @@ func (h *Handler) handleNotify(ctx context.Context, payload map[string]interface
 			freshOrder, ferr := q.GetOrderByOutTradeNo(ctx, outTradeNo)
 			if ferr == nil {
 				currentOrder = freshOrder
+				// 重读后同步刷新用户注销快照：首读与重读之间注销可能已提交，
+				// 沿用旧快照会对 userID 为空的订单调 ActivateVIPWithTx 而回滚 500。
+				isUserDeleted = !currentOrder.UserID.Valid || currentOrder.UserID.String == ""
 			} else if !errors.Is(ferr, pgx.ErrNoRows) {
 				return fmt.Errorf("re-read order state: %w", ferr)
 			}

@@ -1,7 +1,8 @@
 
 import request, { createCancelToken, getBaseInfo } from '../../../utils/request';
 import { openUrl } from '../../../utils/util';
-import { clearUserData, getBackendMode } from '../../../utils/storage';
+import { clearUserData, getBackendMode, setLoggedOut } from '../../../utils/storage';
+import { resetVipCache } from '../../../utils/vip';
 import { closeAutoRecord } from '../../../utils/autoRecord';
 import { logger } from '../../../utils/logger';
 import { getHelpBaseURL } from '../../../config/index';
@@ -101,7 +102,7 @@ Page({
     });
   },
 
-  onConfirmDialogConfirm() {
+  async onConfirmDialogConfirm() {
     // 防重入：setData 生效窗口内双击会双发 DELETE /auth/account。
     if ((this as any).data.deleting) {
       return;
@@ -111,14 +112,17 @@ Page({
       return;
     }
     (this as any)._safeSetData({ deleting: true, 'confirmDialog.visible': false });
+    // 停自动记录必须先于注销请求：关停前的末批上报依赖有效会话，放在注销之后会
+    // 401 触发静默重登——账号已硬删，会以同一微信身份注册"幽灵账号"并领新人 VIP。
+    await closeAutoRecord().catch(() => {});
     request.del('/auth/account', { data: { confirmName }, cancelToken: (this as any)._destroyCancelToken }, true)
       .then(async () => {
         // 服务端已删除账号，后续本地清理、提示、跳转均为 best-effort，
         // 任一环节失败也不应回退“已注销”事实或误导用户。
         try {
-          // PPJ-A03：本地清理必须执行，不能因页面隐藏/销毁而跳过（否则残留 session 与
+          // 本地清理必须执行，不能因页面隐藏/销毁而跳过（否则残留 session 与
           // 本地数据）；仅成功 toast 等 UI 反馈在页面不可见时省略。
-          await closeAutoRecord().catch(() => {});
+          resetVipCache();
           clearUserData();
           if (!(this as any)._isDestroyed && !(this as any)._isHidden) {
             wx.showToast({ title: (this as any).$t('about.deleteAccount'), icon: 'success' });
@@ -126,10 +130,10 @@ Page({
         } catch (cleanupErr) {
           logger.error('注销后清理失败', cleanupErr);
         }
-        // 注销成功后回到首页，由首页 ensureLogin 自动登录新账号并统一决定
-        // 是否跳转到新用户引导（Guide），避免这里直接跳 Guide 后首页再次
-        // 登录又触发一次 Guide。
-        wx.reLaunch({ url: '/pages/index/index' });
+        // 置停留标记并落登录页：注销后不自动重登新账号——登录页手动点击后才创建新账号；
+        // 新用户引导（Guide）由登录页 _applyLoginResult 统一路由。
+        setLoggedOut(true);
+        wx.reLaunch({ url: '/pages/Login/Login' });
       })
       .catch((err: any) => {
         (this as any)._safeSetData({ deleting: false });
@@ -146,6 +150,18 @@ Page({
 
   toChat() {
     openUrl(`${getHelpBaseURL()}/tutorial/about/`);
+  },
+
+  /** 跳转姊妹小程序「爬爬家庭助手」:必须由用户点击触发(微信自动弹确认框);全屏跳转无需 appid 名单声明 */
+  toFamilyApp() {
+    wx.navigateToMiniProgram({
+      appId: 'wx66f181d33f61a691',
+      path: 'pages/map/map',
+      fail: (res) => {
+        if ((res.errMsg || '').includes('cancel')) return; // 用户在确认框点了取消
+        wx.showToast({ title: (this as any).$t('error.DEFAULT'), icon: 'none' });
+      },
+    });
   },
 
   toGuide() {

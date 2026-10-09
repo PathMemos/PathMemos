@@ -1,0 +1,7 @@
+<view class="BasePage" data-theme="{{theme}}">
+  <navigation-bar title="{{_i18n['brand.name'] || ''}}" back="{{false}}"></navigation-bar>
+  <!-- 整屏即登录入口：点击任意处拉起微信一键登录 -->
+  <view class="login" bindtap="onWechatLogin">
+    <image class="login-hero" src="/image/login_guide1{{_locale === 'en' ? '_en' : ''}}.png" mode="aspectFill" />
+  </view>
+</view>

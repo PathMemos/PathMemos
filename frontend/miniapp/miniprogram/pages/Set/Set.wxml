@@ -27,9 +27,9 @@
           />
         </view>
       </Cell>
-      <button class="avatar-btn" open-type="chooseAvatar" bind:chooseavatar="onChooseAvatar"></button>
+      <button wx:if="{{!isAppEnv}}" class="avatar-btn" open-type="chooseAvatar" bind:chooseavatar="onChooseAvatar"></button>
     </view>
-    <view wx:if="{{!isPrivateBackend}}" class="avatar-cell-wrap">
+    <view wx:if="{{!isPrivateBackend && !isAppEnv}}" class="avatar-cell-wrap">
       <Cell showArrow suffix="{{phone || ''}}">{{phone ? _i18n['set.rebindPhone'] : _i18n['set.bindPhone']}}</Cell>
       <button
         class="avatar-btn"
@@ -38,9 +38,7 @@
         bindtap="tapPhoneCell"
       ></button>
     </view>
-    <Cell wx:if="{{!isPrivateBackend && phone}}" showArrow bindtap="onUnbindPhoneTap">
-      {{_i18n['set.unbindPhone']}}
-    </Cell>
+
     <Cell wx:if="{{!isPrivateBackend}}" showArrow="{{!mpSubscribed}}" suffix="{{mpSubscribed ? _i18n['set.serviceAccountBound'] : _i18n['set.serviceAccountUnbound']}}" bindtap="onServiceAccountTap">
       {{_i18n['set.bindServiceAccount']}}
     </Cell>
@@ -63,6 +61,18 @@
       showArrow
     >{{_i18n['set.addToDesktop']}}
     </Cell>
+    <Cell bindtap="toFamilyApp" showArrow>
+      {{_i18n['set.moreProducts']}}
+      <view slot="suffix" class="app-suffix">
+        <image class="app-suffix-logo" src="../../image/family_app_logo.png" />
+        <text class="app-suffix-name">{{_i18n['about.familyAppName']}}</text>
+      </view>
+    </Cell>
+  </view>
+
+  <!-- 退出登录 -->
+  <view class="logout-wrap">
+    <view class="logout-btn" bindtap="onLogoutTap">{{_i18n['set.logout']}}</view>
   </view>
     </view>
   </scroll-view>

@@ -69,9 +69,11 @@
         <view class="preset-tag" data-name="{{_i18n['commonAddresses.company']}}" bindtap="onPresetTap">{{_i18n['commonAddresses.company']}}</view>
       </view>
     </view>
-    <view class="drawer-footer">
-      <view class="tool-btn cancel-btn" bindtap="hiddenEditDrawer">{{_i18n['common.cancel']}}</view>
-      <view class="tool-btn save-btn" bindtap="submitName">{{_i18n['common.save']}}</view>
-    </view>
   </Drawer>
+
+  <!-- fixed 按钮栏挪出 Drawer 的 scroll-view slot，避免滚动容器劫持 fixed 包含块；z-index 压过抽屉 500 -->
+  <view class="drawer-footer" wx:if="{{showEditDrawer}}">
+    <view class="tool-btn cancel-btn" bindtap="hiddenEditDrawer">{{_i18n['common.cancel']}}</view>
+    <view class="tool-btn save-btn" bindtap="submitName">{{_i18n['common.save']}}</view>
+  </view>
 </view>

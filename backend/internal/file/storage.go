@@ -58,7 +58,7 @@ func (s *Storage) OSSConfigured() bool {
 }
 
 func (s *Storage) Save(reader io.Reader, ext string) (string, int64, error) {
-	// R2-L01：ext 只能是简单扩展名，拒绝路径分隔符与 .. 防目录穿越（调用方白名单之外的双保险）。
+	// ext 只能是简单扩展名，拒绝路径分隔符与 .. 防目录穿越（调用方白名单之外的双保险）。
 	if strings.ContainsAny(ext, "/\\") || strings.Contains(ext, "..") {
 		return "", 0, fmt.Errorf("invalid extension")
 	}
@@ -84,6 +84,9 @@ func (s *Storage) Save(reader io.Reader, ext string) (string, int64, error) {
 
 	size, err := io.Copy(f, reader)
 	if err != nil {
+		// 写入失败时清掉半成品：此时 DB 记录尚不存在，孤儿清理任务只扫 DB 行，
+		// 残留文件将永无回收路径。
+		_ = os.Remove(fullPath) //nolint:errcheck
 		return "", 0, fmt.Errorf("write upload file: %w", err)
 	}
 
@@ -149,7 +152,7 @@ func (s *Storage) SaveSystemWithName(reader io.Reader, ext, fileName string) (st
 
 // SaveWithName saves data to a file with a specific name under the current month directory.
 func (s *Storage) SaveWithName(reader io.Reader, ext, fileName string) (string, int64, error) {
-	// R2-L01：ext/fileName 校验防目录穿越（调用方白名单之外的双保险）。
+	// ext/fileName 校验防目录穿越（调用方白名单之外的双保险）。
 	if strings.ContainsAny(ext, "/\\") || strings.Contains(ext, "..") || strings.ContainsAny(fileName, "/\\") || strings.Contains(fileName, "..") {
 		return "", 0, fmt.Errorf("invalid extension or file name")
 	}
@@ -171,6 +174,9 @@ func (s *Storage) SaveWithName(reader io.Reader, ext, fileName string) (string, 
 
 	size, err := io.Copy(f, reader)
 	if err != nil {
+		// 写入失败时清掉半成品：此时 DB 记录尚不存在，孤儿清理任务只扫 DB 行，
+		// 残留文件将永无回收路径。
+		_ = os.Remove(fullPath) //nolint:errcheck
 		return "", 0, fmt.Errorf("write upload file: %w", err)
 	}
 
@@ -226,7 +232,7 @@ func (s *Storage) URL(path, storageType string) (string, error) {
 		}
 		return s.oss.URL(path), nil
 	}
-	// B5-14：baseURL 未配置时返回明确错误，避免静默产生相对路径 URL。
+	// baseURL 未配置时返回明确错误，避免静默产生相对路径 URL。
 	if strings.TrimSpace(s.baseURL) == "" {
 		return "", fmt.Errorf("storage base url not configured")
 	}

@@ -23,6 +23,12 @@ export function getErrorMessage(error: any, defaultMsg: string = i18n.t('error.D
   return error?.msg || error?.data?.msg || error?.message || defaultMsg;
 }
 
+// 判定错误是否为 401 会话过期哨兵（http 层 reject 字符串/Error 均可能），
+// 供 auth/Vip 等模块做「清会话重登」判定——切勿用翻译文案匹配（i18n 文案会变）。
+export function isSessionExpiredError(error: any): boolean {
+  return error === SESSION_EXPIRED_SENTINEL || error?.message === SESSION_EXPIRED_SENTINEL;
+}
+
 export interface CancelToken {
   cancel: () => void;
   isCancelled: () => boolean;
@@ -226,7 +232,7 @@ const _handleResponseError = (resData: any, closeTheErrorMessage = false): void 
     wx.showToast({ title: i18n.t('error.privateBackendNotRegistered'), icon: 'none', duration: 2000 });
     return;
   }
-  // C1：后端 message 为英文硬编码，优先按 biz_code 显示本地化文案，未登记码回退后端 message。
+  // 后端 message 为英文硬编码，优先按 biz_code 显示本地化文案，未登记码回退后端 message。
   const bizMessage = localizedBizCodeMessage(resData.biz_code || resData.bizCode);
   wx.showToast({
     title: bizMessage || resData.message || resData.msg || i18n.t('error.DEFAULT'),
@@ -448,7 +454,7 @@ export const uploadFile = async (
     imageIds.push(pid);
   }
   try {
-    // PPJ-B08：记录每个待上传项在 fileLists 中的下标，成功结果可回写调用方对象，
+    // 记录每个待上传项在 fileLists 中的下标，成功结果可回写调用方对象，
     // 使部分失败后的重试只补传失败项，而不是整批重传（孤儿文件 + 配额浪费）。
     const uploadTargets: { index: number; path: string }[] = [];
     for (let i = 0; i < fileLists.length; i++) {
@@ -557,7 +563,7 @@ const _compressImage = (path: string): Promise<string> => {
           reject(new Error(i18n.t('error.imageSizeLimit')));
           return;
         }
-        const quality = size > 1024 * 1024 ? 50 : size > 200 * 1024 ? 65 : 80;
+        const quality = size > 1024 * 1024 ? 80 : size > 200 * 1024 ? 85 : 90;
         wx.compressImage({
           src: path,
           quality,

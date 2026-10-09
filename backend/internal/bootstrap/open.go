@@ -66,7 +66,7 @@ func SeedOpenBackend(ctx context.Context, cfg *config.Config, pool *db.Pool, ses
 		})
 		if err != nil {
 			if dbx.IsUniqueViolation(err) {
-				// B4-12：多副本并发启动竞态——另一副本已创建，重新读取即可。
+				// 多副本并发启动竞态——另一副本已创建，重新读取即可。
 				existing, gerr := queries.GetUserByOpenID(ctx, defaultOpenID)
 				if gerr != nil {
 					return fmt.Errorf("re-fetch default open user: %w", gerr)
@@ -99,7 +99,7 @@ func SeedOpenBackend(ctx context.Context, cfg *config.Config, pool *db.Pool, ses
 		if err != nil {
 			return fmt.Errorf("generate api key id: %w", err)
 		}
-		// B4-11：先提交替换事务，成功后再 flush 所有 session——
+		// 先提交替换事务，成功后再 flush 所有 session——
 		// 避免事务失败时已产生“全部用户被登出但 key 未更换”的副作用。
 		if txErr := db.WithTx(ctx, pool.Pool(), func(txCtx context.Context, tx *sqlc.Queries) error {
 			if err := tx.DeleteAPIKeyByUser(txCtx, user.ID); err != nil {
@@ -151,7 +151,7 @@ func SeedOpenBackend(ctx context.Context, cfg *config.Config, pool *db.Pool, ses
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// B4-12：ON CONFLICT (user_id) DO NOTHING 命中——并发副本已创建，视为成功。
+			// ON CONFLICT (user_id) DO NOTHING 命中——并发副本已创建，视为成功。
 			slog.InfoContext(ctx, "open backend api key created by concurrent replica", slog.String("user_id", user.ID))
 			return nil
 		}

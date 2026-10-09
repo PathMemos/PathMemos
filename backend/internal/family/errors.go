@@ -17,4 +17,5 @@ var (
 	ErrTargetNotInFamily      = errors.New("target user not in family")
 	ErrCannotDissolvePersonal = errors.New("cannot dissolve personal family")
 	ErrOperationInProgress    = errors.New("operation in progress")
+	ErrRemovedRejoinCooldown  = errors.New("removed from this family recently, try again later")
 )

@@ -18,7 +18,7 @@ type Querier interface {
 	BatchUpsertFamilyMembership(ctx context.Context, arg BatchUpsertFamilyMembershipParams) error
 	BatchUpsertFamilyMembershipOwner(ctx context.Context, arg BatchUpsertFamilyMembershipOwnerParams) error
 	// A-FIX-03：绑定手机号的原子日限——仅当 phone_bind_time 为空或不在今天（上海时区）时写入，
-	// 避免「检查-再更新」竞态下并发绑定绕过日限、反复消耗微信认证额度。解绑走 UpdateUserPhone 不受此限。
+	// 避免「检查-再更新」竞态下并发绑定绕过日限、反复消耗微信认证额度。
 	BindUserPhoneIfAllowed(ctx context.Context, arg BindUserPhoneIfAllowedParams) (int64, error)
 	// 并发首次激活竞态防护：GetUserVIPForUpdate 对不存在的行无法加锁，两个并发首次激活
 	// 都走 ErrNoRows 创建路径会各自按 now 计算 expire、GREATEST 只保留较大者导致较小档时长丢失。
@@ -34,22 +34,20 @@ type Querier interface {
 	ClearTrajectoryFamilyID(ctx context.Context, familyID string) error
 	ClearUserAvatarByFile(ctx context.Context, arg ClearUserAvatarByFileParams) error
 	CloseOrder(ctx context.Context, arg CloseOrderParams) (int64, error)
-	// 两个数组按位置配对（B2-10）：out_trade_nos 展开为 (订单号, 序号)，
+	// 两个数组按位置配对：out_trade_nos 展开为 (订单号, 序号)，
 	// user_ids 按下标取同位置的 user_id，避免双 ANY 独立展开产生笛卡尔误关他人订单。
 	CloseOrdersBatch(ctx context.Context, arg CloseOrdersBatchParams) (int64, error)
-	// R-17：关闭无主（user_id IS NULL，用户注销产生）的过期 pending 订单，避免永久滞留。
+	// 关闭无主（user_id IS NULL，用户注销产生）的过期 pending 订单，避免永久滞留。
 	CloseOwnerlessPendingOrders(ctx context.Context, createdAt pgtype.Timestamptz) (int64, error)
 	ClosePendingOrdersByUser(ctx context.Context, userID pgtype.Text) error
 	ClosePendingOrdersByUserAndVIP(ctx context.Context, arg ClosePendingOrdersByUserAndVIPParams) error
-	// R-01：候选积压量（满批时才统计），超过阈值输出 auto_record_backlog_warn。
+	// 候选积压量（满批时才统计），超过阈值输出 auto_record_backlog_warn。
 	CountAutoRecordCandidates(ctx context.Context, maxGeocodeAttempts int32) (int64, error)
 	CountDiaryEntries(ctx context.Context, arg CountDiaryEntriesParams) (int64, error)
-	CountDiaryEntriesByDiaryID(ctx context.Context, diaryID string) (int64, error)
 	CountDiaryEntriesByUsers(ctx context.Context, dollar_1 []string) (int64, error)
 	CountFamilyDailyCovers(ctx context.Context, familyID string) (int64, error)
 	CountFamilyMembers(ctx context.Context, familyID string) (int64, error)
 	CountInviterMonthlyRewardDays(ctx context.Context, arg CountInviterMonthlyRewardDaysParams) (int32, error)
-	CountMemoriesByUserAndDate(ctx context.Context, arg CountMemoriesByUserAndDateParams) (int64, error)
 	CountWeeklyDiaryEntriesByUsers(ctx context.Context, arg CountWeeklyDiaryEntriesByUsersParams) (int64, error)
 	CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (CreateAPIKeyRow, error)
 	CreateAutoRecordEntry(ctx context.Context, arg CreateAutoRecordEntryParams) error
@@ -60,7 +58,7 @@ type Querier interface {
 	CreateMemory(ctx context.Context, arg CreateMemoryParams) (Memory, error)
 	CreateOrder(ctx context.Context, arg CreateOrderParams) (Order, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
-	// R-21：冗余被邀请人 openid（注销后行保留，作为被邀请奖励终身一次的判定依据）。
+	// 冗余被邀请人 openid（注销后行保留，作为被邀请奖励终身一次的判定依据）。
 	CreateUserInvite(ctx context.Context, arg CreateUserInviteParams) (UserInvite, error)
 	CreateUserInviteCode(ctx context.Context, arg CreateUserInviteCodeParams) (UserInviteCode, error)
 	DecrementAIDailyQuotaUsed(ctx context.Context, arg DecrementAIDailyQuotaUsedParams) (int32, error)
@@ -68,19 +66,20 @@ type Querier interface {
 	DecrementUserImageStorage(ctx context.Context, arg DecrementUserImageStorageParams) error
 	DeleteAIDailyQuotaUsageByUserID(ctx context.Context, userID string) error
 	DeleteAPIKeyByUser(ctx context.Context, userID string) error
-	DeleteDiaryByID(ctx context.Context, id string) error
+	DeleteDiaryEntriesByDiaryID(ctx context.Context, diaryID string) (int64, error)
 	DeleteDiaryEntryByID(ctx context.Context, id string) error
 	DeleteDiaryEntryImages(ctx context.Context, diaryEntryID string) error
 	// 先删图片关联并返回 file_id，再由调用方在同一事务内删除条目。
 	// 拆成两条语句，避免数据修改 CTE 顺序不可预测导致 file_id 漏返回。
 	DeleteDiaryEntryImagesReturningFileIDs(ctx context.Context, diaryEntryID string) ([]string, error)
+	// 条件删除：头行 FOR UPDATE（LockDiaryByIDForUpdate）与本语句配合，
+	// 与并发新增条目（FK KEY SHARE）串行化，关闭「计数后删行」窗口内
+	// 并发已提交条目被级联删除的丢失路径（docs/OBJECTIVES A1）。
+	DeleteDiaryIfEmpty(ctx context.Context, id string) (int64, error)
 	// 先删图片关联并返回 file_id，再由调用方在同一事务内删除日记（级联删除条目）。
 	// 拆成两条语句：PostgreSQL 不保证同一 WITH 内多个数据修改 CTE 的执行顺序，
 	// 若级联（删日记）先于显式 DELETE...RETURNING 执行，file_id 会为空导致文件漏清理。
 	DeleteDiaryImagesReturningFileIDs(ctx context.Context, diaryID string) ([]string, error)
-	// PPJ-J05：当前产品要求 API Key 永不过期（mcp/apiKeyNeverExpires=9999-12-31），本查询暂无调用；
-	// 保留作为未来「Key 可过期」能力的预留，接线时挂到后台清理任务即可。
-	DeleteExpiredAPIKeys(ctx context.Context, dollar_1 int64) (int64, error)
 	DeleteFamily(ctx context.Context, id string) error
 	DeleteFamilyDailyCovers(ctx context.Context, familyID string) error
 	DeleteFamilyMembers(ctx context.Context, familyID string) error
@@ -98,18 +97,26 @@ type Querier interface {
 	DeleteUserCommonAddresses(ctx context.Context, userID string) error
 	DeleteUserInviteCodeByUserID(ctx context.Context, userID string) error
 	DeleteUserVIP(ctx context.Context, userID string) error
+	// openid 曾领过被邀请奖励（墓碑行，注销后保留，见迁移 000008/000011）则本次邀请
+	// 关系整体不发奖：本人 +3 与邀请人 +7 均不发，邀请行照常创建且对邀请人可见，
+	// 注册/绑定/加入主流程照常成功。
+	ExistsInviteeRewardByOpenID(ctx context.Context, userOpenID pgtype.Text) (bool, error)
 	FindTrajectoryCovers(ctx context.Context, arg FindTrajectoryCoversParams) ([]FindTrajectoryCoversRow, error)
 	GetAIDailyQuotaUsed(ctx context.Context, arg GetAIDailyQuotaUsedParams) (int32, error)
 	GetAPIKeyByHash(ctx context.Context, keyHash string) (GetAPIKeyByHashRow, error)
 	GetAPIKeyByUser(ctx context.Context, userID string) (GetAPIKeyByUserRow, error)
+	// trial 下线闸门：仅返回在售商品，0 行=已下线（注册路径静默跳过、端点 404）。
+	// 支付发货沿用 GetVIPByID（不过滤 is_active），已支付订单不因商品下线而漏发。
+	GetActiveVIPByID(ctx context.Context, id string) (Vip, error)
 	GetDiaryByID(ctx context.Context, id string) (Diary, error)
 	GetDiaryByUserAndDate(ctx context.Context, arg GetDiaryByUserAndDateParams) (Diary, error)
 	GetDiaryEntriesByImageID(ctx context.Context, arg GetDiaryEntriesByImageIDParams) ([]int32, error)
 	GetDiaryEntry(ctx context.Context, id string) (DiaryEntry, error)
 	GetDiaryFirstRecordDate(ctx context.Context, dollar_1 []string) (pgtype.Date, error)
-	GetFamilyByID(ctx context.Context, id string) (Family, error)
+	GetFamilyByID(ctx context.Context, id string) (GetFamilyByIDRow, error)
 	GetFamilyDailyCover(ctx context.Context, arg GetFamilyDailyCoverParams) (GetFamilyDailyCoverRow, error)
 	GetFamilyOwner(ctx context.Context, familyID string) (string, error)
+	GetFamilyRemovedMembers(ctx context.Context, id string) ([]byte, error)
 	GetFileByID(ctx context.Context, id string) (File, error)
 	GetFileByIDForUpdate(ctx context.Context, id string) (File, error)
 	GetFileByPath(ctx context.Context, path string) (File, error)
@@ -140,15 +147,15 @@ type Querier interface {
 	GetWxMPAccountByUnionID(ctx context.Context, unionid pgtype.Text) (WxMpAccount, error)
 	GetWxMPAccountByUserID(ctx context.Context, userID pgtype.Text) (WxMpAccount, error)
 	HasVIPClaim(ctx context.Context, arg HasVIPClaimParams) (bool, error)
-	// R-21：按微信主体判重（注销重注册后仍能识别已领取），openid 为空时调用方回退 HasVIPClaim。
+	// 按微信主体判重（注销重注册后仍能识别已领取），openid 为空时调用方回退 HasVIPClaim。
 	HasVIPClaimByOpenID(ctx context.Context, arg HasVIPClaimByOpenIDParams) (bool, error)
 	IncrementAIDailyQuotaUsed(ctx context.Context, arg IncrementAIDailyQuotaUsedParams) (IncrementAIDailyQuotaUsedRow, error)
 	IncrementTrajectoryGeocodeAttempts(ctx context.Context, dollar_1 []string) error
-	// B5-12：条件原子扣减——超限时更新 0 行，由调用方识别拒绝，杜绝 check-then-act 竞态。
+	// 条件原子扣减——超限时更新 0 行，由调用方识别拒绝，杜绝 check-then-act 竞态。
 	IncrementUserImageStorage(ctx context.Context, arg IncrementUserImageStorageParams) (int64, error)
 	InsertAIDialogLog(ctx context.Context, arg InsertAIDialogLogParams) error
 	InsertClientOpsLog(ctx context.Context, arg InsertClientOpsLogParams) (string, error)
-	// PPJ-C04：重复上报（同一 user+recorded_at+lat+lon）静默忽略，避免重试产生重复轨迹。
+	// 重复上报（同一 user+recorded_at+lat+lon）静默忽略，避免重试产生重复轨迹。
 	InsertTrajectories(ctx context.Context, arg InsertTrajectoriesParams) error
 	InsertUserCommonAddresses(ctx context.Context, arg InsertUserCommonAddressesParams) error
 	IsFamilyMember(ctx context.Context, arg IsFamilyMemberParams) (bool, error)
@@ -159,11 +166,11 @@ type Querier interface {
 	ListActiveFreeVIPs(ctx context.Context) ([]Vip, error)
 	ListActivePaidVIPs(ctx context.Context) ([]Vip, error)
 	ListAddressEntriesByDates(ctx context.Context, arg ListAddressEntriesByDatesParams) ([]ListAddressEntriesByDatesRow, error)
-	// R-20/R-22（同日去重集合化）：取当天全部自动条目的 id+地址，后台与手动即时成文共用；
+	// 同日去重集合化：取当天全部自动条目的 id+地址，后台与手动即时成文共用；
 	// 后者需要已存在条目 id 供响应契约（ORDER BY DESC 保证首条命中即最新）。
 	ListAutoEntryAddressesByDate(ctx context.Context, arg ListAutoEntryAddressesByDateParams) ([]ListAutoEntryAddressesByDateRow, error)
-	// R-01：公平轮转——按 user_id keyset 分页，替代「按积压量 ORDER BY cnt DESC」避免低频用户饥饿；
-	// 仅取仍有未达重试上限轨迹的用户（R-02）。
+	// 公平轮转——按 user_id keyset 分页，避免「按积压量 ORDER BY cnt DESC」令低频用户饥饿；
+	// 仅取仍有未达重试上限轨迹的用户。
 	ListAutoRecordCandidates(ctx context.Context, arg ListAutoRecordCandidatesParams) ([]string, error)
 	ListDiaryCards(ctx context.Context, arg ListDiaryCardsParams) ([]ListDiaryCardsRow, error)
 	ListDiaryCardsByDates(ctx context.Context, arg ListDiaryCardsByDatesParams) ([]ListDiaryCardsByDatesRow, error)
@@ -177,8 +184,12 @@ type Querier interface {
 	ListFamilyDailyCovers(ctx context.Context, arg ListFamilyDailyCoversParams) ([]ListFamilyDailyCoversRow, error)
 	ListFamilyMemberPersonalFamilies(ctx context.Context, familyID string) ([]ListFamilyMemberPersonalFamiliesRow, error)
 	ListFamilyMembers(ctx context.Context, familyID string) ([]ListFamilyMembersRow, error)
+	// 一次往返同时取用户当前家庭与其成员列表（替代 GetUserByID + ListFamilyMembers 两段串行，
+	// 是 diary 全部端点的公共前缀）。LEFT JOIN 保形：无家庭时返回单行全 NULL（fm.* 判空跳过），
+	// 用户不存在时 0 行（调用方转 ErrNoRows），与旧两查语义逐一对齐。
+	ListFamilyMembersByUserID(ctx context.Context, id string) ([]ListFamilyMembersByUserIDRow, error)
 	ListFilesByCreator(ctx context.Context, arg ListFilesByCreatorParams) ([]ListFilesByCreatorRow, error)
-	// B2-12：按地址批量取最新坐标（DISTINCT ON），替代循环内逐条 N+1 查询。
+	// 按地址批量取最新坐标（DISTINCT ON），避免循环内逐条 N+1 查询。
 	ListLatestCoordinatesByAddresses(ctx context.Context, arg ListLatestCoordinatesByAddressesParams) ([]ListLatestCoordinatesByAddressesRow, error)
 	ListLocationEntries(ctx context.Context, arg ListLocationEntriesParams) ([]ListLocationEntriesRow, error)
 	ListMemoriesByDateRange(ctx context.Context, arg ListMemoriesByDateRangeParams) ([]ListMemoriesByDateRangeRow, error)
@@ -187,21 +198,24 @@ type Querier interface {
 	ListPendingOrdersBefore(ctx context.Context, arg ListPendingOrdersBeforeParams) ([]Order, error)
 	ListRecentDialogLogs(ctx context.Context, arg ListRecentDialogLogsParams) ([]AiDialogLog, error)
 	ListTopAddressesByUser(ctx context.Context, arg ListTopAddressesByUserParams) ([]ListTopAddressesByUserRow, error)
-	// R-02：排除达到逆地理重试上限的终态轨迹，避免其每轮重复聚类/告警（保留至 7 天清理）。
+	// 排除达到逆地理重试上限的终态轨迹，避免其每轮重复聚类/告警（保留至 7 天清理）。
 	ListTrajectoriesByUser(ctx context.Context, arg ListTrajectoriesByUserParams) ([]AutoRecordTrajectory, error)
 	ListUserCommonAddresses(ctx context.Context, userID string) ([]ListUserCommonAddressesRow, error)
 	ListUserInviteQRCodeFiles(ctx context.Context, arg ListUserInviteQRCodeFilesParams) ([]ListUserInviteQRCodeFilesRow, error)
+	// LEFT JOIN：受邀人注销后行保留（user_id 置 NULL，000011），关系记录仍应在
+	// 邀请人"我的邀请"列表可见；昵称/头像为 NULL，由 handler 映射为"已注销"占位。
 	ListUserInvitesByInviter(ctx context.Context, inviterID pgtype.Text) ([]ListUserInvitesByInviterRow, error)
 	ListUserMcpEntries(ctx context.Context, arg ListUserMcpEntriesParams) ([]ListUserMcpEntriesRow, error)
 	// keyset 游标分页：按 created_by 排序 + 游标 + LIMIT，避免一次性物化全部变更用户。
 	ListUsersWithDiaryChangesSince(ctx context.Context, arg ListUsersWithDiaryChangesSinceParams) ([]string, error)
+	LockDiaryByIDForUpdate(ctx context.Context, id string) (string, error)
 	LockInviterReward(ctx context.Context, dollar_1 pgtype.Text) error
 	MarkAbnormalAlertSent(ctx context.Context, id string) (int64, error)
 	// VP-P1-02：订单已被本地关闭（取消/超时/换单清理）但用户仍完成支付，补记为 paid 以便发货。
 	MarkClosedOrderPaid(ctx context.Context, arg MarkClosedOrderPaidParams) (int64, error)
 	MarkInviteeRewarded(ctx context.Context, id string) (int64, error)
 	MarkInviterRewarded(ctx context.Context, id string) (int64, error)
-	// B2-09：upsert 目标行（源行坐标/计数随 INSERT 带入），目标行不存在时计数不再静默丢失；
+	// upsert 目标行（源行坐标/计数随 INSERT 带入），目标行不存在时计数不静默丢失；
 	// ON CONFLICT 保证并发合并计数不丢。源行删除由 DeleteUserCommonAddressByName 在调用方事务内完成
 	// （H2：sqlc 会静默丢弃同一 named 块中的第二条语句，不可合并写在这里）。
 	MergeUserCommonAddress(ctx context.Context, arg MergeUserCommonAddressParams) error
@@ -209,33 +223,43 @@ type Querier interface {
 	MigrateUserDailyCoversToFamily(ctx context.Context, arg MigrateUserDailyCoversToFamilyParams) error
 	NeedsCommonAddressRefresh(ctx context.Context, userID string) (pgtype.Bool, error)
 	NullifyOrdersByUser(ctx context.Context, userID pgtype.Text) error
+	RecordRemovedMember(ctx context.Context, arg RecordRemovedMemberParams) error
 	RenameUserCommonAddress(ctx context.Context, arg RenameUserCommonAddressParams) error
 	// 邀请码是邀请人的稳定分享码，可被多个被邀请人多次解析（不限制一次性），
 	// 过期语义由 user_invite_codes.expires_at（baseline 000001）决定：过期后解析失败。
-	// R-24：解析为纯读（used_at 死遥测写副作用移除；列保留，将来做过期策略再启用）。
+	// 解析为纯读（used_at 死遥测写副作用移除；列保留，将来做过期策略再启用）。
 	ResolveInviterFromCode(ctx context.Context, shortCode string) (string, error)
+	// 邀请二维码/分享海报豁免：invite/qrcode.go generate 写入的海报记录 metadata 恒含 'raw' 键
+	//（轨迹图为 {family_id, record_date}、头像 marker 为 {}，均无该键，故 'raw' 是 invite 资产唯一识别特征）。
+	// 已分发到微信会话的图片 URL 不能被 7 天窗口静默回收成 404；其回收由两条替代路径覆盖：
+	// ①重生成替换（generate 事务内删旧记录、提交后删旧物理文件）②注销清理（DeleteAccount 按
+	// created_by 收集全部 files 路径删物理文件）。COALESCE 兜底 metadata 为 NULL 的行维持可回收。
 	ScanOldSystemFiles(ctx context.Context, id string) ([]ScanOldSystemFilesRow, error)
+	// 宽限窗 7 天：上传成功但尚未挂到任何引用（客户端崩溃/离线草稿）的图片不应被回收，
+	// 与代码注释及 spec「7 天孤儿清理兜底」口径一致。
 	ScanOrphanFiles(ctx context.Context, id string) ([]ScanOrphanFilesRow, error)
 	SetFamilyDailyManualCover(ctx context.Context, arg SetFamilyDailyManualCoverParams) error
 	TouchDiaryUpdatedAt(ctx context.Context, id string) error
 	TouchWxMPAccountInteractTime(ctx context.Context, mpOpenid string) error
 	UpdateDiaryEntriesAddress(ctx context.Context, arg UpdateDiaryEntriesAddressParams) (int64, error)
 	UpdateDiaryEntriesAddressBatch(ctx context.Context, arg UpdateDiaryEntriesAddressBatchParams) (int64, error)
+	// diary_id 支持跨天编辑时把条目迁移到目标日期的日记（UpsertDiary 后由调用方传入）。
 	UpdateDiaryEntry(ctx context.Context, arg UpdateDiaryEntryParams) (int64, error)
-	// B2-08：参数按使用顺序连续编号，避免 $6 跳跃误导。
+	// 参数按使用顺序连续编号，避免 $6 跳跃误导。
 	UpdateMemory(ctx context.Context, arg UpdateMemoryParams) (Memory, error)
 	UpdateOrderPaid(ctx context.Context, arg UpdateOrderPaidParams) (int64, error)
 	UpdateUserAlertSubscribe(ctx context.Context, arg UpdateUserAlertSubscribeParams) error
 	UpdateUserAutoRecord(ctx context.Context, arg UpdateUserAutoRecordParams) error
 	UpdateUserAvatar(ctx context.Context, arg UpdateUserAvatarParams) error
+	// 仅当 avatar 仍为空时写入：注册后异步默认头像回写不覆盖登录链路已写入的微信头像（02a A-9）。
+	UpdateUserAvatarIfEmpty(ctx context.Context, arg UpdateUserAvatarIfEmptyParams) (int64, error)
 	UpdateUserCurrentFamily(ctx context.Context, arg UpdateUserCurrentFamilyParams) error
-	// 仅当尚无邀请人时写入（登录后补绑场景的幂等闸门，R4）。
+	// 仅当尚无邀请人时写入（登录后补绑场景的幂等闸门）。
 	UpdateUserInvitedBy(ctx context.Context, arg UpdateUserInvitedByParams) (int64, error)
 	UpdateUserLang(ctx context.Context, arg UpdateUserLangParams) error
 	UpdateUserLastActiveAt(ctx context.Context, id string) error
 	UpdateUserNickname(ctx context.Context, arg UpdateUserNicknameParams) error
 	UpdateUserPersonalFamily(ctx context.Context, arg UpdateUserPersonalFamilyParams) error
-	UpdateUserPhone(ctx context.Context, arg UpdateUserPhoneParams) error
 	UpdateUserSessionKey(ctx context.Context, arg UpdateUserSessionKeyParams) error
 	UpdateUserUnionID(ctx context.Context, arg UpdateUserUnionIDParams) error
 	UpdateUsersCurrentFamily(ctx context.Context, arg UpdateUsersCurrentFamilyParams) error
@@ -245,7 +269,7 @@ type Querier interface {
 	UpsertFamilyMembership(ctx context.Context, arg UpsertFamilyMembershipParams) (string, error)
 	UpsertUserAvatarMarker(ctx context.Context, arg UpsertUserAvatarMarkerParams) error
 	UpsertUserVIP(ctx context.Context, arg UpsertUserVIPParams) (UserVip, error)
-	// R-21：open_id 冗余发放主体；不带目标的 ON CONFLICT DO NOTHING 同时覆盖
+	// open_id 冗余发放主体；不带目标的 ON CONFLICT DO NOTHING 同时覆盖
 	// (user_id, vip_id) 与 (open_id, vip_id) 两级唯一，rowsAffected=0 → 409 已领取。
 	UpsertVIPClaim(ctx context.Context, arg UpsertVIPClaimParams) (int64, error)
 	UpsertWxMPAccount(ctx context.Context, arg UpsertWxMPAccountParams) (WxMpAccount, error)

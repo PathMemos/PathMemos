@@ -5,7 +5,7 @@ import (
 	"regexp"
 )
 
-// urlCredentialParamRe 匹配 URL 查询串中可能携带凭据的参数（R2-01/R2-02）。
+// urlCredentialParamRe 匹配 URL 查询串中可能携带凭据的参数。
 var urlCredentialParamRe = regexp.MustCompile(`([?&](?:key|access_token|secret|appid|js_code)=)[^&\s]+`)
 
 // SanitizeURLError 将错误信息中 URL 查询参数的值脱敏（key=***），
@@ -18,7 +18,7 @@ func SanitizeURLError(err error) error {
 	return fmt.Errorf("%s", msg)
 }
 
-// SanitizeRequestID 规范化客户端传入的 X-Request-ID：限制长度并剔除控制字符（R2-L05）。
+// SanitizeRequestID 规范化客户端传入的 X-Request-ID：限制长度并剔除控制字符。
 func SanitizeRequestID(rid string) string {
 	if rid == "" {
 		return ""

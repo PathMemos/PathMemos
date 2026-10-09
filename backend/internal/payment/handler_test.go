@@ -1,8 +1,12 @@
 package payment
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,13 +37,13 @@ func (m *mockVIPService) ActivateVIPWithTx(_ context.Context, userID, vipID stri
 	return nil
 }
 
-// orderRows 构造 sqlc.Order 扫描所需的 12 列 mock 行。
+// orderRows 构造 sqlc.Order 扫描所需的 11 列 mock 行（prepay_id 已随 000012 摘除）。
 func orderRows(id, userID, vipID, outTradeNo, state string, amount int32) *pgxmock.Rows {
 	return pgxmock.NewRows([]string{
 		"id", "user_id", "vip_id", "out_trade_no", "channel", "state", "amount",
-		"prepay_id", "transaction_id", "paid_at", "created_at", "updated_at",
+		"transaction_id", "paid_at", "created_at", "updated_at",
 	}).AddRow(id, pgtype.Text{String: userID, Valid: true}, vipID, outTradeNo,
-		"virtual_pay", state, amount, nil, nil, nil, time.Now(), time.Now())
+		"virtual_pay", state, amount, nil, nil, time.Now(), time.Now())
 }
 
 func notifyPayload(outTradeNo, transactionID string, amount int64) map[string]interface{} {
@@ -300,5 +304,87 @@ func TestValidReceiveID(t *testing.T) {
 		if got := validReceiveID(c.expected, c.got); got != c.want {
 			t.Fatalf("validReceiveID(%q, %q) = %v, want %v", c.expected, c.got, got, c.want)
 		}
+	}
+}
+
+// TestHandleNotify_SubscribeEventSilentAck 订阅消息系列事件（数据回调 URL 与发货事件共用）：
+// 固定成功签收、不进入发货解析、不产生 payment_notify_business_rejected 资金告警。
+func TestHandleNotify_SubscribeEventSilentAck(t *testing.T) {
+	for _, evt := range []string{"subscribe_msg_popup_event", "subscribe_msg_change_event", "subscribe_msg_sent_event"} {
+		mock, err := pgxmock.NewPool()
+		if err != nil {
+			t.Fatalf("new mock pool: %v", err)
+		}
+		payload := map[string]interface{}{
+			"event":                  evt,
+			"openid":                 "oENlX3TF45l_x0zqiO69Lj_9z_4A",
+			"SubscribeMsgPopupEvent": map[string]interface{}{},
+		}
+		h := newNotifyHandler(mock, &mockVIPService{})
+		if err := h.handleNotify(context.Background(), payload); err != nil {
+			t.Fatalf("%s: want silent ack (nil), got %v", evt, err)
+		}
+		// 静默签收路径不得触达数据库。
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("%s: unexpected DB calls: %v", evt, err)
+		}
+		mock.Close()
+	}
+}
+
+// TestHandleNotify_UnsupportedEvent 未知事件（含带完整发货字段者）仍业务拒绝，
+// 保留 payment_notify_business_rejected 告警语义。
+func TestHandleNotify_UnsupportedEvent(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	payload := notifyPayload("OT-1001", "WX-1001", 100)
+	payload["event"] = "xpay_some_future_event"
+	h := newNotifyHandler(mock, &mockVIPService{})
+	err = h.handleNotify(context.Background(), payload)
+	if !errors.Is(err, errNotifyRejected) {
+		t.Fatalf("want errNotifyRejected for unsupported event, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// errReader 模拟网络层读失败（连接截断）的请求 body。
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("simulated connection reset") }
+
+// TestNotify_ReadBodyFailureRetries（FR-3 / VP-9-AC2b）：读失败必须返回 500 + ErrCode:-1
+// 触发微信补发——固定成功会让微信停止重试，已扣款订单静默滞留 pending。
+func TestNotify_ReadBodyFailureRetries(t *testing.T) {
+	h := newNotifyHandler(nil, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/prod/payment/virtualPayNotify", errReader{})
+	h.Notify(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("read body failure: want 500, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"ErrCode":-1`) {
+		t.Fatalf("read body failure: want ErrCode:-1, got %s", rec.Body.String())
+	}
+}
+
+// TestNotify_BodyTooLargeFixedSuccess（FR-3 / VP-9-AC2a）：超限属垃圾/攻击输入，
+// 终止重试（固定成功 JSON）。
+func TestNotify_BodyTooLargeFixedSuccess(t *testing.T) {
+	h := newNotifyHandler(nil, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/prod/payment/virtualPayNotify",
+		bytes.NewReader(make([]byte, 64*1024+1)))
+	h.Notify(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("body too large: want 200, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"ErrCode":0`) {
+		t.Fatalf("body too large: want fixed success, got %s", rec.Body.String())
 	}
 }

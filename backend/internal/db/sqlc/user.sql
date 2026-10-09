@@ -30,22 +30,24 @@ UPDATE users SET unionid = $2, updated_at = now() WHERE id = $1;
 -- name: UpdateUserAvatar :exec
 UPDATE users SET avatar = $2, avatar_file_id = $3, updated_at = now() WHERE id = $1;
 
+-- name: UpdateUserAvatarIfEmpty :execrows
+-- 仅当 avatar 仍为空时写入：注册后异步默认头像回写不覆盖登录链路已写入的微信头像（02a A-9）。
+UPDATE users SET avatar = $2, avatar_file_id = $3, updated_at = now()
+WHERE id = $1 AND (avatar IS NULL OR avatar = '');
+
 -- name: UpdateUserNickname :exec
 UPDATE users SET nickname = $2, updated_at = now() WHERE id = $1;
 
--- name: UpdateUserPhone :exec
-UPDATE users SET phone_number = $2, phone_bind_time = $3, updated_at = now() WHERE id = $1;
-
 -- name: BindUserPhoneIfAllowed :execrows
 -- A-FIX-03：绑定手机号的原子日限——仅当 phone_bind_time 为空或不在今天（上海时区）时写入，
--- 避免「检查-再更新」竞态下并发绑定绕过日限、反复消耗微信认证额度。解绑走 UpdateUserPhone 不受此限。
+-- 避免「检查-再更新」竞态下并发绑定绕过日限、反复消耗微信认证额度。
 UPDATE users
 SET phone_number = $2, phone_bind_time = $3, updated_at = now()
 WHERE id = $1
   AND (phone_bind_time IS NULL OR (phone_bind_time AT TIME ZONE 'Asia/Shanghai')::date <> sqlc.arg(today)::date);
 
 -- name: UpdateUserInvitedBy :execrows
--- 仅当尚无邀请人时写入（登录后补绑场景的幂等闸门，R4）。
+-- 仅当尚无邀请人时写入（登录后补绑场景的幂等闸门）。
 UPDATE users SET invited_by = $2, updated_at = now() WHERE id = $1 AND (invited_by IS NULL OR invited_by = '');
 
 -- name: UpdateUserCurrentFamily :exec
@@ -97,7 +99,7 @@ DELETE FROM users WHERE id = $1;
 SELECT image_storage_bytes FROM users WHERE id = $1;
 
 -- name: IncrementUserImageStorage :execrows
--- B5-12：条件原子扣减——超限时更新 0 行，由调用方识别拒绝，杜绝 check-then-act 竞态。
+-- 条件原子扣减——超限时更新 0 行，由调用方识别拒绝，杜绝 check-then-act 竞态。
 UPDATE users
 SET image_storage_bytes = image_storage_bytes + $2,
     updated_at = now()

@@ -7,7 +7,7 @@ import { logger } from './utils/logger';
 import { flushOpsLog } from './utils/opslog';
 import { themeManager } from './utils/theme';
 import { i18n } from './utils/i18n';
-import { setPendingInviter } from './utils/storage';
+import { getLoggedOut, setPendingInviter } from './utils/storage';
 
 const t = (key: string) => i18n.t(key);
 
@@ -18,6 +18,10 @@ App<IAppOption>({
     _lastAutoRecordRestoreTime: 0,
   },
   onLaunch(options?: WechatMiniprogram.App.LaunchShowOption) {
+    // 多端 App（Donut）环境标记：wx.miniapp 仅 App 运行时注入（各页面按此隐藏/替换
+    // 微信 open-type 能力：getPhoneNumber/chooseAvatar/share 等）。
+    (this as any).globalData.isAppEnv = !!(wx as any).miniapp;
+
     const systemInfo = getSystemInfo();
     (this as any).globalData._systemInfo = systemInfo;
     (this as any).globalData.theme = systemInfo.theme || 'light';
@@ -58,7 +62,10 @@ App<IAppOption>({
         })
         .catch((err: any) => {
           logger.warn('启动登录或恢复自动记录失败', err);
-          // 登录失败（网络抖动/后端瞬时不可用）时也要尝试恢复自动记录：
+          // 登录失败（微信授权失败/被拒、网络抖动、后端瞬时不可用）时跳转登录页，
+          // 由用户手动重试（微信一键登录；多端 App 经官方授权页拉起）。
+          (this as any)._redirectToLogin();
+          // 登录失败时也要尝试恢复自动记录：
           // tryRestoreAutoRecord 内部会按需触发登录与退避重试，避免登录失败
           // 直接阻断自动记录恢复，导致用户打开小程序后功能静默停摆。
           tryRestoreAutoRecord().catch(() => {});
@@ -68,19 +75,40 @@ App<IAppOption>({
     const inviter = options?.query?.inviter;
     const scene = options?.query?.scene;
 
+    // 主动退出/注销停留标记：启动不再静默登录——否则 onLaunch 登录会清掉停留标记
+    // 重建会话，注销场景更会静默注册新账号，"停留登录页"活不过一次冷启动。
+    // inviter/scene 照常解析入 storage，后续在登录页手动登录仍会带上邀请归属。
+    const loggedOut = getLoggedOut();
+    const startLogin = () => {
+      if (!loggedOut) doLogin();
+    };
+
     if (inviter) {
       setPendingInviter(inviter);
-      doLogin();
+      startLogin();
     } else if (scene) {
-      this._resolveSceneAndLogin(scene, doLogin);
+      this._resolveSceneAndLogin(scene, startLogin);
     } else {
-      doLogin();
+      startLogin();
     }
 
     this.checkForUpdate();
 
     // OPS-LOG：打开小程序时上报本地记录的操作日志（失败保留，下次再报）
     flushOpsLog().catch(() => {});
+  },
+
+  _redirectToLogin() {
+    try {
+      const pages = getCurrentPages();
+      const current = pages.length > 0 ? pages[pages.length - 1] : null;
+      if (current && current.route === 'pages/Login/Login') return;
+      wx.redirectTo({ url: '/pages/Login/Login' });
+    } catch (e) {
+      // 启动极早期页面栈尚未建立时 redirectTo 会抛错，吞掉即可：
+      // 未登录的兜底恢复由 onShow 的 tryRestoreAutoRecord 退避重试。
+      logger.warn('跳转登录页失败', e);
+    }
   },
 
   _resolveSceneAndLogin(sceneValue: string, doLogin: () => void) {

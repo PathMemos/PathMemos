@@ -67,7 +67,7 @@ func aesKeyFromEncodingAESKey(key string) ([]byte, error) {
 
 // wechatPadBlockSize 微信消息加解密使用的填充对齐长度。
 // 腾讯官方加解密实现按 32 字节对齐填充（并非 AES 块大小的 16）；
-// 按 16 对齐生成的密文微信服务器无法解密（2026-08-15 线上踩坑）。
+// 按 16 对齐生成的密文微信服务器无法解密（线上踩坑）。
 const wechatPadBlockSize = 32
 
 // pkcs7Pad pads data to a multiple of blockSize using PKCS7.
@@ -133,7 +133,7 @@ func EncryptReplyXML(toUserName, plainXML, appID, encodingAESKey, token, timesta
 </xml>`, cipherText, signature, timestamp, nonce), nil
 }
 
-// 签名校验与解密已统一收敛到 wechatcrypto 包（C3/B6b-09）：
+// 签名校验与解密已统一收敛到 wechatcrypto 包：
 // CheckSignature -> wechatcrypto.CheckSignature
 // CheckEncryptedSignature -> wechatcrypto.CheckEncryptedSignature
 // DecryptMsg -> wechatcrypto.DecryptMsg

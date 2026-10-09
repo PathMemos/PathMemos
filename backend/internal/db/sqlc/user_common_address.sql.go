@@ -169,7 +169,7 @@ type ListLatestCoordinatesByAddressesRow struct {
 	Lon  pgtype.Numeric `json:"lon"`
 }
 
-// B2-12：按地址批量取最新坐标（DISTINCT ON），替代循环内逐条 N+1 查询。
+// 按地址批量取最新坐标（DISTINCT ON），避免循环内逐条 N+1 查询。
 func (q *Queries) ListLatestCoordinatesByAddresses(ctx context.Context, arg ListLatestCoordinatesByAddressesParams) ([]ListLatestCoordinatesByAddressesRow, error) {
 	rows, err := q.db.Query(ctx, listLatestCoordinatesByAddresses, arg.CreatedBy, arg.Column2)
 	if err != nil {
@@ -327,7 +327,7 @@ type MergeUserCommonAddressParams struct {
 	Name_2 string `json:"name2"`
 }
 
-// B2-09：upsert 目标行（源行坐标/计数随 INSERT 带入），目标行不存在时计数不再静默丢失；
+// upsert 目标行（源行坐标/计数随 INSERT 带入），目标行不存在时计数不静默丢失；
 // ON CONFLICT 保证并发合并计数不丢。源行删除由 DeleteUserCommonAddressByName 在调用方事务内完成
 // （H2：sqlc 会静默丢弃同一 named 块中的第二条语句，不可合并写在这里）。
 func (q *Queries) MergeUserCommonAddress(ctx context.Context, arg MergeUserCommonAddressParams) error {

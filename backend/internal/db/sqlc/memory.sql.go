@@ -11,22 +11,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const countMemoriesByUserAndDate = `-- name: CountMemoriesByUserAndDate :one
-SELECT COUNT(*) FROM memories WHERE user_id = $1 AND record_date = $2::date
-`
-
-type CountMemoriesByUserAndDateParams struct {
-	UserID  string      `json:"userId"`
-	Column2 pgtype.Date `json:"column2"`
-}
-
-func (q *Queries) CountMemoriesByUserAndDate(ctx context.Context, arg CountMemoriesByUserAndDateParams) (int64, error) {
-	row := q.db.QueryRow(ctx, countMemoriesByUserAndDate, arg.UserID, arg.Column2)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
 const createMemory = `-- name: CreateMemory :one
 INSERT INTO memories (id, user_id, record_time, record_date, title, content, created_at)
 VALUES ($1, $2, $3, $4, $5, $6, now())
@@ -237,7 +221,7 @@ type UpdateMemoryParams struct {
 	UserID     string             `json:"userId"`
 }
 
-// B2-08：参数按使用顺序连续编号，避免 $6 跳跃误导。
+// 参数按使用顺序连续编号，避免 $6 跳跃误导。
 func (q *Queries) UpdateMemory(ctx context.Context, arg UpdateMemoryParams) (Memory, error) {
 	row := q.db.QueryRow(ctx, updateMemory,
 		arg.Title,

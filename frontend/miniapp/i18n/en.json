@@ -1,0 +1,11 @@
+{
+  "ios": {
+    "name": "PathMemo"
+  },
+  "android": {
+    "name": "PathMemo"
+  },
+  "common": {
+    "name": "PathMemo"
+  }
+}

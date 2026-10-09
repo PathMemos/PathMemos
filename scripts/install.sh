@@ -186,6 +186,11 @@ get_mem_gb() {
 }
 
 create_swap_if_needed() {
+  # 仅 Linux 有 /proc/meminfo 与 mkswap/swapon；macOS 跳过（内存由 Docker Desktop 管理），
+  # 否则 get_mem_gb 读不到 /proc/meminfo 会在 set -e 下中止，挡住后面给 macOS 的专门指引。
+  if [[ "$(detect_os)" != "linux" ]]; then
+    return 0
+  fi
   local mem_gb swap_gb needed_swap target_swap swapfile avail_gb
   mem_gb=$(get_mem_gb "MemTotal")
   swap_gb=$(get_mem_gb "SwapTotal")

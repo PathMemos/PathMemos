@@ -50,7 +50,7 @@ func NewRequestID() string {
 func requestID(r *http.Request) string {
 	rid := RequestID(r.Context())
 	if rid == "" {
-		// B6a-07：优先复用客户端传入的 X-Request-ID，否则生成一次并注入 ctx，
+		// 优先复用客户端传入的 X-Request-ID，否则生成一次并注入 ctx，
 		// 保证同一请求内多次取用稳定（避免每次生成新 UUID）。
 		rid = util.SanitizeRequestID(r.Header.Get("X-Request-ID"))
 		if rid == "" {

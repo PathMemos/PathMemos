@@ -10,12 +10,12 @@ import (
 
 const outTradeNoAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
-func GenerateOutTradeNo(userID, vipID string) (string, error) {
-	// out_trade_no 长度上限为 32。在明文回调模式下，订单号的不可预测性是
-	// 防"伪造首次发货通知"的关键安全边界（P030），因此最大化随机部分。
-	// userID/vipID 仅用于日志/调试，不参与订单号构造。
-	_ = userID
-	_ = vipID
+// GenerateOutTradeNo 生成 32 位随机订单号。不携带 userID/vipID 语义（曾以弃用参数
+// 暗示「仅日志用途」，实为误导性签名，已清理）；归属关系由 orders 行自身的
+// user_id/vip_id 列承载。
+func GenerateOutTradeNo() (string, error) {
+	// 随机不可预测性保留纵深防御价值（回声/撞单探测面），
+	// 当前防伪主边界为安全模式验签解密 + DB 幂等（02e D2/D3）。
 	return randomString(32)
 }
 
@@ -25,6 +25,9 @@ func randomString(n int) (string, error) {
 		return "", fmt.Errorf("random read: %w", err)
 	}
 	for i := range b {
+		// %62 取字符存在轻微模偏差（256%62=8，前 8 个字母概率高约 3%）：对 32 位
+		// 随机串的不可预测性/唯一性（~190 bit 熵 + out_trade_no 唯一约束兜底）影响
+		// 可忽略，为有意取舍（02e D4），不引入拒绝采样复杂度。
 		b[i] = outTradeNoAlphabet[int(b[i])%len(outTradeNoAlphabet)]
 	}
 	return string(b), nil

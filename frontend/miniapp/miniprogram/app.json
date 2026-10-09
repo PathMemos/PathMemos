@@ -6,6 +6,7 @@
     "pages/Set/Set",
     "pages/CommonAddresses/CommonAddresses",
     "pages/Guide/Guide",
+    "pages/Login/Login",
     "pages/Invite/Invite",
     "pages/Family/Family"
   ],
@@ -29,7 +30,9 @@
     "startLocationUpdate",
     "startLocationUpdateBackground"
   ],
-  "requiredBackgroundModes": ["location"],
+  "requiredBackgroundModes": [
+    "location"
+  ],
   "permission": {
     "scope.userLocation": {
       "desc": "用于记录日记位置"
@@ -46,7 +49,15 @@
   "darkmode": true,
   "themeLocation": "theme.json",
   "style": "v2",
-  "componentFramework": "exparser",
+  "componentFramework": "glass-easel",
   "sitemapLocation": "sitemap.json",
-  "lazyCodeLoading": "requiredComponents"
+  "lazyCodeLoading": "requiredComponents",
+  "preloadRule": {
+    "pages/index/index": {
+      "network": "all",
+      "packages": [
+        "pages/sub"
+      ]
+    }
+  }
 }

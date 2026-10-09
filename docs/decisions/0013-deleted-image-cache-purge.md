@@ -14,4 +14,4 @@
 
 ## 落地状态
 
-**已实现**：`internal/purge` 队列 + CDN 刷新客户端、`Storage.DeleteFile` 删除钩子、后台任务 `purge_deleted_objects`（默认 24h，单轮 ≤1 万 URL，失败整批回退）。开关 `CDN_REFRESH_ENABLED`（默认关闭）；未配置/未开启时行为与实现前一致（删除仍即时生效于源站，边缘缓存靠 TTL 自然过期）。残余边界：客户端本地已缓存的副本无法服务端强制失效。
+**已实现**：`internal/purge` 队列 + CDN 刷新客户端、`Storage.DeleteFile` 删除钩子、后台任务 `purge_deleted_objects`（默认 24h，单轮 ≤1 万 URL，失败整批回退）。开关 `CDN_REFRESH_ENABLED`（默认关闭）。**修订（2026-09）**：SaaS 生产图片为 OSS 直连（`OSS_PUBLIC_URL` 指向 aliyuncs.com 原生域，无 CDN 边缘层，pro 域名 DNS-only 无 CF 代理），对象删除即源站 404、「immutable 一年边缘可达」的前提不存在——本机制仅对**接了 CDN 的部署形态**（私有部署可选）有意义，SaaS 无需开启。残余边界（任何形态都存在）：客户端本地已缓存的副本无法服务端强制失效。

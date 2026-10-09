@@ -3,5 +3,6 @@
     "navigation-bar": "/components/navigation-bar/navigation-bar",
     "ConfirmDialog": "/components/ConfirmDialog/ConfirmDialog"
   },
+  "renderer": "webview",
   "navigationBarTitleText": "API 对接"
 }

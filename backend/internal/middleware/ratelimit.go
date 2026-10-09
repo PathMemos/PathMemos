@@ -73,8 +73,8 @@ func (l *slidingWindowLimiter) allow(key string) bool {
 }
 
 func (l *slidingWindowLimiter) evictBuckets(cutoff time.Time) {
-	// R2-03：单次遍历完成淘汰——删除全部过期/空桶并顺带记录最久未活跃桶；
-	// 仍超限时仅删该一个最旧桶。避免原先最坏 O(100×N) 的内层全表扫描。
+	// 单次遍历完成淘汰——删除全部过期/空桶并顺带记录最久未活跃桶；
+	// 仍超限时仅删该一个最旧桶。单次遍历完成淘汰，最坏 O(N)。
 	var oldestKey string
 	var oldestTime time.Time
 	first := true
@@ -104,7 +104,7 @@ type IPRateLimiter struct {
 func NewIPRateLimiter(limit int, window time.Duration, trustedProxies ...string) *IPRateLimiter {
 	parsed, invalid := parseTrustedProxies(trustedProxies)
 	if len(invalid) > 0 {
-		// R2-L11：非法 CIDR 显式告警，避免配置错误时静默退化为直接信任 RemoteAddr。
+		// 非法 CIDR 显式告警，避免配置错误时静默退化为直接信任 RemoteAddr。
 		slog.Warn("ip rate limiter: invalid trusted proxy cidr ignored", slog.Any("invalid", invalid))
 	}
 

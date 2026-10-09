@@ -80,14 +80,16 @@ func NewHandlerWithBackgroundPool(pool *db.Pool, bgPool *db.Pool, rdb *redis.Cli
 
 func (h *Handler) RegisterPublic(router chi.Router) {
 	router.Post("/auth/login", h.Login)
+	router.Post("/auth/login/app", h.LoginApp)
 }
 
 func (h *Handler) RegisterProtected(router chi.Router) {
 	router.Post("/auth/logout", h.Logout)
 	router.Get("/auth/phone", h.GetPhone)
-	router.Post("/auth/phone/unbind", h.UnbindPhone)
 	router.Post("/auth/inviter", h.BindInviter)
 	// POST /auth/phone/bind 由 main.go 单独注册（含 IP 限流，A-FIX-04）；DELETE /auth/account 同理。
+	// 手机号解绑端点已移除：产品规则「手机号只可更换不可解除」，前端无入口，
+	// 保留只会多一个可被任意会话持有者直调的解绑面（02a A-4）。
 }
 
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
@@ -117,6 +119,16 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 空 openid 守卫(与 LoginApp 对齐):jscode2session 正常返回但 openid 为空是异常
+	// 响应——users.open_id 为 NOT NULL+UNIQUE,放行会以空串占位建出"共享账号",
+	// 后续同类异常响应的主体会全部命中该行;邀请奖励的 openid 墓碑防重对空串也失效。
+	if session.OpenID == "" {
+		slog.ErrorContext(ctx, "wechat jscode2session missing openid",
+			slog.String("code", util.MaskID(req.Code)))
+		middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "wechat login failed")
+		return
+	}
+
 	user, isNew, err := h.findOrCreateUser(ctx, session, req.Inviter)
 	if err != nil {
 		slog.ErrorContext(ctx, "login findOrCreateUser failed", slog.Any("error", err))
@@ -142,15 +154,117 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	mpSubscribed := h.getMPSubscribed(ctx, user.ID)
+	userInfo := userinfo.Build(ctx, user, h.vipService, h.defaultAvatar, mpSubscribed)
+	middleware.JSON(w, r, http.StatusOK, map[string]interface{}{
+		"sessionId": sessionID,
+		"newUser":   isNew,
+		"userInfo":  userInfo,
+	})
+}
+
+// getMPSubscribed 查询用户公众号关注状态；无绑定记录是正常情况静默降级，
+// 仅真实 DB 故障才告警，避免每次登录都刷 WARN（与 user.GetProfile 口径一致）。
+func (h *Handler) getMPSubscribed(ctx context.Context, userID string) bool {
 	mpSubscribed := false
-	mpAccount, accErr := h.pool.Queries().GetWxMPAccountByUserID(ctx, pgtype.Text{String: user.ID, Valid: true})
+	mpAccount, accErr := h.pool.Queries().GetWxMPAccountByUserID(ctx, pgtype.Text{String: userID, Valid: true})
 	if accErr == nil {
 		mpSubscribed = mpAccount.Subscribed
 	} else if !stderrors.Is(accErr, pgx.ErrNoRows) {
-		// 无公众号绑定记录（ErrNoRows）是正常情况，静默降级；仅真实 DB 故障才告警，
-		// 避免每次登录都刷 WARN（与 user.GetProfile 口径一致）。
-		slog.WarnContext(ctx, "get wx mp account failed, mpSubscribed defaults to false", slog.String("user_id", user.ID), slog.Any("error", accErr))
+		slog.WarnContext(ctx, "get wx mp account failed, mpSubscribed defaults to false", slog.String("user_id", userID), slog.Any("error", accErr))
 	}
+	return mpSubscribed
+}
+
+// LoginApp 多端应用（Donut App）微信登录：客户端 wx.weixinAppLogin 拉起微信授权，
+// 服务端用多端应用凭据调 donut/code2verifyinfo 换取用户标识（openid/unionid/资料），
+// 按 unionid 打通小程序账号体系。
+func (h *Handler) LoginApp(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	var req struct {
+		Code    string `json:"code"`
+		Inviter string `json:"inviter"`
+	}
+	if err := middleware.ReadJSONBody(w, r, &req, 4096); err != nil {
+		middleware.JSONBodyError(w, r, err)
+		return
+	}
+	if req.Code == "" {
+		middleware.JSONError(w, r, http.StatusBadRequest, errors.CodeBadRequest, "code is required")
+		return
+	}
+
+	identity, err := h.wechat.DonutCode2VerifyInfo(ctx, req.Code)
+	if err != nil {
+		slog.ErrorContext(ctx, "donut code2verifyinfo failed", slog.Any("error", err))
+		if stderrors.Is(err, ErrWechatInvalidCode) {
+			middleware.JSONError(w, r, http.StatusBadRequest, errors.CodeBadRequest, "invalid wechat code")
+		} else {
+			middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "wechat login failed")
+		}
+		return
+	}
+	if identity.OpenID == "" || identity.UnionID == "" {
+		// 无 unionid 说明多端应用与小程序不在同一开放平台账号下，账号无法打通；
+		// 放行会为每次登录建出新账号，必须显式失败暴露配置问题。
+		// 无 openid 同样拒绝：findOrCreateUser 会以 open_id='' 建号，users.open_id 唯一索引
+		// 被空串占位后，后续同类异常响应的主体会命中该行造成账号混淆。
+		slog.ErrorContext(ctx, "donut login missing identity",
+			slog.String("app_openid", util.MaskID(identity.OpenID)),
+			slog.String("unionid", util.MaskID(identity.UnionID)))
+		middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "wechat app login unavailable")
+		return
+	}
+
+	session := &WechatSession{OpenID: identity.OpenID, UnionID: identity.UnionID}
+	user, isNew, err := h.findOrCreateUser(ctx, session, req.Inviter)
+	if err != nil {
+		slog.ErrorContext(ctx, "app login findOrCreateUser failed", slog.Any("error", err))
+		middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "login failed")
+		return
+	}
+
+	// 新用户用微信资料兜底昵称/头像；老用户不覆盖已有资料（update 均为尽力而为）。
+	if isNew && (identity.Nickname != "" || identity.HeadImgURL != "") {
+		if identity.Nickname != "" && (!user.Nickname.Valid || user.Nickname.String == "") {
+			if err := h.pool.Queries().UpdateUserNickname(ctx, sqlc.UpdateUserNicknameParams{
+				ID:       user.ID,
+				Nickname: toNullText(identity.Nickname),
+			}); err != nil {
+				slog.WarnContext(ctx, "prefill nickname from donut userinfo failed", slog.String("user_id", user.ID), slog.Any("error", err))
+			}
+		}
+		if identity.HeadImgURL != "" && !user.Avatar.Valid {
+			if err := h.pool.Queries().UpdateUserAvatar(ctx, sqlc.UpdateUserAvatarParams{
+				ID:     user.ID,
+				Avatar: toNullText(identity.HeadImgURL),
+			}); err != nil {
+				slog.WarnContext(ctx, "prefill avatar from donut userinfo failed", slog.String("user_id", user.ID), slog.Any("error", err))
+			}
+		}
+		if refreshed, refErr := h.pool.Queries().GetUserByID(ctx, user.ID); refErr == nil {
+			user = &refreshed
+		}
+	}
+
+	if identity.UnionID != "" {
+		if linkErr := h.pool.Queries().LinkWxMPAccountByUnionID(ctx, sqlc.LinkWxMPAccountByUnionIDParams{
+			Unionid: toNullText(identity.UnionID),
+			UserID:  toNullText(user.ID),
+		}); linkErr != nil {
+			slog.WarnContext(ctx, "link wx mp account by unionid failed", slog.String("user_id", user.ID), slog.Any("error", linkErr))
+		}
+	}
+
+	sessionID, err := h.sessions.Create(ctx, user.ID)
+	if err != nil {
+		slog.ErrorContext(ctx, "failed to create session", slog.Any("error", err))
+		middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "failed to create session")
+		return
+	}
+
+	mpSubscribed := h.getMPSubscribed(ctx, user.ID)
 	userInfo := userinfo.Build(ctx, user, h.vipService, h.defaultAvatar, mpSubscribed)
 	middleware.JSON(w, r, http.StatusOK, map[string]interface{}{
 		"sessionId": sessionID,
@@ -189,8 +303,8 @@ func (h *Handler) GetPhone(w http.ResponseWriter, r *http.Request) {
 		phone = nil
 	}
 
-	// 与后端 BindPhone 的 phoneModificationLockedToday 对齐：只要当天绑定过（无论当前是否已解绑），
-	// 当天都不可再绑定，避免客户端显示可改、服务端却拒绝。
+	// 与后端 BindPhone 的 phoneModificationLockedToday 对齐：只要当天绑定过，
+	// 当天就不可再绑定（更换=再绑定，受同一日限），避免客户端显示可改、服务端却拒绝。
 	canModifyToday := true
 	if user.PhoneBindTime.Valid {
 		bindDate := user.PhoneBindTime.Time.In(timeutil.Shanghai).Format("2006-01-02")
@@ -205,7 +319,7 @@ func (h *Handler) GetPhone(w http.ResponseWriter, r *http.Request) {
 }
 
 // phoneModificationLockedToday 判断用户今天是否已绑定过手机号：
-// 服务端日限（B1-10），与客户端 canModifyToday 语义一致，防止绕过客户端限制频繁调用微信接口。
+// 服务端日限，与客户端 canModifyToday 语义一致，防止绕过客户端限制频繁调用微信接口。
 func phoneModificationLockedToday(user sqlc.GetUserByIDRow) bool {
 	if !user.PhoneBindTime.Valid {
 		return false
@@ -234,6 +348,10 @@ func (h *Handler) BindPhone(w http.ResponseWriter, r *http.Request) {
 	}
 	if phoneModificationLockedToday(user) {
 		middleware.JSONError(w, r, http.StatusBadRequest, errors.CodeBadRequest, "phone can only be modified once per day")
+		return
+	}
+	if req.Code == "" {
+		middleware.JSONError(w, r, http.StatusBadRequest, errors.CodeBadRequest, "code is required")
 		return
 	}
 
@@ -266,7 +384,7 @@ func (h *Handler) BindPhone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if rows == 0 {
-		// A-FIX-03：并发下其他请求已在本日完成绑定；以原子条件的受影响行数为权威判定。
+		// 并发下其他请求已在本日完成绑定；以原子条件的受影响行数为权威判定。
 		middleware.JSONError(w, r, http.StatusBadRequest, errors.CodeBadRequest, "phone can only be modified once per day")
 		return
 	}
@@ -274,49 +392,7 @@ func (h *Handler) BindPhone(w http.ResponseWriter, r *http.Request) {
 	middleware.JSON(w, r, http.StatusOK, map[string]interface{}{})
 }
 
-func (h *Handler) UnbindPhone(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	userID := middleware.UserID(ctx)
-
-	var req struct {
-		Code string `json:"code"`
-	}
-	if err := middleware.ReadJSONBody(w, r, &req, 4096); err != nil {
-		middleware.JSONBodyError(w, r, err)
-		return
-	}
-
-	// R4：解绑不再调用微信 GetPhoneNumber（每次 code 交换都会产生认证费用）。
-	// 安全边界：登录态持有者即账号所有者，解绑自己账号的手机号无需二次验证。
-	// 日限口径：绑定受「每天最多绑定一次」约束；解绑保留 PhoneBindTime（不清空），
-	// 否则「绑→解绑→当天再绑」可绕过日限并反复消耗微信手机号认证额度。
-	user, err := h.pool.Queries().GetUserByID(ctx, userID)
-	if err != nil {
-		slog.ErrorContext(ctx, "unbind phone get user failed", slog.String("user_id", userID), slog.Any("error", err))
-		middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "failed to get user")
-		return
-	}
-	if !user.PhoneNumber.Valid || user.PhoneNumber.String == "" {
-		middleware.JSONError(w, r, http.StatusBadRequest, errors.CodeBadRequest, "phone not bound")
-		return
-	}
-
-	if err := h.pool.Queries().UpdateUserPhone(ctx, sqlc.UpdateUserPhoneParams{
-		ID:          userID,
-		PhoneNumber: pgtype.Text{},
-		// 保留最后一次绑定时间：日限据此判定「当天是否绑定过」，解绑不清空。
-		PhoneBindTime: user.PhoneBindTime,
-	}); err != nil {
-		err = fmt.Errorf("unbind phone: %w", err)
-		slog.ErrorContext(ctx, "unbind phone failed", slog.String("user_id", userID), slog.Any("error", err))
-		middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "failed to unbind phone")
-		return
-	}
-
-	middleware.JSON(w, r, http.StatusOK, map[string]interface{}{})
-}
-
-// BindInviter 登录后补绑邀请人（R4）。
+// BindInviter 登录后补绑邀请人。
 // 极弱网下新用户可能在场景码解析完成前就完成登录，错过注册期绑定（index.ts 1.5s 竞态）；
 // 客户端在解析完成后调用本接口补绑。幂等约束：
 //   - 已有邀请人（invited_by 非空或存在 user_invites 记录）→ 幂等成功，不重复奖励；
@@ -486,12 +562,15 @@ func (h *Handler) findOrCreateUser(ctx context.Context, session *WechatSession, 
 	if session.UnionID != "" {
 		user, err := queries.GetUserByUnionID(ctx, toNullText(session.UnionID))
 		if err == nil {
-
-			if err := queries.UpdateUserSessionKey(ctx, sqlc.UpdateUserSessionKeyParams{
-				ID:         user.ID,
-				SessionKey: toNullText(session.SessionKey),
-			}); err != nil {
-				return nil, false, fmt.Errorf("update session key: %w", err)
+			// session_key 仅微信小程序登录链路提供（donut/code2verifyinfo 不返回）；
+			// 为空时跳过更新，避免用无效值覆盖。
+			if session.SessionKey != "" {
+				if err := queries.UpdateUserSessionKey(ctx, sqlc.UpdateUserSessionKeyParams{
+					ID:         user.ID,
+					SessionKey: toNullText(session.SessionKey),
+				}); err != nil {
+					return nil, false, fmt.Errorf("update session key: %w", err)
+				}
 			}
 			fullUser, err := queries.GetUserByID(ctx, user.ID)
 			if err != nil {
@@ -500,7 +579,7 @@ func (h *Handler) findOrCreateUser(ctx context.Context, session *WechatSession, 
 			return &fullUser, false, nil
 		}
 		if !stderrors.Is(err, pgx.ErrNoRows) {
-			// A-FIX-05：DB 抖动不能当作「无此用户」，否则会误建新账号。
+			// DB 抖动不能当作「无此用户」，否则会误建新账号。
 			return nil, false, fmt.Errorf("get user by union id: %w", err)
 		}
 	}
@@ -508,11 +587,15 @@ func (h *Handler) findOrCreateUser(ctx context.Context, session *WechatSession, 
 	user, err := queries.GetUserByOpenID(ctx, session.OpenID)
 	if err == nil {
 
-		if err := queries.UpdateUserSessionKey(ctx, sqlc.UpdateUserSessionKeyParams{
-			ID:         user.ID,
-			SessionKey: toNullText(session.SessionKey),
-		}); err != nil {
-			return nil, false, fmt.Errorf("update session key: %w", err)
+		// 与 unionid 分支 / 23505 竞态回退分支同款守卫：SessionKey 为空（多端应用链路恒空，
+		// 或微信异常响应）时跳过更新，不用空值覆盖存量 session_key（否则小程序侧支付签名失效）。
+		if session.SessionKey != "" {
+			if err := queries.UpdateUserSessionKey(ctx, sqlc.UpdateUserSessionKeyParams{
+				ID:         user.ID,
+				SessionKey: toNullText(session.SessionKey),
+			}); err != nil {
+				return nil, false, fmt.Errorf("update session key: %w", err)
+			}
 		}
 
 		if session.UnionID != "" && (!user.Unionid.Valid || user.Unionid.String == "") {
@@ -530,7 +613,7 @@ func (h *Handler) findOrCreateUser(ctx context.Context, session *WechatSession, 
 		return &fullUser, false, nil
 	}
 	if !stderrors.Is(err, pgx.ErrNoRows) {
-		// A-FIX-05：同上，真实 DB 错误向上返回 500。
+		// 同上，真实 DB 错误向上返回 500。
 		return nil, false, fmt.Errorf("get user by open id: %w", err)
 	}
 
@@ -614,11 +697,15 @@ func (h *Handler) findOrCreateUser(ctx context.Context, session *WechatSession, 
 				}
 			}
 			if existingID != "" {
-				if updateErr := queries.UpdateUserSessionKey(ctx, sqlc.UpdateUserSessionKeyParams{
-					ID:         existingID,
-					SessionKey: toNullText(session.SessionKey),
-				}); updateErr != nil {
-					return nil, false, fmt.Errorf("update session key after race: %w", updateErr)
+				// 多端应用链路 SessionKey 恒空：不得用空值覆盖存量 session_key
+				// （否则小程序侧支付签名在下次小程序重登前一直失败），与 unionid 分支同款守卫。
+				if session.SessionKey != "" {
+					if updateErr := queries.UpdateUserSessionKey(ctx, sqlc.UpdateUserSessionKeyParams{
+						ID:         existingID,
+						SessionKey: toNullText(session.SessionKey),
+					}); updateErr != nil {
+						return nil, false, fmt.Errorf("update session key after race: %w", updateErr)
+					}
 				}
 				if session.UnionID != "" {
 					if unionErr := queries.UpdateUserUnionID(ctx, sqlc.UpdateUserUnionIDParams{
@@ -657,11 +744,7 @@ func (h *Handler) findOrCreateUser(ctx context.Context, session *WechatSession, 
 				if h.bgPool != nil {
 					queries = h.bgPool.Queries()
 				}
-				if err := queries.UpdateUserAvatar(bgCtx, sqlc.UpdateUserAvatarParams{
-					ID:           userID,
-					Avatar:       pgtype.Text{String: avatarURL, Valid: true},
-					AvatarFileID: pgtype.Text{},
-				}); err != nil {
+				if err := h.writeDefaultAvatarIfEmpty(bgCtx, queries, userID, avatarURL); err != nil {
 					slog.ErrorContext(bgCtx, "update new user avatar failed", slog.String("user_id", userID), slog.Any("error", err))
 				}
 			})
@@ -671,7 +754,25 @@ func (h *Handler) findOrCreateUser(ctx context.Context, session *WechatSession, 
 	return &newUser, true, nil
 }
 
-// applyInviteRewardsWithTx 邀请奖励下发（R4 抽取）：注册期绑定与登录后补绑共用同一实现，
+// writeDefaultAvatarIfEmpty 条件回写默认头像：仅当 users.avatar 仍为空时写入。
+// 生成 marker 的异步回写与 LoginApp 同步预填的微信 headimgurl 并发，无条件覆盖会构成
+// last-writer-wins 竞态；条件更新使微信头像优先，受影响行数 0 即视为已被登录链路写入（02a A-9）。
+func (h *Handler) writeDefaultAvatarIfEmpty(ctx context.Context, q *sqlc.Queries, userID, avatarURL string) error {
+	rows, err := q.UpdateUserAvatarIfEmpty(ctx, sqlc.UpdateUserAvatarIfEmptyParams{
+		ID:           userID,
+		Avatar:       pgtype.Text{String: avatarURL, Valid: true},
+		AvatarFileID: pgtype.Text{},
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		slog.InfoContext(ctx, "default avatar write-back skipped, avatar already set", slog.String("user_id", userID))
+	}
+	return nil
+}
+
+// applyInviteRewardsWithTx 邀请奖励下发：注册期绑定与登录后补绑共用同一实现，
 // 保证两条路径的奖励逻辑永不漂移。inviterID 为空时不做任何事。
 func (h *Handler) applyInviteRewardsWithTx(ctx context.Context, q *sqlc.Queries, inviteeID, inviterID string) error {
 	if inviterID == "" {
@@ -685,11 +786,19 @@ func (h *Handler) applyInviteRewardsWithTx(ctx context.Context, q *sqlc.Queries,
 		}
 		return nil
 	}
+	// 幂等预检：绑定记录已存在（并发补绑/家庭加入已建行）时跳过——CreateUserInvite
+	// 会撞 user_id 唯一索引，而事务内语句出错即中止，"容忍后继续"不可行（25P02，
+	// 还会连带回滚已执行的 invited_by 补写）。预检把竞态窗口压缩到毫秒级。
+	if _, err := q.GetUserInviteByUserID(ctx, toNullText(inviteeID)); err == nil {
+		return nil
+	} else if !stderrors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("check invite record in tx: %w", err)
+	}
 	inviteID, err := util.NewUUID()
 	if err != nil {
 		return fmt.Errorf("generate invite id: %w", err)
 	}
-	// R-21：冗余被邀请人 openid——注销后邀请行保留（user_id 置 NULL），作为被邀请奖励终身一次的判定依据。
+	// 冗余被邀请人 openid——注销后邀请行保留（user_id 置 NULL），作为被邀请奖励终身一次的判定依据。
 	invitee, err := q.GetUserByID(ctx, inviteeID)
 	if err != nil {
 		return fmt.Errorf("get invitee user: %w", err)
@@ -704,18 +813,30 @@ func (h *Handler) applyInviteRewardsWithTx(ctx context.Context, q *sqlc.Queries,
 		InviterID:  toNullText(inviterID),
 		UserOpenID: inviteeOpenID,
 	}); err != nil {
-		return fmt.Errorf("create user invite: %w", err)
+		if !dbx.IsUniqueViolation(err) {
+			return fmt.Errorf("create user invite: %w", err)
+		}
+		// 与家庭加入奖励路径并发补绑时撞 user_id 唯一索引：对端事务已建行并发奖，本路径幂等跳过（BindInviter 返回成功而非 500）。
+		slog.InfoContext(ctx, "invite record created concurrently, skip rewards", slog.String("invitee_id", inviteeID))
+		return nil
 	}
 
-	// R-21：先标记后发奖——同一微信主体（openid）已终身领取过被邀请奖励时跳过 +3
-	//（部分唯一索引 uq_user_invites_user_open_id 在 DB 层兜底，I1/I11），不阻断注册/绑定主流程，
-	// inviter 侧奖励不受影响（月度 14 天封顶即天花板）。
+	// openid 曾领过被邀请奖励（墓碑行保留于 user_invites，迁移 000008/000011）则跳过全部奖励：
+	// +3/+7 均不发，邀请行照常创建且对邀请人可见。
+	rewarded, err := q.ExistsInviteeRewardByOpenID(ctx, inviteeOpenID)
+	if err != nil {
+		return fmt.Errorf("check invitee reward tombstone: %w", err)
+	}
+	if rewarded {
+		slog.InfoContext(ctx, "invite rewards skipped: openid already rewarded (re-registration)", slog.String("invitee_id", inviteeID))
+		return nil
+	}
+
+	// 先标记后发奖：上方墓碑预检已排除重注册身份，reward_invitee_at 只会在此处由 NULL 翻转一次；
+	// 并发双绑由行锁 + IS NULL 条件自然去重，唯一索引 uq_user_invites_user_open_id 仅作 DB 层兜底。
 	markRows, err := q.MarkInviteeRewarded(ctx, inviteID)
 	if err != nil {
-		if !dbx.IsUniqueViolation(err) {
-			return fmt.Errorf("mark invitee rewarded: %w", err)
-		}
-		slog.InfoContext(ctx, "invitee reward skipped: openid already rewarded", slog.String("invitee_id", inviteeID))
+		return fmt.Errorf("mark invitee rewarded: %w", err)
 	}
 	if markRows > 0 {
 		if err := h.vipService.ExtendVIPDaysWithTx(ctx, inviteeID, 3, q); err != nil {
@@ -768,20 +889,25 @@ func generateUserInviteCode() string {
 }
 
 func createOrGetUserInviteCode(ctx context.Context, q *sqlc.Queries, userID string) (string, error) {
-	shortCode := generateUserInviteCode()
-	if _, err := q.CreateUserInviteCode(ctx, sqlc.CreateUserInviteCodeParams{
-		UserID:    userID,
-		ShortCode: shortCode,
-	}); err != nil {
-		if dbx.IsUniqueViolation(err) {
-			// 并发或冲突时复用该用户已存在的短码，与二维码生成侧 ensureShortCode 保持一致。
-			if existing, getErr := q.GetUserInviteCode(ctx, userID); getErr == nil && existing != "" {
-				return existing, nil
+	for attempt := 0; attempt < 3; attempt++ {
+		shortCode := generateUserInviteCode()
+		if _, err := q.CreateUserInviteCode(ctx, sqlc.CreateUserInviteCodeParams{
+			UserID:    userID,
+			ShortCode: shortCode,
+		}); err != nil {
+			if dbx.IsUniqueViolation(err) {
+				// user_id 冲突（并发/重复注册）时复用该用户已存在的短码，与二维码生成侧 ensureShortCode 保持一致。
+				if existing, getErr := q.GetUserInviteCode(ctx, userID); getErr == nil && existing != "" {
+					return existing, nil
+				}
+				// short_code 全局撞码：换码重试（与 ensureShortCode 同型）。
+				continue
 			}
+			return "", fmt.Errorf("create user invite code: %w", err)
 		}
-		return "", fmt.Errorf("create user invite code: %w", err)
+		return shortCode, nil
 	}
-	return shortCode, nil
+	return "", fmt.Errorf("create user invite code: short code collision")
 }
 
 const inviteCodeChars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"

@@ -1,6 +1,6 @@
 # PP-02G 文件、头像与推送（L2）
 
-> 层级：L2 领域分册｜版本：V2.0｜状态：定稿（以当前代码为唯一事实源）
+> 层级：L2 领域分册｜版本：当前（以代码为唯一事实源）
 > 上游：PP-01 产品总览｜关联 ADR：ADR-0002（图片存储使用阿里云 OSS）、ADR-0013（已删除图片边缘缓存定期批量收敛）
 > 说明：本分册按当前代码实现整理；行内路径指向对应实现位置。
 
@@ -11,7 +11,7 @@
 - 本域边界：
   - 属于本域：文件上传/下载/删除、本地与 OSS 存储、图片存储配额、头像更新与 avatar marker 生成、孤儿文件清理、微信推送（异常告警/新地点提醒）、公众号回调与客服消息、access_token 缓存。
   - 不属于本域：日记条目与封面业务（PP-02B）、AI 对话引擎与配额（AI 分册）、VIP 判定（VIP 分册）、自动记录定位采集（自动记录分册）、家庭与邀请（家庭分册）。
-- 关键实现位置：backend/internal/file/handler.go、storage.go、oss.go、cleanup.go、errors.go；backend/internal/avatar/service.go；backend/internal/push/service.go、mp.go、mini.go、token.go、handler.go、common.go、models.go；backend/internal/wxmp/handler.go、client.go、crypto.go；backend/internal/db/sqlc/file.sql、user.sql、wx_mp_account.sql、auto_record.sql；backend/migrations/000001_baseline.up.sql。
+- 关键实现位置：backend/internal/file/handler.go、storage.go、oss.go、cleanup.go、errors.go；backend/internal/avatar/service.go；backend/internal/purge/purge.go、cdn.go；backend/internal/push/service.go、mp.go、mini.go、token.go、handler.go、common.go、models.go；backend/internal/wxmp/handler.go、client.go、crypto.go；backend/internal/db/sqlc/file.sql、user.sql、wx_mp_account.sql、auto_record.sql；backend/migrations/000001_baseline.up.sql。
 
 ## 2. 领域级架构决策
 
@@ -27,7 +27,7 @@
 | D8 | 微信 access_token 优先读 Redis（key wechat:mp:access_token:{appID}，TTL 110 分钟），未命中调 stable_token | 避免 token 失效竞态 | 无 |
 | D9 | 公众号加密模式使用 AES-256-CBC + PKCS7，**按 32 字节对齐填充**（非 AES 块大小 16） | 腾讯官方实现要求，按 16 对齐微信无法解密 | 无 |
 | D10 | 错误日志中脱敏 access_token（sanitizeTokenFromError / util.SanitizeURLError） | 防止密钥泄漏到日志 | 无 |
-| D11 | 物理文件删除一律在 DB 事务提交之后 | 避免 DB 回滚后文件已丢失 | 无 |
+| D11 | 物理文件删除一律在 DB 事务提交之后（例外：F-7 system 文件批量清理**先物理删除成功者、再 BatchDeleteFiles 删行**——行仍在即可下轮重试，顺序反转正是为了兜底） | 避免 DB 回滚后文件已丢失 | 无 |
 | D12 | 物理删除允许与 DB 删除异步：用户删除在事务提交后删物理文件（失败由孤儿清理兜底）；周期清理完成前，公开桶上的文件 URL 仍可访问 | 容忍清理窗口；不引入签名 URL / 图片鉴权（I8） | 无 |
 | D13 | **已删除图片的边缘缓存收敛（ADR-0013）**：OSS 写入带 `max-age=31536000, immutable`，物理删除后 URL 在 CDN/客户端缓存最长一年仍可命中——已删除图片必须最终不可达，采用**定期批量**缓存清理（purge）收敛，不做逐次同步清理、不改 immutable 写入策略 | 读性能与回源成本优先；接受有限收敛窗口 | ADR-0013 |
 
@@ -37,7 +37,7 @@
 
 作为用户，我在新增条目时上传照片。
 
-**时序**：POST /file/upload（multipart，字段名 files，受 session 保护 + 60 次/分钟/IP 限流（防海量小文件耗尽 files 行/inode），外层 http.TimeoutHandler 5 分钟）→ 预检查存储配额 → ContentLength>50MB 拒绝 → Content-Type 必须 multipart/form-data → MaxBytesReader(MaxTotalSize+1MB) → MultipartReader 逐 part：非 files 字段跳过；文件数 >9 拒绝（第 10 个 files part）；handleUploadPart 校验扩展名/Content-Type → 写临时文件并逐块计数（>10MB 拒绝）→ 总大小 >50MB 拒绝 → 本地 Save 或 OSS 上传 → db.WithTx：CreateFile + 条件 IncrementUserImageStorage（0 行 → 配额错误）→ 返回 {files:[{fileId,url}]}；任一 part 失败回滚本请求已提交的文件/配额。
+**时序**：POST /file/upload（multipart，字段名 files，受 session 保护 + 60 次/分钟/IP 限流（防海量小文件耗尽 files 行/inode），外层 http.TimeoutHandler 5 分钟）→ 预检查存储配额（`GetUserImageStorageUsage` 出错仅记日志放行——真超限由事务内条件 Increment 0 行兜底拒绝）→ ContentLength>50MB 拒绝 → Content-Type 必须 multipart/form-data → MaxBytesReader(MaxTotalSize+1MB) → MultipartReader 逐 part：非 files 字段跳过；文件数 >9 拒绝（第 10 个 files part）；handleUploadPart 校验扩展名/Content-Type → 写临时文件并逐块计数（>10MB 拒绝）→ 总大小 >50MB 拒绝 → 分支时序：**本地** Save（失败即清理）→ db.WithTx：CreateFile + 条件 IncrementUserImageStorage（0 行 → 配额错误）；**OSS** 先 db.WithTx（同上，配额超限不上传对象）→ SaveToOSSWithKey，上传失败内联回滚（删行 + 删对象 + 回退配额，best-effort；回滚在 `context.WithoutCancel` 下执行——客户端断开正是最需清理的场景，沿用已取消的请求 ctx 会让 DB/存储操作全失败而残留三态）→ 返回 {files:[{fileId,url}]}；任一 part 失败回滚本请求已提交的文件/配额。OSS 分支选「先入库后上传」的理由：两步间进程崩溃的残留是「DB 行 + 配额占用」，由 7 天孤儿清理事务版自愈；反序残留「无 DB 行的孤儿对象」不可被扫描、永不自愈且浪费上传。
 
 **AC**：
 - 扩展名不在 {.jpg,.jpeg,.png,.gif,.webp} 或 Content-Type 不以 image/ 开头 → HTTP 400 code=4000 + biz_code=INVALID_FILE_TYPE。
@@ -51,6 +51,7 @@
 - 普通用户上限 USER_IMAGE_STORAGE_LIMIT_BYTES（默认 1GiB），VIP 上限 USER_IMAGE_STORAGE_LIMIT_BYTES_VIP（默认 5GiB），配置为 0 表示不限制。
 - 上传前 checkStorageLimit：used >= limit 直接拒绝；limit<=0 跳过。
 - 实际扣减在事务内 IncrementUserImageStorage（条件更新）；删除文件、删除孤儿文件时 DecrementUserImageStorage（GREATEST 保底不为负）。
+- 配额上限（`storageLimitFor`）在请求进入时计算一次并贯穿整个请求，多 part 期间不重估——单请求总量上限 50MiB 即并发场景下的漂移上限，真实闸门为事务内条件 Increment（0 行拒绝），已知取舍。
 
 **AC**：并发上传使总量超过 limit 时，超出的请求返回 biz_code=USER_IMAGE_STORAGE_LIMIT_EXCEEDED；users.image_storage_bytes 永不为负。
 
@@ -58,7 +59,7 @@
 
 **时序**：GET /file/download/{fileId} → fileId 为空 400 → GetFileByID（不存在 404，DB 错误 500）→ system 文件：解析 metadata.family_id，当前用户 current_family_id 不匹配或缺失 → 403；非 system：CreatedBy 为空 → 403，非本人则查双方 current_family_id 是否相同，不同 → 403 → storage.URL 失败 → 500 → 返回 {url}。
 
-**AC**：跨家庭用户下载他人图片 → 403 code=4030；不存在 → 404 code=4040；URL 构造失败 → 500 code=5001。
+**AC**：跨家庭用户下载他人图片 → 403 code=4030；不存在 → 404 code=4040；URL 构造失败 → 500 code=5001（下载路径无可清理对象，不做回滚；「`context.WithoutCancel` 下删 files 行 + 删物理文件 + 回退配额」的同款内联回滚属于 **F-1 上传路径**的 URL 失败分支）。
 
 ### F-4 文件删除（引用计数）
 
@@ -86,25 +87,25 @@
 
 ### F-7 孤儿文件清理（后台）
 
-**时序**：runCleanupOrphanFiles（默认每 7 天）：先 ClearAvatarReferencesToOrphanFiles（清理 avatar_file_id 指向不存在文件的用户引用）→ 分页 ScanOrphanFiles（file_type=image、created_at 早于 1 天、无条目/头像/封面引用、id 游标，每批 1000）→ 逐条物理删除成功后删 DB 记录并扣减配额。runCleanupOrphanTrajMaps（默认每 7 天）：分页 ScanOldSystemFiles（file_type=system、created_at 与 updated_at 均早于 7 天、无封面引用、无 user_avatar_markers.marker_path 匹配）→ 先物理删除成功者再 BatchDeleteFiles。
+**时序**：runCleanupOrphanFiles（默认每 7 天）：先 ClearAvatarReferencesToOrphanFiles（清理 avatar_file_id 指向不存在文件的用户引用）→ 分页 ScanOrphanFiles（file_type=image、created_at 早于 7 天、无条目/头像/封面引用、id 游标，每批 1000）→ 逐条走事务版删除 file.DeletePhysicalIfUnreferenced：FOR UPDATE 行锁 + 引用复核，事务内删 files 行并回退配额（扣减失败整体回滚），物理删除在提交后 best-effort。runCleanupOrphanTrajMaps（默认每 7 天；任务名沿用历史，回收除邀请二维码/分享海报外的全部 system 文件——海报行 metadata 含 `raw` 键，`ScanOldSystemFiles` 以 `NOT COALESCE(metadata ? 'raw', false)` 豁免（已分发到微信会话的 URL 不得按 7 天窗口回收成 404），海报回收走重生成替换与注销清理两条替代路径，见 02d §8.3）：分页 ScanOldSystemFiles（file_type=system、created_at 与 updated_at 均早于 7 天、metadata 不含 `raw` 键、无封面引用、无 user_avatar_markers.marker_path 匹配）→ 先物理删除成功者再 BatchDeleteFiles。
 
-**AC**：被条目/封面/头像引用的文件不会被清理；物理删除失败保留 DB 记录待下轮重试。
+**AC**：被条目/封面/头像引用的文件不会被清理（删除前事务内引用复核）；DB 行删除与配额回退原子完成；物理文件删除为提交后 best-effort，失败仅记日志、由后台孤儿文件回收兜底，不重试 DB 记录。**兜底边界**：孤儿清理按 files 行扫描，故「行仍在」的场景均可被兜底——删除路径事务失败回滚保留行、注销路径 cleanup 失败漏删的 SET NULL 孤儿行（`files.created_by` FK 非 CASCADE，04 §3.6）都在 7 天扫描窗口内；唯一无自愈的残留是「行已删、提交后物理删除 best-effort 失败」的 OSS 对象（各删除路径共有，已接受存储损耗——行已删即无 URL 解析，无 API 解析面；物理删除失败时对象停留于曾公开 URL（残余暴露面，已接受风险同 02a A-8））。
 
 ### P-1 公众号服务器验证与回调入口
 
-**时序**：GET/POST /wx/callback（公开，WorkerAuth 豁免）→ GET：取 signature/timestamp/nonce/echostr，按 token 排序后 sha1 校验，通过 200 原样返回 echostr，失败 403 body fail；其他方法 405。POST：body 限制 64KB（超限/读失败/解析失败返回纯文本 success）；query 带 msg_signature 视为加密模式，校验 msg_signature（失败 403 fail），AES 解密并校验尾部 appID == WECHAT_MP_APPID（不符返回 success），否则用明文 signature 校验（失败 403 fail）；ToUserName 必须等于 WECHAT_MP_GHID，否则返回 success。
+**时序**：GET/POST /wx/callback（公开，WorkerAuth 豁免）→ GET：取 signature/timestamp/nonce/echostr，按 token 排序后 sha1 校验，通过 200 原样返回 echostr，失败 403 body fail；其他方法 405。POST：body 限制 64KB（超限/读失败/解析失败返回纯文本 success）；query 带 msg_signature 视为加密模式，校验 msg_signature（失败 403 fail），AES 解密并校验尾部 appID == WECHAT_MP_APPID（不符返回 success），明文模式收紧（与 payment 侧对齐）：`WECHAT_ENCODING_AES_KEY` 已配置即强制安全模式，明文推送一律 403 `fail`（`alert=wxmp_plaintext_rejected`——明文签名不绑定消息体，捕获一组合法签名三元组即可重放伪造）；未配置 AES Key 的明文部署（**仅限开源极简部署**——明文签名 `sha1(sort([token,timestamp,nonce]))` 不绑定消息体，±5 分钟窗口内捕获一组合法三元组即可携带任意 body 重放伪造）还需 timestamp ±5 分钟新鲜度校验（超窗 403 fail）后才做明文 signature 校验（失败 403 fail）；ToUserName 必须等于 `WECHAT_MP_GHID`（配置非空时），否则返回 success——未配置 GHID（开源/极简部署）时任意 ToUserName 放行。
 
-**AC**：签名错误 403 fail；body >64KB 返回 200 success；加密模式不会回退明文；ToUserName 不匹配返回 success。
+**AC**：签名错误 403 fail；body >64KB 返回 200 success；加密模式不会回退明文；AES Key 已配置时明文推送一律 403；无 AES Key 的明文部署超 ±5 分钟时间戳 403；ToUserName 不匹配返回 success。
 
 ### P-2 公众号消息处理与去重
 
-- 文本/语音且 MsgId 非空：Redis SETNX wxmp:msgid:{msgId} TTL 60s，重复则被动回复「正在思考，请稍候…」并结束（避免微信重试触发重复 AI）；TTL 到期后同一 MsgId 会被再次处理。Redis 错误时降级为继续处理（不丢消息）。
+- 文本/语音且 MsgId 非空：Redis SETNX wxmp:msgid:{msgId} TTL 300s（覆盖微信回调重试窗口），重复则被动回复「正在思考，请稍候…」并结束（避免重试触发重复 AI）；TTL 到期后同一 MsgId 会被再次处理。Redis 错误时降级为继续处理（不丢消息）。
 - event=subscribe：异步 resolveUser + 同步更新 wx_mp_accounts.subscribed=true + 异步发送小程序卡片，被动回复欢迎语；event=unsubscribe：subscribed=false，回复空。
 - 文本：**先立即被动回复「正在思考」占位**（满足微信 5s 窗口），后台 goroutine 内 resolveUser；失败 → 客服消息发「尚未登录…」+ 异步小程序卡片；成功 → 异步 AI。
 - 语音：Recognition 为空 → 回复语音识别失败提示；否则按文本处理。
 - 其他类型：回复「暂只支持文字和语音消息」。
 
-**AC**：同一 MsgId 在 60s 内重复投递不触发第二次 AI；Redis 不可用时消息仍被处理。
+**AC**：同一 MsgId 在 300s 内重复投递不触发第二次 AI；Redis 不可用时消息仍被处理。
 
 ### P-3 公众号 AI 客服消息
 
@@ -114,7 +115,7 @@
 
 ### P-4 异常告警推送（服务号 + 小程序）
 
-**时序**：后台 runAbnormalAlertCheck（默认每 5 分钟，时间窗口 8:00–22:00）→ 分页 ListAbnormalAlertCandidates（auto_record_enabled=true、VIP **严格有效** `expire_time > now()`、abnormal_alert_sent_at 为空或早于 1 小时前、last_active_at 为空或早于 60 分钟前）→ 对每个用户 SendAbnormalAlert：时间窗口校验 → 用户必须开启自动记录且是 VIP → 取 wx_mp_accounts（subscribed 且 mp_openid 非空=服务号可用；abnormal_subscribe_accepted 且 users.open_id 非空=小程序可用）→ 无可渠道直接返回 → MarkAbnormalAlertSent（原子，0 行=今日已发，跳过）→ 并发发送两条通道（30s 超时，safe.Go）→ handleMPError/handleMiniError 处理微信错误码。
+**时序**：后台 runAbnormalAlertCheck（默认每 5 分钟，时间窗口 8:00–22:00）→ 分页 ListAbnormalAlertCandidates（auto_record_enabled=true、VIP **严格有效** `expire_time > now()`、abnormal_alert_sent_at 为空或早于 1 小时前、last_active_at 为空或早于 60 分钟前、最后一条轨迹时间早于 60 分钟前、且 abnormal_subscribe_accepted 或服务号 subscribed 至少一项成立）→ 对每个用户 SendAbnormalAlert：时间窗口校验 → 用户必须开启自动记录且是 VIP → 取 wx_mp_accounts（subscribed 且 mp_openid 非空=服务号可用；abnormal_subscribe_accepted 且 users.open_id 非空=小程序可用）→ 无可渠道直接返回 → MarkAbnormalAlertSent（原子，0 行=今日已发，跳过）→ 并发发送两条通道（30s 超时，safe.Go）→ handleMPError/handleMiniError 处理微信错误码。
 
 **AC**：8:00 前/22:00 后不推送；非 VIP 不推送；当日已标记过不重复推送；标记成功但发送失败不回滚标记。
 
@@ -133,6 +134,8 @@
 **时序**：POST /subscribe/record body {templateId?, scene, accept}（≤4096 字节）→ scene 必须为 ABNORMAL_ALERT，否则 400 unsupported scene → RecordSubscribe 更新 users.abnormal_subscribe_accepted=accept → {}。userID 从 session 上下文取，不采信 body。
 
 **AC**：scene != ABNORMAL_ALERT → 400 code=4000；body >4096 → **413 code=4130**；成功写入 abnormal_subscribe_accepted。
+
+> **订阅状态单列**：`users.abnormal_subscribe_accepted` 承载异常告警订阅资格。App 端通知已裁撤，仅剩小程序一个订阅来源（服务号订阅为独立通道，见 wx_mp_accounts.subscribed），原「双端互踩」（任一端 43101 拒收关掉另一端资格）不再存在；微信 `43101` → 本列置 false（P-4 错误码处理 / 02c AR-11.5）即该用户小程序订阅额度耗尽的正常语义。
 
 ### P-7 access_token 与微信客户端
 
@@ -169,7 +172,7 @@
 | POST | /wx/callback | 公开（WorkerAuth 豁免） | 微信 XML（≤64KB） | 200 XML 被动回复或纯文本 success | 403 fail（签名/加密签名失败）；405 其他方法 |
 | POST | /ops/client-log | Session | {events[],device?,appVersion?}（≤64KB） | {} | 400 4000；413 4130；500 5001 |
 
-> `/ops/client-log`：事件最多 200 条；缺 `t`/`type` 或 `type` >128 字节的事件被静默丢弃；单条 `detail` >1024 字节或非法 JSON 时整体丢弃 `detail`（不截断保留）；过滤后为空不落库直接 200（`opslog/handler.go`，写 `client_ops_logs`）。
+> `/ops/client-log`：事件最多 200 条；`device` 缺省回退 `User-Agent`，`device`/`appVersion` 分别截 256/64 字节（UTF-8 边界净化）；缺 `t`/`type` 或 `type` >128 字节的事件被静默丢弃；单条 `detail` >1024 字节或非法 JSON 时整体丢弃 `detail`（不截断保留）；过滤后为空不落库直接 200（`opslog/handler.go`，写 `client_ops_logs`）。
 
 **模板消息与订阅消息模板 ID**（backend/internal/push/models.go）：
 
@@ -187,7 +190,7 @@
 - **上传阈值**：MaxFileSize=10MiB、MaxTotalSize=50MiB、MaxFiles=9、MaxNameLen=255 bytes（按 rune 边界截断）；MaxBytesReader=MaxTotalSize+1MiB；扩展名白名单 {.jpg,.jpeg,.png,.gif,.webp}，.jpeg 归一到 .jpg。
 - **配额阈值**：普通 1GiB、VIP 5GiB（环境变量覆盖）；0=不限制；Decrement 用 GREATEST 保底。
 - **头像阈值**：MaxAvatarDownloadSize=5MiB、MaxPixelDimension=4096、TrajectoryMarkerSize=75、TrajectoryMarkerBorder=2、GenerateMarkerTimeout=30s。
-- **推送阈值**：异常告警窗口 8:00–22:00、新地点 6:00–22:59；发送超时 30s；告警候选条件以 02c AR-11.1 为准（含最后轨迹时间、last_active 与订阅通道条件），告警去重 1 小时/自然日；客服消息单条 2000 字节；公众号 body 64KB；消息去重 TTL 60s；thumb 缓存 48h；资料刷新节流 1h；access_token 缓存 110 分钟；微信 API 响应读取 8KB。
+- **推送阈值**：异常告警窗口 8:00–22:00、新地点 6:00–22:59；发送超时 30s；告警候选条件以 02c AR-11.1 为准（含最后轨迹时间、last_active 与订阅通道条件），告警去重每自然日一次（候选重扫阈值 1h）；客服消息单条 2000 字节；公众号 body 64KB；消息去重 TTL 300s；thumb 缓存 48h；资料刷新节流 1h；access_token 缓存 110 分钟；微信 API 响应读取 8KB。
 - **事务/后台**：文件配额与记录同事务；物理删除在提交后；异步任务一律 safe.Go（panic 记录日志）。
 - **公众号加密**：EncodingAESKey 必须 43 字符（解码 32 字节）；PKCS7 按 32 字节对齐；被动回复附 MsgSignature；解密后校验 appID。
 - **幂等/去重**：异常告警 MarkAbnormalAlertSent（SQL 条件原子）；公众号消息 Redis SETNX；access_token Redis 缓存。
@@ -197,7 +200,7 @@
 
 | 页面/组件 | 行为 |
 |-----------|------|
-| utils/http.ts | uploadFile：压缩后（wx.compressImage，quality 按大小 80/65/50，压缩后仍 >10MiB 报错）逐张上传，单请求 field=files，并发 3；配额错误映射为 USER_IMAGE_STORAGE_LIMIT_EXCEEDED。updateAvatar：上传后 PUT /user/avatar {fileId} 并 setBaseInfo(avatar) |
+| utils/http.ts | uploadFile：压缩后（wx.compressImage，quality 按原始大小分档：>1MiB→80、>200KiB→85、≤200KiB→90；原始 >10MiB 先拒绝、压缩后仍 >10MiB 再拒绝）逐张上传，单请求 field=files，并发 3；配额错误映射为 USER_IMAGE_STORAGE_LIMIT_EXCEEDED。updateAvatar：上传后 PUT /user/avatar {fileId} 并 setBaseInfo(avatar) |
 | components/NoteEdit/NoteEdit.ts | 保存时对新增图片调 uploadFile，再 POST/PUT /diary/details |
 | pages/Set/Set.ts | onChooseAvatar → request.updateAvatar；配额超限弹 VIP 升级；mpSubscribed 来自 GET /user/profile |
 | components/SubscribePrompt/SubscribePrompt.ts | wx.requestSubscribeMessage(ABNORMAL_TEMPLATE_ID) → POST /subscribe/record {templateId,scene:ABNORMAL_ALERT,accept} |
@@ -205,8 +208,8 @@
 
 ## 8. 运维与任务
 
-- **后台任务**（backend/internal/jobs/runner.go）：runCleanupOrphanFiles（JOB_INTERVAL_CLEANUP_ORPHAN_FILES，默认 7 天，最长 30 分钟）、runCleanupOrphanTrajMaps（JOB_INTERVAL_CLEANUP_ORPHAN_TRAJ_MAPS，默认 7 天）、runCleanupTrajectories（JOB_INTERVAL_CLEANUP_TRAJECTORIES，默认 6 小时）、runAbnormalAlertCheck（JOB_INTERVAL_ABNORMAL_ALERT，默认 5 分钟）、runCleanupClientOpsLogs（JOB_INTERVAL_CLEANUP_CLIENT_OPS_LOGS 默认 24h，删除 >30 天）、runPurgeDeletedObjects（JOB_INTERVAL_PURGE_DELETED_OBJECTS，默认 24h，单轮 ≤20 批 × 500 URL，失败整批回退）；任务用 PostgreSQL advisory lock 互斥（ADR-0005）。
-- **环境变量**：STORAGE_LOCAL_PATH；OSS_ACCESS_KEY_ID、OSS_ACCESS_KEY_SECRET、OSS_ENDPOINT、OSS_BUCKET、OSS_PUBLIC_URL（ID/SECRET/ENDPOINT/BUCKET/OSS_PUBLIC_URL 任一非空即要求 ID/SECRET/ENDPOINT/BUCKET 四项齐备，见 config.validate）；WECHAT_MP_APPID、WECHAT_MP_SECRET、WECHAT_MP_GHID、WECHAT_MSG_TOKEN、WECHAT_ENCODING_AES_KEY、WECHAT_APPID、WECHAT_MINI_LINK_ENV_VERSION（默认 release）；USER_IMAGE_STORAGE_LIMIT_BYTES、USER_IMAGE_STORAGE_LIMIT_BYTES_VIP。
-- **系统配置（环境变量）**：`STORAGE_PUBLIC_BASE_URL`（文件基址，即 `FileBaseURL`：open 模式由 `BuildSysConfig` 无条件覆盖为 `TrimRight(API_HOST, "/")`，此时 `STORAGE_PUBLIC_BASE_URL` 不生效；saas 模式为 validate 硬性必填，缺失启动失败）、`DEFAULT_AVATAR_URL`（必须以 `?seed=` 结尾）、`DEFAULT_TRAJECTORY_ICON`、`DEFAULT_COVER_IMAGE`。
-- **Redis 键**：wechat:mp:access_token:{appID}（TTL 110m）、wxmp:msgid:{msgId}（60s）、wxmp:thumb_media_id（48h）、wxmp:profile:refresh:{openid}（1h）、purge:oss:pending（已删对象待刷新 URL 集合，容量护栏 10 万，无 TTL；满溢**弃新保旧**：`Record` 返回 `ErrQueueFull`，入队失败记日志 `record deleted url for purge failed`；上游恢复后队列以每轮 20×500 排空、存量最终可达；`CDN_REFRESH_ENABLED=1` 时启用，ADR-0013）。
+- **后台任务**（backend/internal/jobs/runner.go）：runCleanupOrphanFiles（JOB_INTERVAL_CLEANUP_ORPHAN_FILES，默认 7 天，最长 30 分钟）、runCleanupOrphanTrajMaps（JOB_INTERVAL_CLEANUP_ORPHAN_TRAJ_MAPS，默认 7 天；邀请二维码/分享海报按 metadata `raw` 键豁免，见 F-7 与 02d §8.3）、runCleanupTrajectories（JOB_INTERVAL_CLEANUP_TRAJECTORIES，默认 6 小时）、runAbnormalAlertCheck（JOB_INTERVAL_ABNORMAL_ALERT，默认 5 分钟）、runCleanupClientOpsLogs（JOB_INTERVAL_CLEANUP_CLIENT_OPS_LOGS 默认 24h，删除 >30 天）、runPurgeDeletedObjects（JOB_INTERVAL_PURGE_DELETED_OBJECTS，默认 24h，单轮 ≤20 批 × 500 URL，失败整批回退）；任务用 PostgreSQL advisory lock 互斥（ADR-0005）。
+- **环境变量**：STORAGE_LOCAL_PATH；OSS_ACCESS_KEY_ID、OSS_ACCESS_KEY_SECRET、OSS_ENDPOINT、OSS_BUCKET、OSS_PUBLIC_URL（ID/SECRET/ENDPOINT/BUCKET/OSS_PUBLIC_URL 任一非空即要求 ID/SECRET/ENDPOINT/BUCKET 四项齐备，见 config.validate）；WECHAT_MP_APPID、WECHAT_MP_SECRET、WECHAT_MP_GHID、WECHAT_MSG_TOKEN、WECHAT_ENCODING_AES_KEY、WECHAT_APPID、WECHAT_MINI_LINK_ENV_VERSION（默认 release）；USER_IMAGE_STORAGE_LIMIT_BYTES、USER_IMAGE_STORAGE_LIMIT_BYTES_VIP；CDN_REFRESH_ENABLED（默认 false，需 `enabled && rdb && OSSConfigured` 三条件才激活，ADR-0013）。
+- **系统配置（环境变量，`BuildSysConfig → SysConfig.validate` 第二层启动校验，两种模式同）**：`STORAGE_PUBLIC_BASE_URL`（文件基址 `FileBaseURL`：open 模式由 `BuildSysConfig` 无条件覆盖为 `TrimRight(API_HOST, "/")`，此时 env 值不生效；saas 缺失即启动失败——无 `OSS_PUBLIC_URL` 回退，部署经 `CFG_DOMAIN` 注入**裸域名**，`/uploads` 前缀由 `storage.URL()` 拼接）、`DEFAULT_COVER_IMAGE` / `DEFAULT_TRAJECTORY_ICON`（SaaS 形态未配 OSS 必然启动失败（见 DEPLOYMENT §2.11）；仅 open 模式经部署预检留空、系统资源走本地兜底）、`DEFAULT_AVATAR_URL`（缺失或非 `?seed=` 结尾启动失败）。以上不在 required-runtime-vars.txt（该清单只覆盖第一层 `config.validate`）。
+- **Redis 键**：wechat:mp:access_token:{appID}（TTL 110m）、wxmp:msgid:{msgId}（300s）、wxmp:thumb_media_id（48h）、wxmp:profile:refresh:{openid}（1h）、purge:oss:pending（已删对象待刷新 URL 集合，容量护栏 10 万，无 TTL；满溢**弃新保旧**：`Record` 返回 `ErrQueueFull`，入队失败记日志 `record deleted url for purge failed`；`Record` 的 SCard+SAdd 非原子，并发逼近护栏时可少量超限——护栏语义为防无限膨胀而非精确上限；上游恢复后队列以每轮 20×500 排空、存量最终可达；`CDN_REFRESH_ENABLED=1` 时启用，ADR-0013）。
 - **Migration**：000001_baseline（files、user_avatar_markers、wx_mp_accounts 等）、000004_client_ops_logs；均含 down 脚本。

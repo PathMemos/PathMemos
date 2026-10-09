@@ -520,7 +520,7 @@ func (h *Handler) CreateMemory(w http.ResponseWriter, r *http.Request) {
 
 	req, err := parseCreateMemoryRequest(w, r)
 	if err != nil {
-		if err.Error() == "request body too large" {
+		if stderrors.Is(err, errMemoryBodyTooLarge) {
 			middleware.JSONError(w, r, http.StatusRequestEntityTooLarge, errors.CodeRequestEntityTooLarge, err.Error())
 			return
 		}
@@ -537,13 +537,18 @@ func (h *Handler) CreateMemory(w http.ResponseWriter, r *http.Request) {
 	middleware.JSON(w, r, http.StatusOK, map[string]interface{}{"memory_id": id})
 }
 
+// errMemoryBodyTooLarge：REST /memories 的 413 判定用 sentinel（02h MCP-5 要求 400 失败
+// 带中文 message，413 亦以中文回显），替代此前丢失错误类型的字符串匹配。
+var errMemoryBodyTooLarge = stderrors.New("请求体超过 64KB 限制")
+
 func parseCreateMemoryRequest(w http.ResponseWriter, r *http.Request) (createMemoryRequest, error) {
 	var req createMemoryRequest
 	if err := middleware.ReadJSONBody(w, r, &req, maxMcpMessageSize); err != nil {
-		if _, ok := err.(*http.MaxBytesError); ok {
-			return req, fmt.Errorf("request body too large")
+		var maxErr *http.MaxBytesError
+		if stderrors.As(err, &maxErr) {
+			return req, errMemoryBodyTooLarge
 		}
-		return req, fmt.Errorf("invalid request body")
+		return req, fmt.Errorf("请求体格式非法")
 	}
 	if req.RecordTime.IsZero() {
 		return req, fmt.Errorf("缺少 record_time 参数")
@@ -678,7 +683,7 @@ func (h *Handler) queryMemoryItems(ctx context.Context, userID string, startDate
 		if err != nil {
 			return nil, err
 		}
-		// R2-04：与 listUserDiaryEntries 一致，仅小结果写缓存，防止大日期范围组合撑爆 Redis。
+		// 与 listUserDiaryEntries 一致，仅小结果写缓存，防止大日期范围组合撑爆 Redis。
 		if data, err := json.Marshal(items); err == nil && len(data) <= maxMcpMessageSize {
 			_ = h.rdb.Set(ctx, key, data, mcpCacheTTL).Err() //nolint:errcheck
 		}

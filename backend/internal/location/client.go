@@ -58,7 +58,7 @@ func (c *Client) NextKey() string {
 }
 
 func (c *Client) Reverse(ctx context.Context, lat, lon float64, withPois bool) (*ReverseResult, error) {
-	// B5-19：腾讯地图 key 未配置时短路返回明确错误，避免空 key 请求后慢失败 500。
+	// 腾讯地图 key 未配置时短路返回明确错误，避免空 key 请求后慢失败 500。
 	if len(c.apiKeys) == 0 {
 		return nil, fmt.Errorf("tencent map key not configured")
 	}

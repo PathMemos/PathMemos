@@ -1,14 +1,14 @@
-<view class="confirm-dialog" wx:if="{{visible}}">
+<view class="confirm-dialog" data-theme="{{theme}}" wx:if="{{visible}}">
   <view class="modal-mask" bindtap="onMaskTap"></view>
   <view class="modal-content">
     <view class="modal-warn-icon" wx:if="{{confirmType === 'danger'}}">
       <text class="modal-warn-icon-text">!</text>
     </view>
     <view class="modal-title {{confirmType === 'danger' ? 'modal-title--danger' : ''}}" wx:if="{{title}}">{{title}}</view>
-    <view class="modal-body"><text selectable>{{content}}</text></view>
+    <view class="modal-body"><text user-select>{{content}}</text></view>
     <view class="modal-input-area" wx:if="{{showInput}}">
       <view class="modal-input-display {{confirmType === 'danger' ? 'modal-input-display--danger' : ''}}" wx:if="{{showInput && confirmType !== 'danger'}}">
-        <text class="modal-input-display-text" selectable>{{inputDisplayValue}}</text>
+        <text class="modal-input-display-text" user-select>{{inputDisplayValue}}</text>
       </view>
       <input
         class="modal-input"

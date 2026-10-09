@@ -14,6 +14,7 @@ import (
 	"papafeiji/backend/internal/db"
 	"papafeiji/backend/internal/db/sqlc"
 	"papafeiji/backend/internal/location"
+	"papafeiji/backend/internal/mcp"
 	"papafeiji/backend/internal/pkg/safe"
 	"papafeiji/backend/pkg/timeutil"
 	"papafeiji/backend/pkg/util"
@@ -25,10 +26,13 @@ import (
 const (
 	stayPointMergeRadiusM = 300.0
 	stayPointMergeWindow  = 30 * time.Minute
-	maxPendingPerUser     = 100
-	processWorkers        = 5
-	maxGeocodeAttempts    = 10
-	// R-01：候选 keyset 轮转游标与积压告警阈值。
+	// 候选批上限（candidateBatch / 满批判定）与单用户单轮轨迹上限（ListTrajectoriesByUser）
+	// 语义不同、当前同值 100：拆分具名避免一处调参意外改变另一处（OBJECTIVES A3）。
+	maxCandidateBatch       = 100
+	maxTrajectoriesPerRound = 100
+	processWorkers          = 5
+	maxGeocodeAttempts      = 10
+	// 候选 keyset 轮转游标与积压告警阈值。
 	autoRecordCursorKey            = "job:cursor:auto_record"
 	autoRecordBacklogWarnThreshold = 1000
 )
@@ -77,7 +81,7 @@ func (s *Service) HasActiveVIP(ctx context.Context, userID string) bool {
 }
 
 func (s *Service) ProcessRound(ctx context.Context) error {
-	// R-01：keyset 轮转游标；Redis 丢失只会从头再扫，不影响正确性（不变量 I2）。
+	// keyset 轮转游标；Redis 丢失只会从头再扫，不影响正确性（不变量 I2）。
 	cursor := ""
 	if s.rdb != nil {
 		if v, rerr := s.rdb.Get(ctx, autoRecordCursorKey).Result(); rerr == nil {
@@ -101,8 +105,8 @@ func (s *Service) ProcessRound(ctx context.Context) error {
 			slog.WarnContext(ctx, "auto record cursor write failed", slog.Any("error", werr))
 		}
 	}
-	// 满批时统计候选总量，超过阈值告警（R-01）。
-	if len(userIDs) == int(maxPendingPerUser) {
+	// 满批时统计候选总量，超过阈值告警。
+	if len(userIDs) == int(maxCandidateBatch) {
 		if n, cerr := s.pool.Queries().CountAutoRecordCandidates(ctx, maxGeocodeAttempts); cerr == nil && n > autoRecordBacklogWarnThreshold {
 			slog.WarnContext(ctx, "auto_record_backlog_warn", slog.Int64("candidates", n), slog.Int("batch", len(userIDs)))
 		}
@@ -131,7 +135,7 @@ func (s *Service) ProcessRound(ctx context.Context) error {
 	wg.Wait()
 
 	if failed.Load() > 0 {
-		// R-19：轮次存在用户级失败（轨迹已保留、下轮重试），输出告警关键字供 alert-watch 捕获。
+		// 轮次存在用户级失败（轨迹已保留、下轮重试），输出告警关键字供 alert-watch 捕获。
 		slog.ErrorContext(ctx, "alert=auto_record_failed", slog.Int("failed_users", int(failed.Load())))
 		return fmt.Errorf("auto record round completed with %d failures", failed.Load())
 	}
@@ -143,7 +147,7 @@ func (s *Service) candidateBatch(ctx context.Context, cursor string) ([]string, 
 	return s.pool.Queries().ListAutoRecordCandidates(ctx, sqlc.ListAutoRecordCandidatesParams{
 		CursorID:           cursor,
 		MaxGeocodeAttempts: maxGeocodeAttempts,
-		MaxUsers:           maxPendingPerUser,
+		MaxUsers:           maxCandidateBatch,
 	})
 }
 
@@ -163,16 +167,28 @@ func (s *Service) processUser(ctx context.Context, userID string) (err error) {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("auto record already in progress for user %s", userID)
+		// 锁被占用（手动即时成文 POST /diary/details/auto 并发持有，或另一容器正在处理
+		// 同一用户）：跳过该用户而非计入 failed——轨迹保留、下轮自然重试，数据无损；
+		// 正常并发不应触发 alert=auto_record_failed 噪音告警（与后台任务锁 busy 跳过同语义）。
+		slog.InfoContext(ctx, "auto record lock busy, skip user", slog.String("user_id", userID))
+		return nil
 	}
 
 	// 封面刷新与缓存失效必须在分布式锁释放后再异步执行，避免异步任务开始时锁仍被占用
 	//（AGENTS.md §3.8/§4.1）。
 	var asyncFamilyID string
 	var asyncDates []string
+	var asyncHasEntries bool
 	defer func() {
 		if uerr := s.lock.Unlock(context.WithoutCancel(ctx), lockKey, lockToken); uerr != nil {
 			slog.ErrorContext(ctx, "auto record unlock failed", slog.String("user_id", userID), slog.Any("error", uerr))
+		}
+		if err == nil && asyncHasEntries {
+			// 本轮有成文：失效 MCP 用户查询缓存（与手动成文路径同语义，02c AR-8.4），
+			// 失败由 30 分钟 TTL 兜底。
+			safe.Go(ctx, nil, func() {
+				mcp.InvalidateUserCache(context.Background(), s.rdb, userID)
+			})
 		}
 		if err == nil && asyncFamilyID != "" && len(asyncDates) > 0 {
 			safe.Go(ctx, nil, func() {
@@ -215,7 +231,7 @@ func (s *Service) processUser(ctx context.Context, userID string) (err error) {
 	rows, err := s.pool.Queries().ListTrajectoriesByUser(ctx, sqlc.ListTrajectoriesByUserParams{
 		UserID:             userID,
 		MaxGeocodeAttempts: maxGeocodeAttempts,
-		MaxRows:            maxPendingPerUser,
+		MaxRows:            maxTrajectoriesPerRound,
 	})
 	if err != nil {
 		return fmt.Errorf("list trajectories: %w", err)
@@ -242,8 +258,8 @@ func (s *Service) processUser(ctx context.Context, userID string) (err error) {
 		return s.pool.Queries().DeleteTrajectories(ctx, collectTrajectoryIDs(rows))
 	}
 
-	// R-20（同日去重集合化）：按日期缓存当天全部自动条目的地址集合，候选与集合比较——
-	// 旧逻辑只与当天最后一条比较，同日折返旧地点（家→公司→家）会重复成文。
+	// 同日去重集合化：按日期缓存当天全部自动条目的地址集合，候选与集合比较——
+	// 同日折返旧地点（家→公司→家）不会重复成文。
 	autoAddrSets := make(map[string]map[string]struct{})
 	autoAddrSetFor := func(recordDate string, date pgtype.Date) (map[string]struct{}, error) {
 		if set, ok := autoAddrSets[recordDate]; ok {
@@ -430,9 +446,12 @@ func (s *Service) processUser(ctx context.Context, userID string) (err error) {
 		}
 	}
 
-	if len(createdDates) > 0 && user.CurrentFamilyID.Valid && user.CurrentFamilyID.String != "" {
-		asyncFamilyID = user.CurrentFamilyID.String
-		asyncDates = uniqueStrings(createdDates)
+	if len(createdDates) > 0 {
+		asyncHasEntries = true
+		if user.CurrentFamilyID.Valid && user.CurrentFamilyID.String != "" {
+			asyncFamilyID = user.CurrentFamilyID.String
+			asyncDates = uniqueStrings(createdDates)
+		}
 	}
 
 	// 批量删除已处理/无效/重复的 trajectory，减少 DB 写入次数。
@@ -592,7 +611,7 @@ func uniqueStrings(ss []string) []string {
 	return result
 }
 
-// FindDuplicateAutoEntry 在当天自动条目地址索引中查找同址条目（R-22：后台与手动即时成文共用同一判重语义）。
+// FindDuplicateAutoEntry 在当天自动条目地址索引中查找同址条目（后台与手动即时成文共用同一判重语义）。
 // rows 须按 record_time DESC 排序（ListAutoEntryAddressesByDate 保证），首条命中即最新条目；
 // 返回已存在条目 id 供手动成文的响应契约使用（命中时直接返回既有条目）。
 func FindDuplicateAutoEntry(rows []sqlc.ListAutoEntryAddressesByDateRow, landmark, address string) (entryID string, dup bool) {
@@ -641,7 +660,7 @@ func autoAddressSet(rows []sqlc.ListAutoEntryAddressesByDateRow) map[string]stru
 
 // isDuplicateAutoAddress 判断候选驻点是否与当天已有自动条目同址。
 // 匹配规则与原「比最后一条」一致（landmark 对 address、详细地址对 detail_address），
-// 差别仅在比较范围扩为全天集合（R-20）。
+// 差别仅在比较范围扩为全天集合。
 func isDuplicateAutoAddress(set map[string]struct{}, landmark, address string) bool {
 	if landmark != "" {
 		if _, ok := set[landmark]; ok {
@@ -712,7 +731,7 @@ func parseDate(s string) (time.Time, error) {
 	return t, nil
 }
 
-// handleGeocodeRetry 累计逆地理失败次数并从不删除轨迹（PPJ-C03）。R-02：达到 maxGeocodeAttempts
+// handleGeocodeRetry 累计逆地理失败次数并从不删除轨迹。达到 maxGeocodeAttempts
 // 的轨迹成为终态，由 SQL（ListTrajectoriesByUser / 候选 EXISTS）排除，不再参与聚类与告警；
 // 仅在跨过上限的那一次记录 geocode_discarded，轨迹保留至 7 天清理窗口回收。
 func (s *Service) handleGeocodeRetry(ctx context.Context, rows []sqlc.AutoRecordTrajectory, clusterIDs []string, userID string) {

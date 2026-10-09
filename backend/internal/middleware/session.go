@@ -85,7 +85,7 @@ local absExpiry = tonumber(ARGV[4])
 if not expiry or expiry <= 0 or not absExpiry or absExpiry <= 0 then
     return redis.error_reply('ERR invalid expiry')
 end
--- B1-11：登录时清理索引中已过期的 session（每次最多 50 个，避免长时间阻塞）。
+-- 登录时清理索引中已过期的 session（每次最多 50 个，避免长时间阻塞）。
 -- 同时按迭代数 i>50 截断：否则集合前 50 个成员都有效时会 smembers 全量物化 + 逐成员 exists，
 -- 阻塞 Redis 单线程、拖慢登录核心路径。
 local members = redis.call('smembers', userSessionsKey)
@@ -190,7 +190,7 @@ end
 local userSessionsKey = 'sessions:user:' .. userID
 redis.call('srem', userSessionsKey, sessionID)
 redis.call('del', sessionKey)
--- B6a-04：同步删除绝对过期索引 key，避免 session:abs:* 残留。
+-- 同步删除绝对过期索引 key，避免 session:abs:* 残留。
 redis.call('del', sessionAbsKey)
 if tonumber(expiry) and tonumber(expiry) > 0 then
     redis.call('expire', userSessionsKey, expiry)
@@ -205,7 +205,7 @@ local userSessionsKey = KEYS[1]
 local sessionIDs = redis.call('smembers', userSessionsKey)
 for i, id in ipairs(sessionIDs) do
     redis.call('del', 'session:' .. id)
-    -- B6a-04：同步删除绝对过期索引 key。
+    -- 同步删除绝对过期索引 key。
     redis.call('del', 'session:abs:' .. id)
 end
 redis.call('del', userSessionsKey)

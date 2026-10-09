@@ -21,7 +21,7 @@ func doRequest(t *testing.T, allowSandbox bool, body string) *httptest.ResponseR
 	return rec
 }
 
-// TestRequestSandboxGate PPJ-B05：生产默认拒绝沙箱 env=1（闸门先于任何 DB 访问）。
+// TestRequestSandboxGate 生产默认拒绝沙箱 env=1（闸门先于任何 DB 访问）。
 func TestRequestSandboxGate(t *testing.T) {
 	rec := doRequest(t, false, `{"vipId":"vip-month-0001","env":1}`)
 	if rec.Code != http.StatusForbidden {

@@ -10,15 +10,13 @@
 
 1. **安全模型维持现状**：发货回调仅接受安全模式（`msg_signature` 验签 + AES 解密 + `receive_id == WECHAT_APPID`）；明文一律拒绝并返回固定成功（终止重试）。Token/AES 密钥独立于公众号配置。
 2. **金额不作为漏发闸门**：回调金额 > 0 即视为真实扣款并照常发货；与 `orders.amount` 不一致仅记 `payment_notify_amount_mismatch` 告警（slog Error）。理由：微信侧已扣款而拒绝发货会造成用户资损与客诉，其伤害大于「标价配置错误多发货」；且平台立减/优惠等场景本来就会导致金额不一致。
-3. **不建自动对账**：告警关键字仅供日志检索（DEPLOYMENT §10），不引入自动对账任务、不接告警渠道（当前无指标/告警基建）。人工处置路径：按 AGENTS.md「虚拟支付回调排障与补发」重放/补发。
-4. **沙箱与体验版预期**：`env=1` 受 `PAYMENT_ALLOW_SANDBOX` 闸门保护，生产默认关闭。体验版（envVersion=trial）/开发版构建支付必然 403 为**预期行为**——trial VIP 由注册自动发放（不可购买、不可重复领取），沙箱联调使用开启闸门的专用环境。
+3. **不建自动对账**：`payment_notify_amount_mismatch` 已纳入 `scripts/alert-watch.sh` 关键字白名单，经 `alert-cron.sh`（每 2 分钟扫描告警日志）触达 webhook（`CFG_ALERT_WEBHOOK_URL`）；不引入自动对账任务。人工处置路径：按 AGENTS.md「虚拟支付回调排障与补发」重放/补发。
+4. **沙箱与开发版预期**：`env=1` 受 `PAYMENT_ALLOW_SANDBOX` 闸门保护，生产默认关闭。`getPayEnv` 仅开发版（develop）走 `env=1`，体验版与正式版一律 `env=0` 现网实付——体验版承担真实购买测试职责，实付与正式版行为完全一致、无资损口径差异；沙箱「免费领 VIP」通道不对体验版开放。开发版构建在闸门关闭时支付必然 403 为**预期行为**——trial VIP 由注册自动发放（不可购买、不可重复领取），沙箱联调使用开启闸门的专用环境。
 5. **订单无 refund 状态**：状态机仅 pending/paid/closed（closed→paid 补发）；退款不在本系统范围内。
 
 ## 后果
 
 - 标价配置错误（如 prices 与微信后台不一致）不会阻断发货，只能靠 `payment_notify_amount_mismatch` 日志事后发现；日志无人值守时会静默积累。
 - 伪造回调已被验签 + receive_id + transaction_id 唯一约束三重阻断，残余风险可接受。
-
-> **注（2026-09 审定）**：决策 3 中「告警关键字仅供日志检索，不接告警渠道」的落地状态已变化：`payment_notify_amount_mismatch` 已纳入 `scripts/alert-watch.sh` 关键字白名单，经 `alert-cron.sh`（每 2 分钟扫描告警日志）触达 webhook（`CFG_ALERT_WEBHOOK_URL`）。决策 3 的「不建自动对账任务」仍然成立。
-
-> **注（2026-09 审定·第四轮评审 N-03）**：「注销 × 在途已付款订单」取舍显式登记——支付成功后、回调到达前用户注销（注销事务将订单 `user_id` 置空），回调到达后无论 pending→paid 还是 closed→paid 补记，均只更新订单状态、不激活 VIP、无退款路径；重注册（同微信新账号）亦不补发（订单与 openid 无关联，墓碑机制不覆盖）。秒级窗口 × 用户自主注销，接受。
+- 「注销 × 在途已付款订单」取舍：支付成功后、回调到达前用户注销（注销事务将订单 `user_id` 置空），回调到达后无论 pending→paid 还是 closed→paid 补记，均只更新订单状态、不激活 VIP、无退款路径；重注册（同微信新账号）亦不补发（订单与 openid 无关联，墓碑机制不覆盖）。秒级窗口 × 用户自主注销，接受。
+- 该场景系统侧无补发/退款闭环（`grant_vip_by_phone.sh` 依赖手机号，注销用户无定位键）；用户投诉时的处置路径为**微信商户平台按 `out_trade_no` 手工退款**（系统外操作），退款后订单行保持 paid 不变（无对账联动）。

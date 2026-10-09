@@ -1,8 +1,8 @@
 # PP-03 接口契约（L3）
 
-> 层级：L3 接口契约｜版本：V2.0｜状态：定稿（以当前代码为唯一事实源）
+> 层级：L3 接口契约｜版本：当前（以代码为唯一事实源）
 > 上游：PP-01 产品总览｜关联 ADR：ADR-0001（MCP 剥离到 Cloudflare Worker）、ADR-0004（app/sse 双容器）
-> 说明：本文件按当前代码实现整理，描述当前接口契约。章节遵循 docs/spec-standards.md 第二节 L3 必含小节（认证与请求头 / 统一响应结构 / 错误码词汇表 / 分页 / 状态码映射 / 超时与限流 / 数据归属校验 / 幂等约定 / 按域分组全登记 + 通用契约模板）。
+> 说明：本文件按当前代码实现整理，描述当前接口契约。章节遵循 docs/spec-standards.md §一 映射表的 L3 必含小节（认证与请求头 / 统一响应结构 / 错误码词汇表 / 分页 / 状态码映射 / 超时与限流 / 数据归属校验 / 幂等约定 / 按域分组全登记 + 通用契约模板）。
 >
 > **实现锚点**（仅定位用途，标注当前代码位置）：
 > - 路由挂载与中间件顺序：backend/cmd/server/main.go
@@ -17,7 +17,7 @@
 
 | 头 | 值形态 | 由谁校验 | 适用路由 | 源文件 |
 |----|--------|---------|---------|--------|
-| Authorization | Bearer + sessionId | SessionMiddleware（SaaS）或 OpenAuthMiddleware（open） | 所有受保护路由、SSE /ai/chat、MCP 数据端点（此处 Bearer 为 API Key） | middleware/session.go、middleware/open_auth.go、mcp/server.go |
+| Authorization | Bearer + sessionId | SessionMiddleware（SaaS）或 OpenAuthMiddleware（open） | 所有受保护路由、SSE /ai/chat、MCP 数据端点（此处 Bearer 为 API Key） | middleware/session.go、middleware/open_auth.go、mcp/server.go、mcp/handler.go |
 | X-Private-Api-Key | 明文 OPEN_API_KEY | OpenAuthMiddleware，且**仅当完全无 Authorization 头时** | open 模式受保护路由（Worker 转发 MCP/curl 通路） | middleware/open_auth.go |
 | X-Worker-Secret | 明文 WORKER_SECRET | WorkerAuth（HTTP/SSE 顶层） | 经 Worker 中转的 HTTP 流量 | middleware/worker.go |
 | X-Worker-Secret | 明文 MCP_WORKER_SECRET | mcp.workerSecretAuth | SaaS 模式 /internal/mcp/* | mcp/rpc.go |
@@ -32,25 +32,25 @@
 - Authorization: Bearer sessionId → Redis session:<id> → 注入 user_id + session_id 到 context（middleware/session.go:279-301）。
 - 会话 TTL：滑动过期 30 天（sessionExpiry）、绝对过期 90 天（sessionAbsoluteExpiry）；每次成功读取刷新滑动 TTL（session.go:23-29,160-178）。
 - 缺失 session → 401 + code="4010" + biz_code="SESSION_INVALID" + message="missing session"；不存在/过期 → 401 + code="4010" + biz_code="SESSION_INVALID" + "invalid or expired session"；Redis 错误 → 500 + code="5001" + "failed to check session"。
-- SaaS 模式的受保护分组使用 SessionMiddleware；open 模式使用 OpenAuthMiddleware（main.go:240-245,318-322）。
+- SaaS 模式的受保护分组使用 SessionMiddleware；open 模式使用 OpenAuthMiddleware（main.go `run`，HTTP 与 SSE 两个受保护分组）。
 
 **B. 开源版 API Key 鉴权（仅 open 模式，OpenAuthMiddleware）**
 
-- 两条**互斥**通路（middleware/open_auth.go:21-26）：
+- 两条**互斥**通路（middleware/open_auth.go `OpenAuthMiddleware.Handler`）：
   1. 有 Authorization 头 → 只做 session 鉴权；session 不存在直接 401，**不**回落到 API Key。
-  2. 无 Authorization 头且带 X-Private-Api-Key → 只接受与种子 OPEN_API_KEY 的 SHA-256 相等的 key（lookupUserByAPIKey，open_auth.go:89-105），成功后注入 sessionID = "apikey:<userID>"。
+  2. 无 Authorization 头且带 X-Private-Api-Key → 只接受与种子 OPEN_API_KEY 的 SHA-256 相等的 key（open_auth.go `lookupUserByAPIKey`），成功后注入 sessionID = "apikey:<userID>"。
 - 用户经 /mcp/key 创建的 MCP Key **不能**升级为完整 REST 凭证（仅种子 OPEN_API_KEY 被接受）。
-- 连续失败达 3 次才 sleep 500ms 并清零计数（暴力穷举节流，open_auth.go:31-32,77-82）。
+- 连续失败达 3 次才 sleep 500ms 并清零计数（暴力穷举节流，open_auth.go `failCount`）。
 - 均失败 → 401 + code="4010" + biz_code="SESSION_INVALID" + "unauthorized"。
 
 **C. Worker 中转一致性校验（不是源站防线）**
 
-- WorkerAuth(expected, skipPrefixes...)（middleware/worker.go:16-46）：
+- WorkerAuth(expected, skipPrefixes...)（middleware/worker.go `WorkerAuth`）：
   - expected（WORKER_SECRET）为空 → 仅 `DEPLOYMENT_MODE=open` 允许（开源直连语义）；**saas 模式下 WORKER_SECRET 为启动必填**，空则 `config.validate` 失败、进程拒绝启动；expected 为空时不校验也不消费 `X-Worker-Secret`/`X-Forwarded-Host`（入站伪造这两个头无效果）；
   - 路径命中 skip 前缀 → 直接放行；
   - **无 X-Forwarded-Host** → 直接放行（允许 SaaS 小程序直连 pro.papafeiji.cn）；
   - 有 X-Forwarded-Host → 校验 X-Worker-Secret，缺失/不匹配返回 403（纯文本 forbidden，非统一 envelope）。
-- HTTP apiRouter 的 skip 前缀：/api/prod/payment/virtualPayNotify、/wx/callback、/internal/mcp（main.go:207）；health 端点不挂载 WorkerAuth；SSE 路由的 WorkerAuth 无 skip 前缀，但 health 注册在分组之外（main.go:309-317）。
+- HTTP apiRouter 的 skip 前缀：/api/prod/payment/virtualPayNotify、/wx/callback、/internal/mcp（main.go `run`）；health 端点不挂载 WorkerAuth；SSE 路由的 WorkerAuth 无 skip 前缀，但 health 注册在分组之外（main.go `run` SSE 分组）。
 - SaaS /internal/mcp/* 由 mcp.workerSecretAuth 独立校验 MCP_WORKER_SECRET：saas 模式启动即强制非空（`config.validate`），运行时未配置 → 500 + server misconfigured；不匹配 → 403 + forbidden（mcp/rpc.go）。
 
 ### 1.3 部署模式差异（DEPLOYMENT_MODE=saas|open，默认 saas）
@@ -60,7 +60,7 @@
 | 受保护分组中间件 | SessionMiddleware | OpenAuthMiddleware |
 | MCP 协议端点 | 仅 /internal/mcp/*（X-Worker-Secret，RegisterInternal） | 仅公开 /mcp/*（RegisterPublic，IP 限流 60/min） |
 | /mcp/key* 管理 | 会话分组内 | 会话分组内；以 apikey: 身份调用会被 403 拒绝（mcp/handler.go:169-175） |
-| 启动 migration / seed | 由 deploy.sh 控制 | 启动时 migration.Run + bootstrap.SeedOpenBackend（main.go:112,135） |
+| 启动 migration / seed | 由 deploy.sh 控制 | 启动时 migration.Run + bootstrap.SeedOpenBackend（main.go `run` open 分支） |
 | /system/config features | payment/wxmp 按 env 计算 | payment=false、wxmp=false |
 
 ## 2. 统一响应结构
@@ -95,24 +95,26 @@
 
 | 端点/场景 | 响应体 | 源文件 |
 |-----------|--------|--------|
-| 微信支付回调 GET/POST /api/prod/payment/virtualPayNotify | 固定 {"ErrCode":0,"ErrMsg":"success"}（200）；瞬时故障 {"ErrCode":-1,"ErrMsg":"internal error"}（500） | payment/handler.go:372,288,330 |
+| 微信支付回调 GET/POST /api/prod/payment/virtualPayNotify | 固定 {"ErrCode":0,"ErrMsg":"success"}（200）；瞬时故障 {"ErrCode":-1,"ErrMsg":"internal error"}（500） | payment/handler.go `writeNotifyJSON`、`Notify` 瞬时分支 |
 | 微信公众号回调 GET /wx/callback | 纯文本 echostr（200）或 fail（403） | wxmp/handler.go:94-114 |
-| 微信公众号回调 POST /wx/callback | XML 回复或纯文本 success（200） | wxmp/handler.go:203-248,444-454 |
+| 微信公众号回调 POST /wx/callback | XML 回复或纯文本 success（200） | wxmp/handler.go `writeReply`、`writeXMLError` |
 | SSE POST /ai/chat | text/event-stream，见 2.2 | ai/handler.go、ai/upstream.go |
 | MCP 数据端点 /mcp/*、/internal/mcp/* | JSON-RPC 端点 `/mcp`、`/internal/mcp/rpc` 错误为纯文本（`mcp/server.go`）；REST 端点 `diary`/`memories` 返回统一 envelope（401/400/413/429/500 走 `middleware.JSON*`，`mcp/handler.go`） | mcp/server.go、mcp/handler.go |
-| POST /file/upload 超时 | http.TimeoutHandler 返回 {"code":"5001","message":"upload timeout"}（非统一 envelope 包：是 message 不是 msg，且无 request_id） | main.go:273 |
+| POST /file/upload 超时 | http.TimeoutHandler(5min) 返回 {"code":"5001","message":"upload timeout"}（非统一 envelope 包：是 message 不是 msg，且无 request_id） | main.go `run` file upload 接线 |
+| POST /diary/share-card 超时 | http.TimeoutHandler(60s) 返回 {"code":"5001","message":"render timeout"}（同上非统一 envelope 形态） | main.go `run` shareCardHandler 接线 |
 | WorkerAuth / workerSecretAuth 拒绝 | 纯文本 forbidden（403） | middleware/worker.go:39-41、mcp/rpc.go:52-55 |
 
 ### 2.2 SSE 事件流（POST /ai/chat）
 
-响应头：Content-Type: text/event-stream、Cache-Control: no-cache、Connection: keep-alive；HTTP 状态 200，先 WriteHeader(200) 再 Flush（ai/handler.go:89-93）。
+响应头：Content-Type: text/event-stream、Cache-Control: no-cache、Connection: keep-alive；HTTP 状态 200，先 WriteHeader(200) 再 Flush（ai/handler.go `Chat`）。
 
 | 事件 | 载荷 | 源文件 |
 |------|------|--------|
-| 数据块 | 每个 chunk 按行输出 data: <line> + 换行，末尾空行 | ai/upstream.go:244-256 |
-| 心跳 | 每 25s 一条 SSE 注释行 `: heartbeat`（无 event/data 语义，客户端忽略） | ai/handler.go |
-| 结束 | event: done + data 空行 | ai/upstream.go:258-264 |
-| 错误 | event: error，data 为 {"code":"<枚举>","biz_code":"<语义码?>","bizCode":"<语义码?>","message":"<msg>"}（`bizCode` 为与 `biz_code` 同时下发、供旧客户端读取的兼容字段） | ai/upstream.go:266-282 |
+| 数据块 | 每个 chunk 按行输出 data: <line> + 换行，末尾空行 | ai/upstream.go `writeSSEData` |
+| 心跳 | 每 25s 一条 SSE 注释行 `: heartbeat`（无 event/data 语义，客户端忽略） | ai/handler.go `lockedSSEWriter.heartbeat` |
+| 提示 | event: notice，data 为 {"type":"truncated"}（非终止性：回答被 180s 超时截断且已有部分回复，随后仍以 done 正常收尾；与 error 的终止语义相反） | ai/upstream.go `writeSSENotice`、ai/handler.go `lockedSSEWriter.notice` |
+| 结束 | event: done + data 空行 | ai/upstream.go `writeSSEDone` |
+| 错误 | event: error，data 为 {"code":"<枚举>","biz_code":"<语义码?>","bizCode":"<语义码?>","message":"<msg>"}（`bizCode` 为与 `biz_code` 同时下发、供旧客户端读取的兼容字段） | ai/upstream.go `writeSSEError` |
 
 错误事件取值：配额超限 code=4290、biz_code=AI_DAILY_QUOTA_EXCEEDED、message="daily ai chat quota exceeded"；在途冲突（同 request_id 处理中，等待超时或在途失败，**不回落生成**）code=4290、biz_code=OPERATION_IN_PROGRESS、message="ai turn in progress, retry later"；超时 code=5001、message="timeout"；上游错误 code=5001、message="upstream error"（ai/handler.go）。
 
@@ -151,6 +153,7 @@
 | OWNER_CANNOT_LEAVE_FAMILY | `BizOwnerCannotLeaveFamily` | 403 | 4030 | owner 退出家庭 |
 | CANNOT_REMOVE_SELF / CANNOT_REMOVE_OWNER | `BizCannotRemoveSelf` / `BizCannotRemoveOwner` | 403 | 4030 | 移除成员校验 |
 | ALREADY_IN_FAMILY / FAMILY_FULL | `BizAlreadyInFamily` / `BizFamilyFull` | 409 | 4090 | 创建 / 加入家庭 |
+| REMOVED_REJOIN_COOLDOWN | `BizRemovedRejoinCooldown` | 403 | 4030 | 邀请链接加入的被移除冷却命中（ADR-0019，02d F-4） |
 | FREE_VIP_ALREADY_CLAIMED / TRIAL_VIP_ALREADY_CLAIMED | `BizFreeVipAlreadyClaimed` / `BizTrialVipAlreadyClaimed` | 409 | 4090 | VIP 领取防重 |
 | ORDER_NOT_FOUND | `BizOrderNotFound` | 404 | 4040 | 订单不存在 / 非本人 |
 | OPERATION_IN_PROGRESS | `BizOperationInProgress` | 429 | 4290 | 锁冲突 / 并发注销 / AI 在途 |
@@ -164,9 +167,9 @@
 | 包 | 哨兵错误 | 出参 | 源文件 |
 |----|---------|------|--------|
 | auth | ErrWechatInvalidCode、ErrWechatService | 登录/绑手机号错误分支 | auth/errors.go |
-| family | ErrAlreadyInFamily、ErrFamilyNotFound、ErrTargetIsPersonalFamily、ErrAlreadyInTargetFamily、ErrNotInNormalFamily、ErrOwnerCannotLeave、ErrFamilyFull、ErrCannotRemoveSelf、ErrCannotRemoveOwner、ErrNotOwner、ErrTargetNotInFamily、ErrCannotDissolvePersonal、ErrOperationInProgress | 家庭/邀请 handler switch | family/errors.go |
+| family | ErrAlreadyInFamily、ErrFamilyNotFound、ErrTargetIsPersonalFamily、ErrAlreadyInTargetFamily、ErrNotInNormalFamily、ErrOwnerCannotLeave、ErrFamilyFull、ErrRemovedRejoinCooldown、ErrCannotRemoveSelf、ErrCannotRemoveOwner、ErrNotOwner、ErrTargetNotInFamily、ErrCannotDissolvePersonal、ErrOperationInProgress | 家庭/邀请 handler switch | family/errors.go |
 | file | ErrNotFileOwner、ErrSystemFileDelete、ErrFileNotFound、ErrFileInUse | 删除文件错误分支 | file/errors.go |
-| vip | ErrFreeVIPAlreadyClaimed、ErrTrialVIPAlreadyClaimed、ErrInvalidVIP | 领取 VIP 错误分支 | vip/errors.go |
+| vip | ErrFreeVIPAlreadyClaimed、ErrTrialVIPAlreadyClaimed、ErrInvalidVIP、ErrTrialVIPDisabled | 领取 VIP 错误分支（ErrTrialVIPDisabled：trial 商品下线/缺失 → `POST /vip/new-user` 404 4040 `trial vip disabled`，对齐 free 档下线闸门） | vip/errors.go |
 | diary | ErrEntryNotFound、ErrFamilyMismatch、ErrMemberNotFound、ErrPermissionDenied、ErrCoverUpdateInProgress、ErrDailyReverseQuotaExceeded、errTextTooLong、errInvalidColor、errInvalidCoords、errTooManyImages 等 | 日记 handler | diary/service.go、diary/handler.go |
 | ai | ErrAIDailyQuotaExceeded、errAIChatTimeout、errAITurnInProgress | SSE 错误分支（errAITurnInProgress → SSE error 事件 code=4290 + biz_code=OPERATION_IN_PROGRESS，message `ai turn in progress, retry later`） | ai/service.go |
 
@@ -198,8 +201,8 @@ errors.HTTPStatus(bizCode)：
 
 - 受保护 handler 的用户身份**只从 context 取**（middleware.UserID(ctx)），不从 URL/body 取用户 ID（middleware/session.go:31-36）。
 - 数据归属在 handler/service 层校验：
-  - 文件：files.created_by 必须等于当前用户，或双方 current_family_id 相同（file/handler.go:465-543）；系统文件按 metadata.family_id 与用户 current_family_id 比对。
-  - 日记：虚拟 ID 形如 family:<familyId>:date:<YYYY-MM-DD>，familyId 必须等于当前用户 current_family_id，否则 403（diary/service.go:130-136,505-511）。
+  - 文件：files.created_by 必须等于当前用户，或双方 current_family_id 相同（file/handler.go `Download`/`isFileAccessible`）；系统文件按 metadata.family_id 与用户 current_family_id 比对。
+  - 日记：虚拟 ID 形如 family:<familyId>:date:<YYYY-MM-DD>，familyId 必须等于当前用户 current_family_id，否则 403（diary/handler.go `parseVirtualID`、diary/service.go `ValidateFamilyAccess`/`GetDetails`）。
   - 支付订单：orders.user_id 必须等于当前用户，否则按 ORDER_NOT_FOUND 返回（payment/handler.go:144-147,183-186）。
 - MCP/API Key 端点：Bearer key 的 SHA-256 命中 api_keys.key_hash，以该行 user_id 作为数据归属；expires_at 仅存储、不作为有效性条件（mcp/server.go:70-82、mcp/handler.go:42,490-493）。
 - Authorization 与会话不匹配时不会静默降级为默认用户（open 模式 session 失效直接 401，open_auth.go:47-55）。
@@ -213,8 +216,8 @@ errors.HTTPStatus(bizCode)：
 | HTTP（app） | 127.0.0.1:8080 | 10 分钟 | 10 秒 | 310 秒 | 60 秒 |
 | SSE（sse） | 127.0.0.1:8081 | 0（不限制，防掐断 SSE） | 10 秒 | 0 | 60 秒 |
 
-- 优雅关闭：SIGINT/SIGTERM → shuttingDown=true（`/health/ready` 返回 503）→ 停止后台任务 → 30s 超时的 Shutdown。
-- POST /file/upload 额外包 http.TimeoutHandler(5*time.Minute)，超时体见 2.1（main.go:273）。
+- 优雅关闭：SIGINT/SIGTERM → shuttingDown=true（`/health/ready` **与 `/health/live`** 均返回 503，供 nginx/探针提前停止路由（现架构为单 nginx upstream，无独立 LB））→ 停止后台任务 → 30s 超时的 Shutdown。
+- POST /file/upload 额外包 http.TimeoutHandler(5*time.Minute)，超时体见 2.1（main.go `run` file upload 接线）。该 5min 为服务端兜底预算，链路有效上限取各层最小值（主路径客户端 30s / nginx 60s；私有 Worker 链路 360s，见 06 §2.3）。
 - AI 流超时 `AIStreamTimeout` = 180s（`ai/handler.go`）；上游 HTTP 客户端超时 5 分钟（`config.SSEHTTPClient()`）、通用客户端 30 秒（`config.HTTPClient()`）。
 
 ### 6.2 body 大小上限（middleware.ReadJSONBody）
@@ -222,15 +225,17 @@ errors.HTTPStatus(bizCode)：
 | 端点 | 上限 | 源文件 |
 |------|------|--------|
 | 用户设置类（/user/*） | 8 KB | user/handler.go:30 |
-| VIP 领取 | 8 KB | vip/handler.go:16 |
+| VIP 领取 | 8 KB | vip/handler.go `maxVIPRequestBodySize` |
 | 登录/绑手机号/绑定邀请人/注销/支付 request/cancel/auto-record config/push | 4 KB | 各 handler |
 | 日记条目/记忆/封面、家庭 join、邀请 qrcode | 64 KB | diary/handler.go、family/handler.go、invite/handler.go |
-| AI 对话 POST /ai/chat | 32 KB | ai/handler.go:28 |
+| POST /diary/share-card | 512 KB（50 条 × 3000 字 UTF-8 最坏包体） | sharecard/handler.go |
+| AI 对话 POST /ai/chat | 32 KB | ai/handler.go `maxChatBodySize` |
 | MCP 数据端点 | 64 KB | mcp/handler.go:36 |
 | POST /auto-record/trajectories | 64 KB | autorecord/handler.go:23 |
-| POST /ops/client-log | 64 KB | opslog/handler.go:22 |
+| POST /ops/client-log | 64 KB | opslog/handler.go `maxBodySize` |
 | POST /api/prod/payment/virtualPayNotify | 64 KB（handler 内 LimitReader，非统一中间件） | payment/handler.go:223 |
-| POST /file/upload | 单文件 10 MB / 单请求 50 MB / 最多 9 个 | file/handler.go:35-37 |
+| GET/POST /wx/callback | 64 KB（handler 内 LimitReader，非统一中间件；超限返回 XML error/纯文本，非 413 envelope——公众号回调不走 JSON 中间件） | wxmp/handler.go:122 |
+| POST /file/upload | 单文件 10 MB / 单请求 50 MB / 最多 9 个 | file/handler.go `MaxFileSize`/`MaxTotalSize`/`MaxFiles` |
 | 默认兜底（maxBytes 小于等于 0） | 4096 B | middleware/body.go:13 |
 
 > 超限统一语义：JSON body 超上限 → **HTTP 413 + `code="4130"`**；multipart 单文件/总量业务超限仍为 400 + `code="4000"`（+ `biz_code=FILE_SIZE_EXCEEDED`）。
@@ -239,19 +244,20 @@ errors.HTTPStatus(bizCode)：
 
 | 范围 | 阈值 | 实现 | 源文件 |
 |------|------|------|--------|
-| GET /health/live、/health/ready | 30 次/分钟/IP | 内存滑动窗口（同容器内 app 与 sse 两个 Server 共享同一 limiter 实例，健康端点合并共享 30 次/分钟/IP 预算；双容器部署时两容器各自独立计数，每容器 30/min/IP） | main.go:200-203,309-311 |
-| 公开路由组（login、支付回调、wx 回调、/invite/resolve 另加、/system/config） | 60 次/分钟/IP | 同上 | main.go:209-211 |
-| GET /invite/resolve | 60 次/小时/IP | 独立 limiter | invite/handler.go |
-| DELETE /auth/account | 5 次/小时/IP | 独立 limiter | main.go:251 |
-| POST /auth/phone/bind | 10 次/分钟/IP | 独立 limiter | main.go:260 |
-| SSE POST /ai/chat | 30 次/分钟/IP | 独立 limiter | main.go:314 |
+| GET /health/live、/health/ready | 30 次/分钟/IP | 内存滑动窗口（同容器内 app 与 sse 两个 Server 共享同一 limiter 实例，健康端点合并共享 30 次/分钟/IP 预算；双容器部署时两容器各自独立计数，每容器 30/min/IP） | main.go `run`（`healthLimiter`） |
+| 公开路由组（/auth/login、/auth/login/app、支付回调、wx 回调、/invite/resolve 另加、/system/config） | 60 次/分钟/IP | 同上 | main.go `run`（`publicLimiter`） |
+| GET /invite/resolve | 60 次/小时/IP | 独立 limiter | invite/handler.go `NewHandler`（resolveLimiter） |
+| DELETE /auth/account | 5 次/小时/IP | 独立 limiter | main.go `run` |
+| POST /auth/phone/bind | 10 次/分钟/IP | 独立 limiter | main.go `run` |
+| SSE POST /ai/chat | 30 次/分钟/IP | 独立 limiter | main.go `run`（`aiChatLimiter`） |
 | SSE 并发连接 | 单用户 2、进程内 `SSE_MAX_CONNS`（默认 200） | `chatLimiter`（package 级，仅 sse 进程） | ai/handler.go |
-| POST /file/upload | 60 次/分钟/IP | 独立 limiter（防海量小文件耗尽 files 行/inode；先于 5 分钟 TimeoutHandler 执行） | main.go:268-275 |
-| MCP 数据端点（open 公开 /mcp/*） | 60 次/分钟/IP（外层）+ 30 次/分钟/API Key（内层） | IP limiter + KeyRateLimiter | mcp/rpc.go:29-37、mcp/handler.go:59-70 |
-| AI 每日配额 | 非 VIP 10 次/天、VIP 100 次/天 | Redis ai:daily_chat:<userId>:<date> Lua 原子计数 | ai/handler.go:25-27、ai/service.go:259-272,429-467 |
-| 逆地理编码 | 200 次/用户/天 | Redis location:reverse:<userId>:<date>，fail-closed | location/quota.go:14-51 |
-| 限流算法 | 滑动窗口，maxBuckets=10000（1.2 倍触发驱逐） | slidingWindowLimiter | middleware/ratelimit.go:26-97 |
-| 可信代理 | TRUSTED_PROXY_CIDR（配置后才解析 X-Forwarded-For/X-Real-IP） | | middleware/ratelimit.go:149-191 |
+| POST /file/upload | 60 次/分钟/IP | 独立 limiter（防海量小文件耗尽 files 行/inode；先于 5 分钟 TimeoutHandler 执行） | main.go `run`（`uploadLimiter`） |
+| POST /diary/share-card | 30 次/分钟/IP + 60s TimeoutHandler | 独立 limiter + 渲染并发闸门 3（单次峰值内存 ~45MB，防叠加） | main.go |
+| MCP 数据端点（open 公开 /mcp/*） | 60 次/分钟/IP（外层）+ 30 次/分钟/API Key（内层） | IP limiter + KeyRateLimiter | mcp/rpc.go `RegisterPublic`、mcp/handler.go `NewHandler` |
+| AI 每日配额 | 非 VIP 10 次/天、VIP 100 次/天 | Redis ai:daily_chat:<userId>:<date> Lua 原子计数（DB ai_daily_quota_usage 为权威，Redis 为快速闸门） | ai/handler.go `dailyQuotaNonVIP`/`dailyQuotaVIP`、ai/service.go `tryConsumeDailyQuota` |
+| 逆地理编码 | 200 次/用户/天 | Redis location:reverse:<userId>:<date>，fail-closed | location/quota.go `CheckReverseQuota` |
+| 限流算法 | 滑动窗口，maxBuckets=10000（1.2 倍触发驱逐） | slidingWindowLimiter | middleware/ratelimit.go `slidingWindowLimiter` |
+| 可信代理 | TRUSTED_PROXY_CIDR（配置后才解析 X-Forwarded-For/X-Real-IP；支持逗号分隔多个 CIDR，非法 CIDR 启动失败/告警忽略） | | middleware/ratelimit.go `parseTrustedProxies`、config.go `validate` |
 
 > 限流/配额命中统一返回 429 + `code="4290"` + `biz_code="RATE_LIMITED"`。
 
@@ -269,18 +275,19 @@ errors.HTTPStatus(bizCode)：
 |------|--------------|------|--------|
 | 支付回调发货 | orders.transaction_id 唯一索引 + orders.state（pending/closed→paid） | 重复回调不重复发货；closed 被支付补记并发货；金额>0 一律发货（不一致仅告警）；瞬时故障返回非 2xx 触发微信重试，业务性拒绝返回固定成功 | payment/handler.go、payment/service.go |
 | 关闭订单 | CloseOrder 条件更新（仅 pending 且属主） | 已关闭/已支付/并发关闭均返回 200 | payment/handler.go:107-161 |
-| AI 对话 | 客户端 request_id（格式 ^[A-Za-z0-9_-]{8,64}$）；无则消息哈希 | 重连复用同一 request_id 命中回复缓存，不重复扣配额/落库 | ai/handler.go:31-32,78-81、ai/service.go:77-83,193-214 |
+| AI 对话 | 客户端 request_id（格式 ^[A-Za-z0-9_-]{8,64}$）；无则消息哈希 | 重连复用同一 request_id 命中回复缓存，不重复扣配额/落库；在途冲突不回落生成（OPERATION_IN_PROGRESS） | ai/handler.go `requestIDPattern`/`Chat`、ai/service.go `aiTurnKeys` |
 | MCP POST /mcp/key | 用户唯一（api_keys UNIQUE(user_id)） | 已存在时返回既有 key（get-or-create） | mcp/handler.go:177-225 |
 | POST /mcp/key/rotate | 事务内先删后建 | 每次换发新 key | mcp/handler.go:274-315 |
-| 家庭加入 | family_members 唯一约束 + errAlreadyInTargetFamily | 已在目标家庭返回 200 | family/handler.go:238-239 |
-| 绑定邀请人 | 事务内行锁 GetUserByIDForUpdate + 幂等检查 | 已绑定幂等成功；注册超过 7 天静默成功不绑定 | auth/handler.go:378-399 |
-| 微信公众号消息 | msgID Redis SETNX（60s TTL） | 重复消息返回占位文案，不重复触发 AI | wxmp/handler.go:41,207-219,250-263 |
+| 家庭加入 | family_members 唯一约束 + errAlreadyInTargetFamily | 已在目标家庭返回 200 | family/handler.go `JoinByInviteLink` |
+| 绑定邀请人 | 事务内行锁 GetUserByIDForUpdate + 幂等检查 | 已绑定幂等成功；注册超过 7 天静默成功不绑定 | auth/handler.go `BindInviter` |
+| 微信公众号消息 | msgID Redis SETNX（300s TTL，覆盖微信重试窗口） | 重复消息返回占位文案，不重复触发 AI | wxmp/handler.go msgIDCacheTTL、handleMessage 去重段 |
 | 免费/试用 VIP 领取 | user_vip_claims UNIQUE(user_id,vip_id)、user_vips UNIQUE(user_id) | 重复领取返回 409 业务码 | vip/handler.go、迁移唯一约束 |
-| 文件上传失败回滚 | 请求内已提交 part 的顺序回滚（记录/物理文件/配额） | 避免半成功 | file/handler.go:110-208 |
+| 文件上传失败回滚 | 请求内已提交 part 的顺序回滚（记录/物理文件/配额） | 避免半成功 | file/handler.go `Upload`/`rollbackUploadedParts` |
 
 ## 8. 全量端点登记
 
 > 统计：main.go + 各 handler 注册的端点（含 HTTP 与 SSE 的 health 端点、以及 SaaS/open 互斥的两套 MCP 路由）。以下按域登记。
+> `backend/cmd/admin` 为一次性运维 CLI（按手机号删号、`jobs status`/`job run <name>`），不监听任何 HTTP 端点，不在本登记范围。
 
 ### 8.1 运维 / 健康
 
@@ -295,10 +302,10 @@ errors.HTTPStatus(bizCode)：
 | 方法 | 路径 | 鉴权 | 说明 |
 |------|------|------|------|
 | POST | /auth/login | 公开（IP 60/min） | body {code,inviter?}；微信 jscode2session → 查找/创建用户（含个人家庭、试用 VIP、邀请奖励、邀请码）→ 返回 {sessionId,newUser,userInfo} |
+| POST | /auth/login/app | 公开（IP 60/min） | body {code,inviter?}；多端 App（Donut）wx.weixinAppLogin 的 code → 服务端以多端应用 access_token 调 donut/code2verifyinfo 换 openapp_info（openid/unionid/头像/昵称）→ 同 /auth/login 建号/返回；DONUT_APPID/DONUT_APPSECRET 未配置时 500 |
 | POST | /auth/logout | 登录态 | 删除当前 session |
 | GET | /auth/phone | 登录态 | 返回 {phoneNumber,canModifyToday}；canModifyToday 基于上海时区当日是否已绑过 |
 | POST | /auth/phone/bind | 登录态 + IP 限流 10/min | body {code}；每日最多绑定一次（服务端日限，原子条件更新），微信换号后写 phone_bind_time；手机号唯一冲突 409 语义 |
-| POST | /auth/phone/unbind | 登录态 | body {code}（不消费微信接口）；未绑定时 400 phone not bound |
 | POST | /auth/inviter | 登录态 | body {inviter}；补绑邀请人，事务内行锁+幂等；自邀/不存在 400；注册超过 7 天静默成功 |
 | DELETE | /auth/account | 登录态 + IP 5/h | body {confirmName} 必须等于当前昵称；先删当前 session 再事务删数据，后台异步清理 session/文件 |
 
@@ -333,7 +340,7 @@ errors.HTTPStatus(bizCode)：
 |------|------|------|------|
 | GET | /invite/resolve | 公开（IP 60/h） | query code（8 位白名单字符集）→ {userId}；非法 400、未找到 404 |
 | GET | /invite/list | 登录态 | 当前用户邀请列表 {list:[{userId,nickName,avatarUrl,joined}]} |
-| POST | /invite/qrcode | 登录态 | body 可空 {raw?}；返回 {url}（小程序码/原始码） |
+| POST | /invite/qrcode | 登录态 | body 可空 {raw?}；返回 {url, thumbUrl}（小程序码/原始码海报 + 分享缩略图，raw 时 thumbUrl 为空） |
 
 ### 8.6 日记（diary）
 
@@ -349,10 +356,11 @@ errors.HTTPStatus(bizCode)：
 | PUT | /diary/details | 登录态 | body 含 id，更新条目 |
 | DELETE | /diary/details | 登录态 | query id，删除条目 |
 | POST | /diary/details/auto | 登录态 + VIP | body {lat,lon}；逆地理（受 200/日配额）自动成文；非 VIP NOT_VIP |
-| POST | /diary/details/memory | 登录态 | body {title,content,recordTime}，新建回忆；标题 1~50、正文不超过 10000 |
+| POST | /diary/details/memory | 登录态 | body {title,content,recordTime}，新建回忆；标题 1~50、正文 1~10000（空正文 400） |
 | PUT | /diary/details/memory | 登录态 | body {id,title,content,recordTime} |
 | DELETE | /diary/details/memory | 登录态 | query id |
 | GET | /diary/cover-url | 登录态 | query familyId,recordDate；需为当前家庭成员；返回 {coverImg} |
+| POST | /diary/share-card | 登录态 | 分享卡服务端渲染：body 为客户端按 locale 格式化好的展示串与记录/图片 URL 列表（契约见 sharecard/render.go ShareCardRequest）；内容寻址（sha256+渲染器版本）Redis 缓存 24h；返回 {poster, thumb} 下载 URL；图片抓取失败跳过、QR 抓取失败 500；抓取 URL 的 SSRF 校验规则与已接受残余面见 02b §5 share-card 行 |
 
 ### 8.7 自动记录（autorecord）
 
@@ -361,7 +369,7 @@ errors.HTTPStatus(bizCode)：
 | GET | /auto-record/config | 登录态 | 非 VIP 恒返回 {enabled:false}；VIP 返回用户 auto_record_enabled；读用户 DB 失败时降级返回 200 {enabled:false}（非 500） |
 | PUT | /auto-record/config | 登录态 | body {enabled}；enabled=true 需 VIP，否则 NOT_VIP |
 | PUT | /auto-record/active | 登录态 | 记录活跃心跳：仅更新 last_active_at（不触碰 abnormal_alert_sent_at；异常告警的抑制由候选查询附带 last_active_at 条件间接实现，见 02c AR-11.7） |
-| POST | /auto-record/trajectories | 登录态 + VIP | body {points:[{lat,lon,recordedAt}]}（最多 50）；坐标范围校验；写 auto_record_trajectories |
+| POST | /auto-record/trajectories | 登录态 + VIP | body {points:[{lat,lon,recordedAt}]}（最多 50）+ batchSeq（仅观测日志用）；坐标范围校验；写 auto_record_trajectories（自然键唯一索引 ON CONFLICT DO NOTHING 幂等），并顺带刷新 last_active_at 心跳 |
 
 ### 8.8 文件（file）
 
@@ -376,10 +384,10 @@ errors.HTTPStatus(bizCode)：
 | 方法 | 路径 | 鉴权 | 说明 |
 |------|------|------|------|
 | GET | /vip | 登录态 | 在售付费 VIP 商品列表（含 prices） |
-| GET | /vip/free | 登录态 | 免费 VIP 列表 [{id,name}] |
-| POST | /vip/free/claim | 登录态 | body {vipId}；已领取 409 语义 FREE_VIP_ALREADY_CLAIMED |
-| GET | /vip/free/check | 登录态 | query vipId，返回 {claimed} |
-| POST | /vip/new-user | 登录态 | 领取新用户试用 VIP；已领取 TRIAL_VIP_ALREADY_CLAIMED |
+| GET | /vip/free | 登录态 | 免费 VIP 列表 [{id,name}]；`FREE_VIP_ENABLED=0` 时 404（02e VP-13-AC4） |
+| POST | /vip/free/claim | 登录态 | body {vipId}；已领取 409 语义 FREE_VIP_ALREADY_CLAIMED；`FREE_VIP_ENABLED=0` 时 404 |
+| GET | /vip/free/check | 登录态 | query vipId，返回 {claimed}；`FREE_VIP_ENABLED=0` 时 404 |
+| POST | /vip/new-user | 登录态 | 领取新用户试用 VIP；已领取 TRIAL_VIP_ALREADY_CLAIMED；trial 商品下线（is_active=false 或缺失）404 `trial vip disabled` |
 
 ### 8.10 支付（payment）
 
@@ -389,7 +397,7 @@ errors.HTTPStatus(bizCode)：
 | POST | /payment/virtual/cancel | 登录态 | body {outTradeNo}；仅关闭自己 pending 订单，重复/已关闭幂等 200 |
 | GET | /payment/virtual/status | 登录态 | query outTradeNo；返回 {state}；非属主按 ORDER_NOT_FOUND |
 | GET | /api/prod/payment/virtualPayNotify | 微信签名（公开组） | 服务器地址验证：校验 signature/timestamp/nonce 后原样返回 echostr |
-| POST | /api/prod/payment/virtualPayNotify | 微信加密验签（公开组） | 安全模式回调：msg_signature 验签 + AES 解密发货；明文模式被拒；瞬时故障返回 500 触发重试 |
+| POST | /api/prod/payment/virtualPayNotify | 微信加密验签（公开组） | 安全模式回调：msg_signature 验签 + AES 解密（receive_id 需匹配 WECHAT_APPID，未配置时跳过）发货；明文模式被拒（固定成功终止重试）；瞬时故障返回 500 触发重试 |
 
 ### 8.11 推送（push）
 
@@ -442,7 +450,7 @@ errors.HTTPStatus(bizCode)：
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |------|------|------|------|
-| POST | /ops/client-log | 登录态 | body {events[],device?,appVersion?}；最多 200 条事件；缺 `t`/`type`、`type` 超 128 字节的事件被静默丢弃；单条 detail 超 1024B 时仅整体丢弃 detail 字段（不截断保留，见 §6.4）；过滤后为空不落库直接 200；写 client_ops_logs |
+| POST | /ops/client-log | 登录态 | body {events[],device?,appVersion?}；最多 200 条事件；缺 `t`/`type`、`type` 超 128 字节的事件被静默丢弃；单条 detail 超 1024B 时仅整体丢弃 detail 字段（不截断保留，见 §6.4）；device 缺省取 User-Agent（截断 256B）、appVersion 截断 64B；过滤后为空不落库直接 200；写 client_ops_logs |
 
 ### 8.16 公众号回调（wxmp）
 
@@ -459,20 +467,7 @@ errors.HTTPStatus(bizCode)：
 
 ### 8.18 后台任务（非 HTTP，供 API 行为解释）
 
-`jobs.Runner.Start`（jobs/runner.go），所有任务用 PostgreSQL advisory lock（`lock:background:{task}`）互斥、任务自身幂等，间隔可用 env 覆盖（默认值来自 config.go）；`KnownJobNames` 共 10 项，Redis 记录 `job:last_success` / `job:last_failure` / `job:fail_streak`，`watchJobHealth` 每分钟做失联检测（>3× 周期输出 `job_stale`）并消费 `job:trigger:<name>` 人工补跑：
-
-| 任务 | 间隔（默认） | 对应 API/表 |
-|------|-------------|-------------|
-| 自动记录处理 | 5 分钟 | 消费 /auto-record/trajectories 写入的轨迹 |
-| 异常提醒检查 | 5 分钟 | 关联 /subscribe/record、users.abnormal_alert_sent_at |
-| 订单超时关闭 | 1 分钟 | 关闭 24h 未支付 orders |
-| AI 对话日志清理 | 24 小时 | 删除 ai_dialog_logs 中 >90 天记录（无每用户条数上限） |
-| 轨迹数据清理 | 6 小时 | auto_record_trajectories |
-| 孤立文件清理 | 7 天 | files/物理存储 |
-| 孤立轨迹图清理 | 7 天 | 轨迹地图文件 |
-| 客户端日志清理 | 24 小时 | 删除 client_ops_logs 中 >30 天记录 |
-| 常用地址汇总 | 每日 03:00 | /user/common-addresses/refresh 同一底层 |
-| 已删对象 CDN 缓存刷新 | 24 小时（`JOB_INTERVAL_PURGE_DELETED_OBJECTS`；`CDN_REFRESH_ENABLED=1` 才启用） | 消费 Redis `purge:oss:pending` 队列，分批调阿里云 CDN 刷新（ADR-0013） |
+`jobs.Runner.Start`（jobs/runner.go），所有任务用 PostgreSQL advisory lock（`lock:background:{task}`）互斥、任务自身幂等，间隔可用 env 覆盖（默认值来自 config.go）；`KnownJobNames` 共 10 项，Redis 记录 `job:last_success` / `job:last_failure` / `job:fail_streak`，`watchJobHealth` 每分钟做失联检测（>3× 周期输出 `job_stale`）并消费 `job:trigger:<name>` 人工补跑。**任务清单、间隔与各域职责的权威源为 02c §8**（本节不复述数值；已删对象 CDN 刷新为 ADR-0013 登记的私有形态能力）。
 
 ## 9. 通用契约模板
 

@@ -140,17 +140,6 @@ func (q *Queries) CountDiaryEntries(ctx context.Context, arg CountDiaryEntriesPa
 	return count, err
 }
 
-const countDiaryEntriesByDiaryID = `-- name: CountDiaryEntriesByDiaryID :one
-SELECT COUNT(*) FROM diary_entries WHERE diary_id = $1
-`
-
-func (q *Queries) CountDiaryEntriesByDiaryID(ctx context.Context, diaryID string) (int64, error) {
-	row := q.db.QueryRow(ctx, countDiaryEntriesByDiaryID, diaryID)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
 const countDiaryEntriesByUsers = `-- name: CountDiaryEntriesByUsers :one
 SELECT COUNT(*)
 FROM diary_entries
@@ -184,13 +173,34 @@ func (q *Queries) CountWeeklyDiaryEntriesByUsers(ctx context.Context, arg CountW
 	return count, err
 }
 
-const deleteDiaryByID = `-- name: DeleteDiaryByID :exec
-DELETE FROM diaries WHERE id = $1
+const deleteDiaryEntriesByDiaryID = `-- name: DeleteDiaryEntriesByDiaryID :execrows
+DELETE FROM diary_entries WHERE diary_id = $1
 `
 
-func (q *Queries) DeleteDiaryByID(ctx context.Context, id string) error {
-	_, err := q.db.Exec(ctx, deleteDiaryByID, id)
-	return err
+func (q *Queries) DeleteDiaryEntriesByDiaryID(ctx context.Context, diaryID string) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteDiaryEntriesByDiaryID, diaryID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteDiaryIfEmpty = `-- name: DeleteDiaryIfEmpty :execrows
+DELETE FROM diaries AS d
+WHERE d.id = $1
+  AND NOT EXISTS (SELECT 1 FROM diary_entries e WHERE e.diary_id = d.id)
+  AND NOT EXISTS (SELECT 1 FROM memories m WHERE m.user_id = d.user_id AND m.record_date = d.record_date)
+`
+
+// 条件删除：头行 FOR UPDATE（LockDiaryByIDForUpdate）与本语句配合，
+// 与并发新增条目（FK KEY SHARE）串行化，关闭「计数后删行」窗口内
+// 并发已提交条目被级联删除的丢失路径（docs/OBJECTIVES A1）。
+func (q *Queries) DeleteDiaryIfEmpty(ctx context.Context, id string) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteDiaryIfEmpty, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const deleteDiaryImagesReturningFileIDs = `-- name: DeleteDiaryImagesReturningFileIDs :many
@@ -781,6 +791,17 @@ func (q *Queries) ListLocationEntries(ctx context.Context, arg ListLocationEntri
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockDiaryByIDForUpdate = `-- name: LockDiaryByIDForUpdate :one
+SELECT id FROM diaries WHERE id = $1 FOR UPDATE
+`
+
+func (q *Queries) LockDiaryByIDForUpdate(ctx context.Context, id string) (string, error) {
+	row := q.db.QueryRow(ctx, lockDiaryByIDForUpdate, id)
+	var id_2 string
+	err := row.Scan(&id_2)
+	return id_2, err
 }
 
 const setFamilyDailyManualCover = `-- name: SetFamilyDailyManualCover :exec

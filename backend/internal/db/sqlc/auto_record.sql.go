@@ -23,7 +23,7 @@ WHERE u.auto_record_enabled = true
   )
 `
 
-// R-01：候选积压量（满批时才统计），超过阈值输出 auto_record_backlog_warn。
+// 候选积压量（满批时才统计），超过阈值输出 auto_record_backlog_warn。
 func (q *Queries) CountAutoRecordCandidates(ctx context.Context, maxGeocodeAttempts int32) (int64, error) {
 	row := q.db.QueryRow(ctx, countAutoRecordCandidates, maxGeocodeAttempts)
 	var column_1 int64
@@ -83,7 +83,7 @@ type InsertTrajectoriesParams struct {
 	RecordedAts []pgtype.Timestamptz `json:"recordedAts"`
 }
 
-// PPJ-C04：重复上报（同一 user+recorded_at+lat+lon）静默忽略，避免重试产生重复轨迹。
+// 重复上报（同一 user+recorded_at+lat+lon）静默忽略，避免重试产生重复轨迹。
 func (q *Queries) InsertTrajectories(ctx context.Context, arg InsertTrajectoriesParams) error {
 	_, err := q.db.Exec(ctx, insertTrajectories,
 		arg.Ids,
@@ -105,7 +105,7 @@ LEFT JOIN LATERAL (
     WHERE t.user_id = u.id
 ) lt ON true
 WHERE u.auto_record_enabled = true
-  -- PPJ-C01：告警发送侧用严格 VIP（无宽限），候选侧也须严格，否则过期用户每轮入选又被跳过。
+  -- 告警发送侧用严格 VIP（无宽限），候选侧也须严格，否则过期用户每轮入选又被跳过。
   AND v.expire_time > now()
   AND (
       u.abnormal_alert_sent_at IS NULL
@@ -175,8 +175,8 @@ type ListAutoRecordCandidatesParams struct {
 	MaxUsers           int32  `json:"maxUsers"`
 }
 
-// R-01：公平轮转——按 user_id keyset 分页，替代「按积压量 ORDER BY cnt DESC」避免低频用户饥饿；
-// 仅取仍有未达重试上限轨迹的用户（R-02）。
+// 公平轮转——按 user_id keyset 分页，避免「按积压量 ORDER BY cnt DESC」令低频用户饥饿；
+// 仅取仍有未达重试上限轨迹的用户。
 func (q *Queries) ListAutoRecordCandidates(ctx context.Context, arg ListAutoRecordCandidatesParams) ([]string, error) {
 	rows, err := q.db.Query(ctx, listAutoRecordCandidates, arg.CursorID, arg.MaxGeocodeAttempts, arg.MaxUsers)
 	if err != nil {
@@ -211,7 +211,7 @@ type ListTrajectoriesByUserParams struct {
 	MaxRows            int32  `json:"maxRows"`
 }
 
-// R-02：排除达到逆地理重试上限的终态轨迹，避免其每轮重复聚类/告警（保留至 7 天清理）。
+// 排除达到逆地理重试上限的终态轨迹，避免其每轮重复聚类/告警（保留至 7 天清理）。
 func (q *Queries) ListTrajectoriesByUser(ctx context.Context, arg ListTrajectoriesByUserParams) ([]AutoRecordTrajectory, error) {
 	rows, err := q.db.Query(ctx, listTrajectoriesByUser, arg.UserID, arg.MaxGeocodeAttempts, arg.MaxRows)
 	if err != nil {

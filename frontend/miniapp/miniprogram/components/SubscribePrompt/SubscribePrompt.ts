@@ -34,6 +34,8 @@ Component({
 
   methods: {
     onConfirm() {
+      // 异常提醒订阅仅小程序通道：App 端通知已裁撤，
+      // 不接开放平台一次性订阅，无需按环境分发。
       wx.requestSubscribeMessage({
         tmplIds: [ABNORMAL_TEMPLATE_ID],
         success: (res: any) => {

@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BACKUP="${1:-$(ls -1t /root/DeployOps/papafeiji-db-backups/papafeiji-backup-*.dump 2>/dev/null | head -1 || true)}"
 CONTAINER="papafeiji-rehearse"
-PORT="${PAPAFEIJ_REHEARSE_PORT:-54329}"
+PORT="${PAPAFEIJI_REHEARSE_PORT:-54329}"
 PGPASSWORD_REHEARSE="rehearse-only"
 
 [[ -n "${BACKUP}" && -f "${BACKUP}" ]] || { echo "错误：未找到备份文件（可传参指定 .dump）" >&2; exit 1; }
@@ -33,19 +33,10 @@ done
 docker exec "${CONTAINER}" pg_isready -U papafeiji -d papafeiji >/dev/null || { echo "错误：临时库未就绪" >&2; exit 1; }
 
 echo "==> 恢复备份（约需数十秒到数分钟）..."
-pg_restore -h 127.0.0.1 -p "${PORT}" -U papafeiji -d papafeiji --no-owner --role=papafeiji "${BACKUP}"
+PGPASSWORD="${PGPASSWORD_REHEARSE}" pg_restore -h 127.0.0.1 -p "${PORT}" -U papafeiji -d papafeiji --no-owner --role=papafeiji "${BACKUP}"
 
-echo "==> 渲染迁移占位符（哑值，仅验证可执行性）..."
-REHEARSE_DIR="$(mktemp -d)"
-cp "${PROJECT_ROOT}/backend/migrations/"*.sql "${REHEARSE_DIR}/"
-sed -i \
-  -e "s#{{API_HOST}}#https://rehearse.invalid#g" \
-  -e "s#{{OSS_PUBLIC_URL}}#https://rehearse.invalid/oss#g" \
-  -e "s#{{AI_BASE_URL}}#https://rehearse.invalid#g" \
-  -e "s#{{AI_MODEL}}#rehearse#g" \
-  -e "s#{{CFG_VIRTUAL_PAY_PRODUCT_ID_MONTH}}#rehearse-month#g" \
-  -e "s#{{CFG_VIRTUAL_PAY_PRODUCT_ID_YEAR}}#rehearse-year#g" \
-  "${REHEARSE_DIR}"/*.sql
+# 迁移占位符机制已随 squash 移除（迁移 SQL 无 {{...}}），直接使用原目录
+REHEARSE_DIR="${PROJECT_ROOT}/backend/migrations"
 
 MIGRATE_BIN="${GOPATH:-$HOME/go}/bin/migrate"
 if [[ ! -x "${MIGRATE_BIN}" ]]; then
@@ -54,7 +45,8 @@ if [[ ! -x "${MIGRATE_BIN}" ]]; then
 fi
 
 echo "==> 执行正向迁移..."
-DATABASE_URL="postgres://papafeiji:${PGPASSWORD_REHEARSE}@127.0.0.1:${PORT}/papafeiji?sslmode=disable" \
-  "${MIGRATE_BIN}" -path "${REHEARSE_DIR}" -database "${DATABASE_URL}" up
-echo "==> 迁移后版本：$("${MIGRATE_BIN}" -path "${REHEARSE_DIR}" -database "${DATABASE_URL}" version | awk '{print $1}')"
+REHEARSE_DATABASE_URL="postgres://papafeiji:${PGPASSWORD_REHEARSE}@127.0.0.1:${PORT}/papafeiji?sslmode=disable"
+DATABASE_URL="${REHEARSE_DATABASE_URL}" \
+  "${MIGRATE_BIN}" -path "${REHEARSE_DIR}" -database "${REHEARSE_DATABASE_URL}" up
+echo "==> 迁移后版本：$("${MIGRATE_BIN}" -path "${REHEARSE_DIR}" -database "${REHEARSE_DATABASE_URL}" version | awk '{print $1}')"
 echo "==> 预演通过：备份 ${BACKUP} 上全部迁移可执行。"

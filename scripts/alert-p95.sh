@@ -13,7 +13,8 @@ if [[ -f .env ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT="$(docker compose logs --since 15m app 2>&1 | "${SCRIPT_DIR}/accesslog-p95.sh" - 15 2>&1)" || true
+# app 与 sse 双容器都输出访问日志（/ai/chat 走 sse），P95 统计需覆盖两者。
+OUT="$(docker compose logs --since 15m app sse 2>&1 | "${SCRIPT_DIR}/accesslog-p95.sh" - 15 2>&1)" || true
 echo "${OUT}"
 
 if grep -q "slo_breach" <<< "${OUT}"; then

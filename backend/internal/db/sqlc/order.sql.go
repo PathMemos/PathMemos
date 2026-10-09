@@ -42,7 +42,7 @@ type CloseOrdersBatchParams struct {
 	OutTradeNos []string `json:"outTradeNos"`
 }
 
-// 两个数组按位置配对（B2-10）：out_trade_nos 展开为 (订单号, 序号)，
+// 两个数组按位置配对：out_trade_nos 展开为 (订单号, 序号)，
 // user_ids 按下标取同位置的 user_id，避免双 ANY 独立展开产生笛卡尔误关他人订单。
 func (q *Queries) CloseOrdersBatch(ctx context.Context, arg CloseOrdersBatchParams) (int64, error) {
 	result, err := q.db.Exec(ctx, closeOrdersBatch, arg.UserIds, arg.OutTradeNos)
@@ -62,7 +62,7 @@ WHERE orders.id IN (
 )
 `
 
-// R-17：关闭无主（user_id IS NULL，用户注销产生）的过期 pending 订单，避免永久滞留。
+// 关闭无主（user_id IS NULL，用户注销产生）的过期 pending 订单，避免永久滞留。
 func (q *Queries) CloseOwnerlessPendingOrders(ctx context.Context, createdAt pgtype.Timestamptz) (int64, error) {
 	result, err := q.db.Exec(ctx, closeOwnerlessPendingOrders, createdAt)
 	if err != nil {
@@ -97,9 +97,9 @@ func (q *Queries) ClosePendingOrdersByUserAndVIP(ctx context.Context, arg CloseP
 }
 
 const createOrder = `-- name: CreateOrder :one
-INSERT INTO orders (id, user_id, vip_id, out_trade_no, channel, state, amount, prepay_id, created_at, updated_at)
-VALUES ($1, $2, $3, $4, 'virtual_pay', 'pending', $5, $6, now(), now())
-RETURNING id, user_id, vip_id, out_trade_no, channel, state, amount, prepay_id, transaction_id, paid_at, created_at, updated_at
+INSERT INTO orders (id, user_id, vip_id, out_trade_no, channel, state, amount, created_at, updated_at)
+VALUES ($1, $2, $3, $4, 'virtual_pay', 'pending', $5, now(), now())
+RETURNING id, user_id, vip_id, out_trade_no, channel, state, amount, transaction_id, paid_at, created_at, updated_at
 `
 
 type CreateOrderParams struct {
@@ -108,7 +108,6 @@ type CreateOrderParams struct {
 	VipID      string      `json:"vipId"`
 	OutTradeNo string      `json:"outTradeNo"`
 	Amount     int32       `json:"amount"`
-	PrepayID   pgtype.Text `json:"prepayId"`
 }
 
 func (q *Queries) CreateOrder(ctx context.Context, arg CreateOrderParams) (Order, error) {
@@ -118,7 +117,6 @@ func (q *Queries) CreateOrder(ctx context.Context, arg CreateOrderParams) (Order
 		arg.VipID,
 		arg.OutTradeNo,
 		arg.Amount,
-		arg.PrepayID,
 	)
 	var i Order
 	err := row.Scan(
@@ -129,7 +127,6 @@ func (q *Queries) CreateOrder(ctx context.Context, arg CreateOrderParams) (Order
 		&i.Channel,
 		&i.State,
 		&i.Amount,
-		&i.PrepayID,
 		&i.TransactionID,
 		&i.PaidAt,
 		&i.CreatedAt,
@@ -139,7 +136,7 @@ func (q *Queries) CreateOrder(ctx context.Context, arg CreateOrderParams) (Order
 }
 
 const getOrderByOutTradeNo = `-- name: GetOrderByOutTradeNo :one
-SELECT id, user_id, vip_id, out_trade_no, channel, state, amount, prepay_id, transaction_id, paid_at, created_at, updated_at FROM orders WHERE out_trade_no = $1
+SELECT id, user_id, vip_id, out_trade_no, channel, state, amount, transaction_id, paid_at, created_at, updated_at FROM orders WHERE out_trade_no = $1
 `
 
 func (q *Queries) GetOrderByOutTradeNo(ctx context.Context, outTradeNo string) (Order, error) {
@@ -153,7 +150,6 @@ func (q *Queries) GetOrderByOutTradeNo(ctx context.Context, outTradeNo string) (
 		&i.Channel,
 		&i.State,
 		&i.Amount,
-		&i.PrepayID,
 		&i.TransactionID,
 		&i.PaidAt,
 		&i.CreatedAt,
@@ -163,7 +159,7 @@ func (q *Queries) GetOrderByOutTradeNo(ctx context.Context, outTradeNo string) (
 }
 
 const listPendingOrdersBefore = `-- name: ListPendingOrdersBefore :many
-SELECT id, user_id, vip_id, out_trade_no, channel, state, amount, prepay_id, transaction_id, paid_at, created_at, updated_at FROM orders
+SELECT id, user_id, vip_id, out_trade_no, channel, state, amount, transaction_id, paid_at, created_at, updated_at FROM orders
 WHERE state = 'pending'
   AND created_at < $1
   AND user_id IS NOT NULL
@@ -194,7 +190,6 @@ func (q *Queries) ListPendingOrdersBefore(ctx context.Context, arg ListPendingOr
 			&i.Channel,
 			&i.State,
 			&i.Amount,
-			&i.PrepayID,
 			&i.TransactionID,
 			&i.PaidAt,
 			&i.CreatedAt,

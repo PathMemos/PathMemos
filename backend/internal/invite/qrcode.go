@@ -28,14 +28,33 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/redis/go-redis/v9"
+	xdraw "golang.org/x/image/draw"
 )
+
+// InviteQR 生成结果：合成海报与分享缩略图的存储 URL。
+// thumbUrl 服务于微信 OpenSDK shareImageMessage 的 64KB 缩略图硬约束
+// （超限报 sendOpenReq:fail:check args fail, thumbData.size: N）。
+type InviteQR struct {
+	URL      string `json:"url"`
+	ThumbURL string `json:"thumbUrl"`
+}
+
+// parseInviteQRCache 解析 Redis 缓存值；旧版缓存是纯 URL 字符串（无缩略图），
+// 解析失败视为过期，由调用方重新生成。
+func parseInviteQRCache(cached string) (InviteQR, bool) {
+	var qr InviteQR
+	if err := json.Unmarshal([]byte(cached), &qr); err != nil || qr.URL == "" {
+		return InviteQR{}, false
+	}
+	return qr, true
+}
 
 const (
 	inviteQRCodeCacheKey    = "invite:qrcode:%s"
 	inviteQRCodeCacheTTL    = 6 * 24 * time.Hour
 	inviteQRCodeTargetRatio = 0.20
 	inviteQRCodeMargin      = 40
-	inviteQRCodeInnerOffset = 300 // B5-15：二维码距右下角的额外内缩像素
+	inviteQRCodeInnerOffset = 300 // 二维码距右下角的额外内缩像素
 	inviteShortCodeLen      = 8
 )
 
@@ -60,17 +79,17 @@ func NewQRCodeGenerator(wechat WechatClient, pool *db.Pool, storage *file.Storag
 	}
 }
 
-func (g *QRCodeGenerator) Generate(ctx context.Context, rdb *redis.Client, userID string) (string, error) {
+func (g *QRCodeGenerator) Generate(ctx context.Context, rdb *redis.Client, userID string) (InviteQR, error) {
 	return g.generate(ctx, rdb, userID, false)
 }
 
-func (g *QRCodeGenerator) GenerateRaw(ctx context.Context, rdb *redis.Client, userID string) (string, error) {
+func (g *QRCodeGenerator) GenerateRaw(ctx context.Context, rdb *redis.Client, userID string) (InviteQR, error) {
 	return g.generate(ctx, rdb, userID, true)
 }
 
-func (g *QRCodeGenerator) generate(ctx context.Context, rdb *redis.Client, userID string, raw bool) (string, error) {
+func (g *QRCodeGenerator) generate(ctx context.Context, rdb *redis.Client, userID string, raw bool) (InviteQR, error) {
 	if userID == "" {
-		return "", fmt.Errorf("user id is empty")
+		return InviteQR{}, fmt.Errorf("user id is empty")
 	}
 
 	cacheKey := fmt.Sprintf(inviteQRCodeCacheKey, userID)
@@ -80,7 +99,10 @@ func (g *QRCodeGenerator) generate(ctx context.Context, rdb *redis.Client, userI
 	if rdb != nil {
 		cached, err := rdb.Get(ctx, cacheKey).Result()
 		if err == nil && cached != "" {
-			return cached, nil
+			if qr, ok := parseInviteQRCache(cached); ok {
+				return qr, nil
+			}
+			// 旧版纯 URL 缓存（无缩略图）：视为过期，走重新生成补齐 thumbUrl
 		}
 		if err != nil && err != redis.Nil {
 			slog.WarnContext(ctx, "read invite qrcode cache failed", slog.String("user_id", userID), slog.Bool("raw", raw), slog.Any("error", err))
@@ -97,11 +119,13 @@ func (g *QRCodeGenerator) generate(ctx context.Context, rdb *redis.Client, userI
 			for i := 0; i < 10; i++ {
 				select {
 				case <-ctx.Done():
-					return "", ctx.Err()
+					return InviteQR{}, ctx.Err()
 				case <-time.After(100 * time.Millisecond):
 				}
 				if cached, cerr := rdb.Get(ctx, cacheKey).Result(); cerr == nil && cached != "" {
-					return cached, nil
+					if qr, ok := parseInviteQRCache(cached); ok {
+						return qr, nil
+					}
 				}
 			}
 			slog.WarnContext(ctx, "invite qrcode generation lock not acquired, falling through", slog.String("user_id", userID), slog.Bool("raw", raw))
@@ -112,12 +136,12 @@ func (g *QRCodeGenerator) generate(ctx context.Context, rdb *redis.Client, userI
 
 	shortCode, err := g.ensureShortCode(ctx, g.pool.Queries(), userID)
 	if err != nil {
-		return "", fmt.Errorf("ensure short code: %w", err)
+		return InviteQR{}, fmt.Errorf("ensure short code: %w", err)
 	}
 
 	user, err := g.pool.Queries().GetUserByID(ctx, userID)
 	if err != nil {
-		return "", fmt.Errorf("get user: %w", err)
+		return InviteQR{}, fmt.Errorf("get user: %w", err)
 	}
 	familyID := util.ToString(user.CurrentFamilyID)
 	if familyID == "" {
@@ -132,12 +156,12 @@ func (g *QRCodeGenerator) generate(ctx context.Context, rdb *redis.Client, userI
 		"raw":       rawStr,
 	})
 	if err != nil {
-		return "", fmt.Errorf("marshal qrcode metadata: %w", err)
+		return InviteQR{}, fmt.Errorf("marshal qrcode metadata: %w", err)
 	}
 
 	qrBytes, err := g.fetchWxaCode(ctx, shortCode)
 	if err != nil {
-		return "", fmt.Errorf("fetch wxa code: %w", err)
+		return InviteQR{}, fmt.Errorf("fetch wxa code: %w", err)
 	}
 
 	var imageBytes []byte
@@ -148,7 +172,7 @@ func (g *QRCodeGenerator) generate(ctx context.Context, rdb *redis.Client, userI
 	} else {
 		imageBytes, err = g.composite(qrBytes)
 		if err != nil {
-			return "", fmt.Errorf("composite invite image: %w", err)
+			return InviteQR{}, fmt.Errorf("composite invite image: %w", err)
 		}
 		suffix = "jpg"
 	}
@@ -156,12 +180,12 @@ func (g *QRCodeGenerator) generate(ctx context.Context, rdb *redis.Client, userI
 	fileName := shortCode + "." + suffix
 	key, storageType, size, err := g.storage.SaveSystemWithName(bytes.NewReader(imageBytes), "."+suffix, shortCode)
 	if err != nil {
-		return "", fmt.Errorf("save invite image: %w", err)
+		return InviteQR{}, fmt.Errorf("save invite image: %w", err)
 	}
 
 	fileID, err := util.NewUUID()
 	if err != nil {
-		return "", fmt.Errorf("generate invite file id: %w", err)
+		return InviteQR{}, fmt.Errorf("generate invite file id: %w", err)
 	}
 
 	// 事务内查询旧文件、创建新文件记录并删除旧文件记录；物理文件删除在 DB 提交成功后进行。
@@ -199,7 +223,7 @@ func (g *QRCodeGenerator) generate(ctx context.Context, rdb *redis.Client, userI
 		}
 		return nil
 	}); err != nil {
-		return "", err
+		return InviteQR{}, err
 	}
 
 	// DB 提交成功后再清理旧物理文件；清理失败可接受少量孤儿文件。
@@ -216,16 +240,69 @@ func (g *QRCodeGenerator) generate(ctx context.Context, rdb *redis.Client, userI
 
 	imageURL, urlErr := g.storage.URL(key, storageType)
 	if urlErr != nil {
-		return "", fmt.Errorf("get invite qrcode url: %w", urlErr)
+		return InviteQR{}, fmt.Errorf("get invite qrcode url: %w", urlErr)
 	}
 
-	if rdb != nil {
-		if err := rdb.Set(ctx, cacheKey, imageURL, inviteQRCodeCacheTTL).Err(); err != nil {
-			slog.WarnContext(ctx, "cache invite qrcode url failed", slog.String("user_id", userID), slog.Bool("raw", raw), slog.Any("error", err))
+	// 分享缩略图：OpenSDK thumbData ≤64KB 硬约束，由服务端确定性产出
+	// 240px 宽、≤60KB 的 JPEG。失败降级为 thumbUrl 为空（客户端回退压缩原图）。
+	// 缩略图不建文件记录：路径按 月份+短码-thumb 确定性命名，当月重生成覆盖写。
+	// 无 files 行即不在任何清理路径覆盖内（行扫描任务与注销按行收集均不可见），
+	// 跨月遗留为纯存储孤儿（单个仅数十 KB，已接受）；海报行则被系统文件清理豁免
+	//（ScanOldSystemFiles NOT metadata ? 'raw'，02d §8.3），回收走重生成替换与注销清理。
+	thumbURL := ""
+	if !raw {
+		if thumbBytes, err := makeInviteThumb(imageBytes); err != nil {
+			slog.WarnContext(ctx, "make invite thumb failed", slog.String("user_id", userID), slog.Any("error", err))
+		} else if thumbKey, thumbStorageType, _, err := g.storage.SaveSystemWithName(bytes.NewReader(thumbBytes), ".jpg", shortCode+"-thumb"); err != nil {
+			slog.WarnContext(ctx, "save invite thumb failed", slog.String("user_id", userID), slog.Any("error", err))
+		} else if tu, urlErr := g.storage.URL(thumbKey, thumbStorageType); urlErr != nil {
+			slog.WarnContext(ctx, "invite thumb url failed", slog.String("user_id", userID), slog.Any("error", urlErr))
+		} else {
+			thumbURL = tu
 		}
 	}
 
-	return imageURL, nil
+	if rdb != nil {
+		if payload, mErr := json.Marshal(map[string]string{"url": imageURL, "thumbUrl": thumbURL}); mErr == nil {
+			if err := rdb.Set(ctx, cacheKey, string(payload), inviteQRCodeCacheTTL).Err(); err != nil {
+				slog.WarnContext(ctx, "cache invite qrcode url failed", slog.String("user_id", userID), slog.Bool("raw", raw), slog.Any("error", err))
+			}
+		} else {
+			slog.WarnContext(ctx, "marshal invite qrcode cache failed", slog.String("user_id", userID), slog.Bool("raw", raw), slog.Any("error", mErr))
+		}
+	}
+
+	return InviteQR{URL: imageURL, ThumbURL: thumbURL}, nil
+}
+
+// makeInviteThumb 将海报缩到 240px 宽并迭代降质到 ≤60KB（OpenSDK 64KB 上限留余量）。
+func makeInviteThumb(poster []byte) ([]byte, error) {
+	src, _, err := image.Decode(bytes.NewReader(poster))
+	if err != nil {
+		return nil, fmt.Errorf("decode poster: %w", err)
+	}
+	bounds := src.Bounds()
+	for _, width := range []int{240, 180, 140} {
+		if width > bounds.Dx() {
+			continue
+		}
+		height := bounds.Dy() * width / bounds.Dx()
+		if height < 1 {
+			height = 1
+		}
+		dst := image.NewRGBA(image.Rect(0, 0, width, height))
+		xdraw.CatmullRom.Scale(dst, dst.Bounds(), src, bounds, xdraw.Over, nil)
+		for _, quality := range []int{80, 65, 50, 40} {
+			var buf bytes.Buffer
+			if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: quality}); err != nil {
+				return nil, fmt.Errorf("encode thumb: %w", err)
+			}
+			if buf.Len() <= 60*1024 {
+				return buf.Bytes(), nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("thumb exceeds 60KB even at minimum size")
 }
 
 func (g *QRCodeGenerator) ensureShortCode(ctx context.Context, q *sqlc.Queries, userID string) (string, error) {
@@ -237,7 +314,7 @@ func (g *QRCodeGenerator) ensureShortCode(ctx context.Context, q *sqlc.Queries, 
 		return "", fmt.Errorf("get user invite code: %w", err)
 	}
 
-	// A-FIX-06：短码全局唯一，碰撞需换码重试（最长 3 次）；若冲突来自 user_id 唯一键，
+	// 短码全局唯一，碰撞需换码重试（最长 3 次）；若冲突来自 user_id 唯一键，
 	// 说明本人已有码，直接复用。
 	const maxCodeAttempts = 3
 	for attempt := 0; attempt < maxCodeAttempts; attempt++ {

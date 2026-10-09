@@ -45,7 +45,7 @@ type CreateUserInviteParams struct {
 	UserOpenID pgtype.Text `json:"userOpenId"`
 }
 
-// R-21：冗余被邀请人 openid（注销后行保留，作为被邀请奖励终身一次的判定依据）。
+// 冗余被邀请人 openid（注销后行保留，作为被邀请奖励终身一次的判定依据）。
 func (q *Queries) CreateUserInvite(ctx context.Context, arg CreateUserInviteParams) (UserInvite, error) {
 	row := q.db.QueryRow(ctx, createUserInvite,
 		arg.ID,
@@ -100,6 +100,24 @@ func (q *Queries) DeleteUserInviteCodeByUserID(ctx context.Context, userID strin
 	return err
 }
 
+const existsInviteeRewardByOpenID = `-- name: ExistsInviteeRewardByOpenID :one
+SELECT EXISTS(
+    SELECT 1 FROM user_invites
+    WHERE user_open_id = $1
+      AND reward_invitee_at IS NOT NULL
+)
+`
+
+// openid 曾领过被邀请奖励（墓碑行，注销后保留，见迁移 000008/000011）则本次邀请
+// 关系整体不发奖：本人 +3 与邀请人 +7 均不发，邀请行照常创建且对邀请人可见，
+// 注册/绑定/加入主流程照常成功。
+func (q *Queries) ExistsInviteeRewardByOpenID(ctx context.Context, userOpenID pgtype.Text) (bool, error) {
+	row := q.db.QueryRow(ctx, existsInviteeRewardByOpenID, userOpenID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const getUserInviteByUserID = `-- name: GetUserInviteByUserID :one
 SELECT id, user_id, inviter_id, entry_count, reward_inviter_at, reward_invitee_at, created_at, user_open_id FROM user_invites WHERE user_id = $1
 `
@@ -137,7 +155,7 @@ SELECT ui.user_id, u.nickname, u.avatar,
         AND u.current_family_id != u.personal_family_id
         AND u.current_family_id = inv.current_family_id) AS joined
 FROM user_invites ui
-JOIN users u ON u.id = ui.user_id
+LEFT JOIN users u ON u.id = ui.user_id
 JOIN users inv ON inv.id = ui.inviter_id
 WHERE ui.inviter_id = $1
 ORDER BY ui.created_at DESC
@@ -151,6 +169,8 @@ type ListUserInvitesByInviterRow struct {
 	Joined   pgtype.Bool `json:"joined"`
 }
 
+// LEFT JOIN：受邀人注销后行保留（user_id 置 NULL，000011），关系记录仍应在
+// 邀请人"我的邀请"列表可见；昵称/头像为 NULL，由 handler 映射为"已注销"占位。
 func (q *Queries) ListUserInvitesByInviter(ctx context.Context, inviterID pgtype.Text) ([]ListUserInvitesByInviterRow, error) {
 	rows, err := q.db.Query(ctx, listUserInvitesByInviter, inviterID)
 	if err != nil {
@@ -222,7 +242,7 @@ WHERE short_code = $1
 
 // 邀请码是邀请人的稳定分享码，可被多个被邀请人多次解析（不限制一次性），
 // 过期语义由 user_invite_codes.expires_at（baseline 000001）决定：过期后解析失败。
-// R-24：解析为纯读（used_at 死遥测写副作用移除；列保留，将来做过期策略再启用）。
+// 解析为纯读（used_at 死遥测写副作用移除；列保留，将来做过期策略再启用）。
 func (q *Queries) ResolveInviterFromCode(ctx context.Context, shortCode string) (string, error) {
 	row := q.db.QueryRow(ctx, resolveInviterFromCode, shortCode)
 	var user_id string

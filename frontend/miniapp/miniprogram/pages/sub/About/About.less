@@ -45,6 +45,30 @@
   padding: 0;
 }
 
+/* 互引行:Cell 的 suffix 具名插槽,右侧"对方 logo + 灰字"组合。
+   用 flex:1 + flex-end 贴右——箭头 .iconfont 自带 margin-left:auto,
+   若这里也用 auto 外边距,flex 会把剩余空间平分给两个 auto,组合被顶到中间。
+   padding-right 对齐 Cell .suffix 默认值(20rpx),与相邻菜单灰色文字观感一致。 */
+.app-suffix {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 20rpx;
+}
+
+.app-suffix-logo {
+  width: 36rpx;
+  height: 36rpx;
+  border-radius: 8rpx;
+  margin-right: 8rpx;
+}
+
+.app-suffix-name {
+  font-size: 28rpx;
+  color: var(--ppfj-text-tertiary);
+}
+
 .fili {
   padding-bottom: 100rpx;
   text-align: center;

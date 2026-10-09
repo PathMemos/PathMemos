@@ -26,3 +26,4 @@
 ### 负面 / 代价
 
 - DB 泄露即全量 Key 泄露。缓解：一用户一键、提供 rotate/delete、注销级联删除、Key 作用域仅日记/回忆读写且 30/min 限流。
+- Key 明文副本经绑定 token 存于 Cloudflare KV（`mcp_token:<token>` → apiKey，30 天 TTL 自清）——泄露面扩展至第三方平台；rotate/注销不联动清理该副本（残留仅指向已失效 Key，回源 401，无数据风险），按需经 `DELETE /worker/register` 或 KV 手动清理（详见 02h §8.2 已知取舍）。

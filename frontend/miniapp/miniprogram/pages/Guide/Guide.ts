@@ -1,5 +1,5 @@
 
-import { setNeedShowXPa } from '../../utils/storage';
+import { setNeedShowXPa, getPendingLinkId } from '../../utils/storage';
 
 import { OSS_PUBLIC_URL } from '../../config/index';
 import i18n from '../../utils/i18n';
@@ -56,6 +56,11 @@ Page({
   next() {
     if (this.data.step === 3) {
       setNeedShowXPa(false);
+      // 受邀加入的用户（pendingLinkId 未消费）教程结束直达家庭页，落地即见已加入的家庭
+      if (getPendingLinkId()) {
+        wx.redirectTo({ url: '/pages/Family/Family' });
+        return;
+      }
       wx.redirectTo({ url: '/pages/index/index' });
     } else {
       (this as any)._safeSetData({ step: this.data.step + 1 });

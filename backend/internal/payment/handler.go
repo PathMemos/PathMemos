@@ -125,7 +125,7 @@ func (h *Handler) Cancel(w http.ResponseWriter, r *http.Request) {
 		UserID:     pgtype.Text{String: userID, Valid: true},
 	})
 	if err != nil {
-		// 真实 DB 错误不再吞掉（B6b-05）：按 500 返回，由日志与监控兜底。
+		// 真实 DB 错误按 500 返回，由日志与监控兜底。
 		slog.ErrorContext(ctx, "failed to cancel order", slog.Any("error", err))
 		middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "failed to cancel order")
 		return
@@ -146,7 +146,7 @@ func (h *Handler) Cancel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if order.State != "pending" {
-			// 订单已关闭/已支付：并发关闭竞态下 0 行属正常结果，按已关闭返回成功语义（B6b-05）。
+			// 订单已关闭/已支付：并发关闭竞态下 0 行属正常结果，按已关闭返回成功语义。
 			slog.InfoContext(ctx, "cancel order already closed", slog.String("out_trade_no", req.OutTradeNo), slog.String("state", order.State))
 			middleware.JSON(w, r, http.StatusOK, map[string]interface{}{})
 			return
@@ -175,7 +175,7 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 			middleware.JSONBizError(w, r, errors.BizOrderNotFound, "order not found")
 			return
 		}
-		// VP-P2-01：真实 DB 错误不再伪装成「订单不存在」404，按 500 + 日志暴露故障。
+		// 真实 DB 错误按 500 + 日志暴露故障，不伪装成「订单不存在」404。
 		slog.ErrorContext(ctx, "failed to get order status", slog.Any("error", err))
 		middleware.JSONError(w, r, http.StatusInternalServerError, errors.CodeInternalError, "failed to get order status")
 		return
@@ -225,12 +225,20 @@ func (h *Handler) Notify(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxNotifyBodySize+1))
 	if err != nil {
-		slog.ErrorContext(ctx, "payment notify read body failed", slog.Any("error", err))
-		writeNotifyJSON(w)
+		// 读失败（网络截断等）多为瞬时：返回非 2xx 触发微信补发（与 transient 分支同型，VP-9-AC2b/FR-3）——
+		// 固定成功会让微信停止重试，已扣款订单静默滞留 pending 至关单，且回调体丢失无从补发。
+		slog.ErrorContext(ctx, "payment notify read body failed",
+			slog.String("alert", "payment_notify_read_failed"), slog.Any("error", err))
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		//nolint:errcheck
+		_, _ = w.Write([]byte(`{"ErrCode":-1,"ErrMsg":"internal error"}`))
 		return
 	}
 	if len(body) > maxNotifyBodySize {
-		slog.WarnContext(ctx, "payment notify body too large")
+		// 垃圾/攻击输入：终止重试（固定成功），仅告警留痕（VP-9-AC2a/FR-3）。
+		slog.WarnContext(ctx, "payment notify body too large",
+			slog.String("alert", "payment_notify_body_too_large"))
 		writeNotifyJSON(w)
 		return
 	}
@@ -273,7 +281,7 @@ func (h *Handler) Notify(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		slog.InfoContext(ctx, "payment notify decrypted", slog.String("receive_id", receiveID))
-		// VP-P2-03：校验消息确实发往本小程序。虚拟支付属小程序，receive_id = 小程序 AppID
+		// 校验消息确实发往本小程序。虚拟支付属小程序，receive_id = 小程序 AppID
 		// （WECHAT_APPID / WechatAppID），不是公众号 AppID（WECHAT_MP_APPID）。
 		// 防止 Token/AESKey 复用或泄露时伪造任意应用的回调；未配置时跳过。
 		if !validReceiveID(h.cfg.WechatAppID, receiveID) {
@@ -313,7 +321,7 @@ func (h *Handler) Notify(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.handleNotify(ctx, payload); err != nil {
 		if stderrors.Is(err, errNotifyRejected) {
-			// 业务性拒绝：重试无法改变结果，返回固定成功终止微信重试并告警（B6b-04）。
+			// 业务性拒绝：重试无法改变结果，返回固定成功终止微信重试并告警。
 			slog.WarnContext(ctx, "payment notify business rejected",
 				slog.String("out_trade_no", getString(payload, "out_trade_no")),
 				slog.String("alert", "payment_notify_business_rejected"),
@@ -321,7 +329,7 @@ func (h *Handler) Notify(w http.ResponseWriter, r *http.Request) {
 			writeNotifyJSON(w)
 			return
 		}
-		// 瞬时故障（DB 抖动等）：返回非 2xx 触发微信重试，避免已扣款未到账无自动补偿（B6b-04）。
+		// 瞬时故障（DB 抖动等）：返回非 2xx 触发微信重试，避免已扣款未到账无自动补偿。
 		// L3：带 alert 标签，便于监控识别同一订单的连续重试失败。
 		slog.ErrorContext(ctx, "payment notify transient failure, will be retried", slog.String("alert", "payment_notify_transient_retry"), slog.String("out_trade_no", getString(payload, "out_trade_no")), slog.String("error", err.Error()))
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -334,9 +342,6 @@ func (h *Handler) Notify(w http.ResponseWriter, r *http.Request) {
 	writeNotifyJSON(w)
 }
 
-// extractEncryptedCiphertext 从安全模式回调 body 中提取密文：
-// 优先尝试 JSON 包装（数据格式=JSON 时微信发送 {"encrypt": "..."} 或 {"Encrypt": "..."}），
-// 再尝试 XML 包装（<xml><Encrypt>...</Encrypt></xml>）。非密文包装返回空串。
 // validReceiveID 判断解密出来的 receive_id 是否发往本小程序。未配置期望 AppID 时
 // （开源/私有化未填 WECHAT_APPID）跳过校验，避免误拒。
 func validReceiveID(expected, got string) bool {
@@ -344,6 +349,9 @@ func validReceiveID(expected, got string) bool {
 	return expected == "" || expected == got
 }
 
+// extractEncryptedCiphertext 从安全模式回调 body 中提取密文：
+// 优先尝试 JSON 包装（数据格式=JSON 时微信发送 {"encrypt": "..."} 或 {"Encrypt": "..."}），
+// 再尝试 XML 包装（<xml><Encrypt>...</Encrypt></xml>）。非密文包装返回空串。
 func extractEncryptedCiphertext(body []byte) string {
 	var jsonEnv map[string]interface{}
 	if err := json.Unmarshal(body, &jsonEnv); err == nil {

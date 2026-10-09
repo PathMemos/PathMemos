@@ -34,7 +34,7 @@ SET name = $3, updated_at = now()
 WHERE user_id = $1 AND name = $2;
 
 -- name: MergeUserCommonAddress :exec
--- B2-09：upsert 目标行（源行坐标/计数随 INSERT 带入），目标行不存在时计数不再静默丢失；
+-- upsert 目标行（源行坐标/计数随 INSERT 带入），目标行不存在时计数不静默丢失；
 -- ON CONFLICT 保证并发合并计数不丢。源行删除由 DeleteUserCommonAddressByName 在调用方事务内完成
 -- （H2：sqlc 会静默丢弃同一 named 块中的第二条语句，不可合并写在这里）。
 INSERT INTO user_common_addresses (user_id, name, lat, lon, count, updated_at)
@@ -72,7 +72,7 @@ ORDER BY de.created_at DESC
 LIMIT 1;
 
 -- name: ListLatestCoordinatesByAddresses :many
--- B2-12：按地址批量取最新坐标（DISTINCT ON），替代循环内逐条 N+1 查询。
+-- 按地址批量取最新坐标（DISTINCT ON），避免循环内逐条 N+1 查询。
 SELECT DISTINCT ON (de.address)
     de.address AS name, de.lat, de.lon
 FROM diary_entries AS de

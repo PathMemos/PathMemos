@@ -12,6 +12,32 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+// RefsAllowPhysicalDelete 是文件物理删除的引用判定谓词（纯函数，无 IO），
+// 由 file 包删除路径与 diary 包 deleteIfOnlySelfReferenced 共用，防止双实现漂移。
+//
+// refs 为 GetFileReferences 的结果（cover / entry / avatar 三类引用）。
+// selfEntryID 参数化两种删除语义：
+//   - 传空（file 包 DeleteFile / DeletePhysicalIfUnreferenced）：严格零引用语义，
+//     cover / entry / avatar 任一引用存在即阻止删除；
+//   - 传自身条目 ID（diary 包编辑/删除条目路径）：「引用者全是自己」语义，
+//     自身条目对文件的 entry 引用不阻止删除；otherEntryRefCount 为排除自身条目后
+//     仍引用该文件的条目数（调用方经 GetDiaryEntriesByImageID 查得，仅在
+//     refs.UsedByEntry 为真时需要查询），大于 0 说明还有他人条目引用，阻止删除。
+//
+// selfEntryID 为空时 otherEntryRefCount 不参与判定，调用方固定传 0。
+func RefsAllowPhysicalDelete(refs sqlc.GetFileReferencesRow, selfEntryID string, otherEntryRefCount int) bool {
+	if refs.UsedByCover || refs.AvatarUserCount > 0 {
+		return false
+	}
+	if !refs.UsedByEntry {
+		return true
+	}
+	if selfEntryID == "" {
+		return false
+	}
+	return otherEntryRefCount == 0
+}
+
 func DeleteFile(ctx context.Context, pool *db.Pool, storage *Storage, fileID, userID string) error {
 	var physicalPath, physicalStorageType string
 	err := db.WithTx(ctx, pool.Pool(), func(ctx context.Context, q *sqlc.Queries) error {
@@ -39,7 +65,7 @@ func DeleteFile(ctx context.Context, pool *db.Pool, storage *Storage, fileID, us
 			return fmt.Errorf("check file references: %w", err)
 		}
 
-		if refs.UsedByCover || refs.UsedByEntry || refs.AvatarUserCount > 0 {
+		if !RefsAllowPhysicalDelete(refs, "", 0) {
 			return ErrFileInUse
 		}
 
@@ -89,7 +115,7 @@ func DeletePhysicalIfUnreferenced(ctx context.Context, pool *db.Pool, storage *S
 			return fmt.Errorf("check references: %w", err)
 		}
 
-		if refs.UsedByCover || refs.UsedByEntry || refs.AvatarUserCount > 0 {
+		if !RefsAllowPhysicalDelete(refs, "", 0) {
 			return nil
 		}
 

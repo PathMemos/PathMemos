@@ -44,7 +44,7 @@ func summarizeUserCommonAddresses(ctx context.Context, pool *Pool, userID string
 	lons := make([]pgtype.Numeric, 0, len(top))
 	counts := make([]int32, 0, len(top))
 
-	// B2-12：一次批量查询全部地址的最新坐标，替代循环内 N+1。
+	// 一次批量查询全部地址的最新坐标，替代循环内 N+1。
 	coordNames := make([]string, 0, len(top))
 	for _, row := range top {
 		if row.Name.Valid && row.Name.String != "" {
@@ -69,7 +69,7 @@ func summarizeUserCommonAddresses(ctx context.Context, pool *Pool, userID string
 		}
 		coord, ok := coordByAddress[row.Name.String]
 		if !ok {
-			// R2-L10：单条脏数据（无坐标记录）跳过而非整批失败，避免连坐其它地址。
+			// 单条脏数据（无坐标记录）跳过而非整批失败，避免连坐其它地址。
 			continue
 		}
 		userIDs = append(userIDs, userID)

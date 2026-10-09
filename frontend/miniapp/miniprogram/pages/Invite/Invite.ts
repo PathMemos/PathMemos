@@ -1,6 +1,9 @@
 
 import request, { getBaseInfo, createCancelToken, resetLoading } from '../../utils/request';
+import { getErrorMessage } from '../../utils/http';
 import { logger } from '../../utils/logger';
+import { opsLog, flushOpsLog } from '../../utils/opslog';
+import { ensureThumbUnderLimit, toUserPath } from '../../utils/appShare';
 import themeBehavior from '../../behaviors/theme';
 import i18nBehavior from '../../behaviors/i18n';
 
@@ -11,6 +14,7 @@ Page({
     list: [] as any[],
     loading: false,
     shareImageUrl: '',
+    shareThumbUrl: '',
     generating: false,
     inviteLinkId: '',
     shareReady: false,
@@ -22,6 +26,7 @@ Page({
 
   _downloadTask: null as any,
   _shareImageCache: null as { url: string; path: string } | null,
+  _shareThumbCache: null as { url: string; path: string } | null,
   _cancelToken: null as any,
   _loginCancelToken: null as any,
   _qrCancelToken: null as any,
@@ -30,6 +35,7 @@ Page({
     (this as any)._isDestroyed = false;
     (this as any)._isHidden = false;
     (this as any)._applyPendingSetData();
+    (this as any)._safeSetData({ isAppEnv: !!(getApp() as any)?.globalData?.isAppEnv });
     if ((this as any)._cancelToken) {
       try { (this as any)._cancelToken.cancel(); } catch {  }
     }
@@ -123,7 +129,9 @@ Page({
     try {
       const { data } = await request.post('/invite/qrcode', { cancelToken }, false);
       if (data?.url) {
-        (this as any)._safeSetData({ shareImageUrl: data.url });
+        // thumbUrl 为服务端确定性 ≤60KB 的分享缩略图（OpenSDK 64KB 硬约束）；
+        // 旧后端无此字段时回退海报原图（走客户端压缩兜底）。
+        (this as any)._safeSetData({ shareImageUrl: data.url, shareThumbUrl: data.thumbUrl || data.url });
       }
     } catch (e: any) {
       logger.warn('预生成邀请图失败', e);
@@ -170,6 +178,37 @@ Page({
       path: `/pages/index/index?inviter=${encodeURIComponent(userId)}`,
       imageUrl: '/image/person_invite.png',
     };
+  },
+
+  // 多端 App 分享（open-type 不可用）：两种卡片与 onShareAppMessage 同构。
+  onAppShare(e: any) {
+    const self = this as any;
+    const api = (wx as any).miniapp?.shareMiniProgramMessage;
+    if (typeof api !== 'function') {
+      wx.showToast({ title: self.$t('error.DEFAULT'), icon: 'none' });
+      return;
+    }
+    const baseInfo = self.data.baseInfo || {};
+    const isFamily = self.data.inviteLinkId && e?.currentTarget?.dataset?.shareType === 'family';
+    const payload = isFamily
+      ? {
+          title: self.$t('family.inviteTitle', { name: baseInfo.nickName || self.$t('invite.me') }),
+          path: `/pages/Family/Family?linkId=${encodeURIComponent(self.data.inviteLinkId)}`,
+          imageUrl: '/image/family_invite.png',
+        }
+      : {
+          title: self.$t('invite.shareTitle', {
+            name: baseInfo.nickName || self.$t('invite.me'),
+            brand: self.$t('brand.name'),
+          }),
+          path: `/pages/index/index?inviter=${encodeURIComponent(baseInfo.userId || '')}`,
+          imageUrl: '/image/person_invite.png',
+        };
+    api({
+      ...payload,
+      success: () => wx.showToast({ title: self.$t('invite.sharedOk'), icon: 'success' }),
+      fail: (err: any) => wx.showToast({ title: getErrorMessage(err, self.$t('error.DEFAULT')), icon: 'none' }),
+    });
   },
 
   async saveShareImage() {
@@ -233,6 +272,70 @@ Page({
         (this as any)._shareImageCache = { url: imageUrl, path: filePath };
       }
       if ((this as any)._isDestroyed || (this as any)._isHidden) return;
+      // 多端 App：showShareImageMenu 不支持（SDK 暂不支持此 API），走官方
+      // wx.miniapp.shareImageMessage（需 OpenSDK，图片+缩略图+场景），与 NoteDetail.onShareMoment 同型。
+      if ((wx as any).miniapp) {
+        const scene = await new Promise<number>((resolveSheet) => {
+          wx.showActionSheet({
+            itemList: [
+              (this as any).$t('noteDetail.shareToChat'),
+              (this as any).$t('noteDetail.shareToMoments'),
+              (this as any).$t('noteDetail.addToFavorite'),
+            ],
+            success: (res: any) => resolveSheet([0, 1, 2][res.tapIndex] ?? 0),
+            fail: () => resolveSheet(-1),
+          });
+        });
+        if (scene < 0) return; // 用户取消选择
+        // OpenSDK 缩略图 64KB 硬约束（服务端 thumbUrl 确定性达标）+ 朋友圈要求
+        // 用户路径，见 utils/appShare。
+        let thumbSource = (this as any).data.shareThumbUrl || filePath;
+        let thumbPath = '';
+        if (thumbSource !== filePath) {
+          const tcache = (this as any)._shareThumbCache;
+          if (tcache && tcache.url === thumbSource) {
+            thumbPath = await new Promise<string>((resolve) => {
+              wx.getFileSystemManager().access({
+                path: tcache.path,
+                success: () => resolve(tcache.path),
+                fail: () => resolve(''),
+              });
+            });
+          }
+          if (!thumbPath) {
+            opsLog('share_diag', { step: 'invite-thumb-download' });
+            const download: any = await new Promise((resolve, reject) => {
+              wx.downloadFile({
+                url: thumbSource,
+                success: resolve,
+                fail: (err) => reject(new Error(err?.errMsg || 'thumb download fail')),
+              });
+            });
+            if (download.statusCode !== 200) {
+              throw new Error(`thumb download fail: ${download.statusCode}`);
+            }
+            thumbPath = download.tempFilePath;
+            (this as any)._shareThumbCache = { url: thumbSource, path: thumbPath };
+          }
+        }
+        const thumbLimited = await ensureThumbUnderLimit(thumbPath || filePath);
+        const imagePathShared = await toUserPath(filePath, 'invite-image.jpg');
+        const thumbShared = await toUserPath(thumbLimited, 'invite-thumb.jpg');
+        opsLog('share_diag', { step: 'invite-export-ok' });
+        void flushOpsLog();
+        (wx as any).miniapp.shareImageMessage({
+          imagePath: imagePathShared,
+          thumbPath: thumbShared,
+          scene,
+          success: () => wx.showToast({ title: (this as any).$t('invite.sharedOk'), icon: 'success' }),
+          fail: (err: any) => {
+            if ((this as any)._isDestroyed || (this as any)._isHidden) return;
+            if (err?.errMsg?.includes('cancel')) return;
+            wx.showToast({ title: (this as any).$t('invite.shareFail'), icon: 'none' });
+          },
+        });
+        return;
+      }
       wx.showShareImageMenu({
         path: filePath,
         needShowEntrance: true as any,

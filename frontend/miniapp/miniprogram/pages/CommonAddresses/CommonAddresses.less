@@ -211,7 +211,8 @@
   background-color: var(--ppfj-card-bg);
   box-sizing: border-box;
   padding: 0 48rpx;
-  z-index: 2;
+  // 位于 Drawer(500) 外的页面根级渲染，需压过抽屉面板
+  z-index: 600;
 
   .tool-btn {
     display: flex;

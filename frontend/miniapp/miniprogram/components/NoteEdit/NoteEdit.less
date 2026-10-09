@@ -32,6 +32,10 @@
   margin-bottom: 18rpx;
 
   .field-input-field {
+    /* 只读展示字段：禁用输入框在 Donut/WebView 渲染下会吞掉点击事件
+       （浏览器对 disabled 控件不派发 click），对指针透明后点击落到
+       外层 .field-input（bindtap=chooseLocation），双端行为一致。 */
+    pointer-events: none;
     flex: 1;
     height: 100%;
     color: var(--ppfj-text);
@@ -173,7 +177,8 @@
   padding: 0 48rpx;
   transition: 0.1s;
   opacity: 1;
-  z-index: 2;
+  // 位于 Drawer(500) 外的组件根级渲染，需压过抽屉面板、让位日历/时间选择器(999+)
+  z-index: 600;
 
   .tool-btn {
     display: flex;

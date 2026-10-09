@@ -2,6 +2,7 @@ package family
 
 import (
 	"context"
+	"encoding/json"
 	stderrors "errors"
 	"fmt"
 	"log/slog"
@@ -68,8 +69,8 @@ type AccountCleanupInfo struct {
 // DefaultAvatarMarkerPath 是系统默认头像 marker 的资源路径：全局共享资产，注销时不可删除。
 const DefaultAvatarMarkerPath = "system-assets/default-marker.png"
 
-// MarkerDeletable 判断注销清理时是否应删除用户头像 marker（B6a-14/C2）。
-// 用精确相等替换原先的 strings.Contains("default-marker") 子串判断，避免误伤合法路径。
+// MarkerDeletable 判断注销清理时是否应删除用户头像 marker。
+// 与 DefaultAvatarMarkerPath 精确相等判断，避免子串误伤合法路径。
 func (i *AccountCleanupInfo) MarkerDeletable() bool {
 	return i.MarkerPath != "" && i.MarkerPath != DefaultAvatarMarkerPath
 }
@@ -241,6 +242,10 @@ func (s *Service) JoinFamily(ctx context.Context, userID, targetFamilyID string)
 			return ErrAlreadyInTargetFamily
 		}
 
+		if err := checkRejoinCooldown(ctx, q, targetFamilyID, []string{userID}); err != nil {
+			return err
+		}
+
 		var isOwnerOfSource bool
 		if currentFamilyID != "" && currentFamilyID != personalFamilyID {
 			// sourceFamilyID 与 possibleSourceFamilyID 均来自加锁前快照；若期间状态变化，
@@ -248,7 +253,14 @@ func (s *Service) JoinFamily(ctx context.Context, userID, targetFamilyID string)
 			sourceFamilyID = currentFamilyID
 			owner, err := q.GetFamilyOwner(ctx, sourceFamilyID)
 			if err != nil {
-				return fmt.Errorf("get source family owner: %w", err)
+				if stderrors.Is(err, pgx.ErrNoRows) {
+					// 无 owner 记录属异常数据（告警并按非 owner 加入），其余 DB 错误不得静默吞掉；
+					// 与 LeaveFamily/RemoveMember/DissolveFamily 口径一致。
+					slog.WarnContext(ctx, "family has no owner record", slog.String("user_id", userID))
+					owner = ""
+				} else {
+					return fmt.Errorf("get source family owner: %w", err)
+				}
 			}
 			isOwnerOfSource = owner == userID
 		}
@@ -283,6 +295,52 @@ func (s *Service) JoinFamily(ctx context.Context, userID, targetFamilyID string)
 	return nil
 }
 
+// removedRejoinCooldown 是被 owner 移出家庭成员的邀请链接加入冷却期（ADR-0019）。
+const removedRejoinCooldown = 7 * 24 * time.Hour
+
+// checkRejoinCooldown 拒绝冷却期内经邀请链接重新加入的用户：任一 userIDs 在
+// families.removed_members 中且移除时间晚于「现在 - 冷却期」即拒绝。空名单直接放行。
+func checkRejoinCooldown(ctx context.Context, q *sqlc.Queries, targetFamilyID string, userIDs []string) error {
+	if len(userIDs) == 0 {
+		return nil
+	}
+	raw, err := q.GetFamilyRemovedMembers(ctx, targetFamilyID)
+	if err != nil {
+		return fmt.Errorf("get removed members: %w", err)
+	}
+	if rejoinBlocked(raw, userIDs, time.Now()) {
+		return ErrRemovedRejoinCooldown
+	}
+	return nil
+}
+
+// rejoinBlocked 解析 removed_members（{userID: RFC3339 移除时间}）判断是否处于冷却期；
+// 解析失败的条目按无冷却处理（该列仅由 RecordRemovedMember 以固定格式写入）。
+func rejoinBlocked(raw []byte, userIDs []string, now time.Time) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var removed map[string]string
+	if err := json.Unmarshal(raw, &removed); err != nil {
+		return false
+	}
+	deadline := now.Add(-removedRejoinCooldown)
+	for _, id := range userIDs {
+		ts, ok := removed[id]
+		if !ok {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, ts)
+		if err != nil {
+			continue
+		}
+		if t.After(deadline) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Service) joinFamilyTx(ctx context.Context, q *sqlc.Queries, user sqlc.GetUserByIDRow, targetFamilyID string, isOwnerOfSource bool) error {
 	if isOwnerOfSource {
 		// 设计决策：家庭 owner 加入别人家庭时，会把源家庭全体成员一起迁入目标家庭并解散源家庭
@@ -296,15 +354,23 @@ func (s *Service) joinFamilyTx(ctx context.Context, q *sqlc.Queries, user sqlc.G
 			return fmt.Errorf("list source members: %w", err)
 		}
 
+		// 合并路径同样过冷却检查：任一被迁移成员处于目标家庭的移除冷却期内即拒绝，
+		// 防止经第三方家庭整家合并走私冷却名单（ADR-0019）。
 		memberIDs := make([]string, 0, len(members))
-		membershipIDs := make([]string, 0, len(members))
 		for _, m := range members {
+			memberIDs = append(memberIDs, m.UserID)
+		}
+		if err := checkRejoinCooldown(ctx, q, targetFamilyID, memberIDs); err != nil {
+			return err
+		}
+
+		membershipIDs := make([]string, 0, len(members))
+		for range members {
 			membershipID, err := util.NewUUID()
 			if err != nil {
 				return fmt.Errorf("generate membership id: %w", err)
 			}
 			membershipIDs = append(membershipIDs, membershipID)
-			memberIDs = append(memberIDs, m.UserID)
 		}
 
 		if len(memberIDs) > 0 {
@@ -460,7 +526,15 @@ func (s *Service) RemoveMember(ctx context.Context, ownerID, targetUserID string
 
 	familyID := util.ToString(owner.CurrentFamilyID)
 	familyOwner, err := s.pool.Queries().GetFamilyOwner(ctx, familyID)
-	if err != nil || familyOwner != ownerID {
+	if err != nil {
+		if stderrors.Is(err, pgx.ErrNoRows) {
+			// 无 owner 记录属异常数据；其余 DB 错误不得静默吞成 403（与 LeaveFamily 口径一致）。
+			slog.WarnContext(ctx, "family has no owner record", slog.String("family_id", familyID))
+			return ErrNotOwner
+		}
+		return fmt.Errorf("get family owner: %w", err)
+	}
+	if familyOwner != ownerID {
 		return ErrNotOwner
 	}
 
@@ -489,7 +563,23 @@ func (s *Service) RemoveMember(ctx context.Context, ownerID, targetUserID string
 			return ErrCannotRemoveOwner
 		}
 
-		return s.leaveToPersonalTx(ctx, q, target)
+		if err := s.leaveToPersonalTx(ctx, q, target); err != nil {
+			return err
+		}
+
+		// 记录被移除成员与时间（ADR-0019 移除冷却）：再次移除同一个人时 jsonb merge
+		// 覆写时间戳，冷却期重新起算。
+		patch, err := json.Marshal(map[string]string{targetUserID: time.Now().UTC().Format(time.RFC3339)})
+		if err != nil {
+			return fmt.Errorf("marshal removed member patch: %w", err)
+		}
+		if err := q.RecordRemovedMember(ctx, sqlc.RecordRemovedMemberParams{
+			ID:      familyID,
+			Column2: patch,
+		}); err != nil {
+			return fmt.Errorf("record removed member: %w", err)
+		}
+		return nil
 	}); err != nil {
 		return err
 	}
@@ -510,7 +600,14 @@ func (s *Service) DissolveFamily(ctx context.Context, ownerID string) error {
 
 	familyID := util.ToString(owner.CurrentFamilyID)
 	familyOwner, err := s.pool.Queries().GetFamilyOwner(ctx, familyID)
-	if err != nil || familyOwner != ownerID {
+	if err != nil {
+		if stderrors.Is(err, pgx.ErrNoRows) {
+			slog.WarnContext(ctx, "family has no owner record", slog.String("family_id", familyID))
+			return ErrNotOwner
+		}
+		return fmt.Errorf("get family owner: %w", err)
+	}
+	if familyOwner != ownerID {
 		return ErrNotOwner
 	}
 
@@ -578,7 +675,7 @@ func (s *Service) leaveToPersonalTx(ctx context.Context, q *sqlc.Queries, user s
 		}
 	}
 
-	// B-1：无个人家庭（open 模式默认用户/异常数据）时 current_family_id 置 NULL——
+	// 无个人家庭（open 模式默认用户/异常数据）时 current_family_id 置 NULL——
 	// 空串 Valid=true 会命中 families 外键返回 500（与下方 dissolveFamilyTx 的 NULL 写法一致）。
 	currentFamilyID := pgtype.Text{}
 	if user.PersonalFamilyID.Valid && user.PersonalFamilyID.String != "" {
@@ -762,10 +859,15 @@ func (s *Service) DeleteAccount(ctx context.Context, userID string) (*AccountCle
 		}
 		isOwner := false
 		if inNormalFamily {
-			familyOwner, err := q.GetFamilyOwner(ctx, familyID)
-			if err == nil && familyOwner == userID {
+			familyOwner, ownerErr := q.GetFamilyOwner(ctx, familyID)
+			switch {
+			case ownerErr == nil && familyOwner == userID:
 				isOwner = true
 				familyIDsToClean = append(familyIDsToClean, familyID)
+			case ownerErr != nil && !stderrors.Is(ownerErr, pgx.ErrNoRows):
+				// 不上抛——事务内后续语句必然失败回滚、注销整体重试；仅补可观测性，
+				// 与 JoinFamily/LeaveFamily 等路径「其余 DB 错误不得静默吞掉」口径对齐。
+				slog.WarnContext(ctx, "delete account check family owner failed", slog.String("family_id", familyID), slog.Any("error", ownerErr))
 			}
 		}
 		var err error

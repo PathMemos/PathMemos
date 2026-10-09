@@ -250,7 +250,7 @@ func (h *Handler) GetDetails(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	extra, _ := resp["extra"].(map[string]interface{})
-	// PPJ-D01：服务端已算得条目总数，透传 count 供前端分页判断。
+	// 服务端已算得条目总数，透传 count 供前端分页判断。
 	count, _ := resp["count"].(int64)
 	middleware.JSONWithExtraAndCount(w, r, http.StatusOK, entries, extra, int(count))
 }
@@ -286,7 +286,7 @@ func writeDiaryServiceError(w http.ResponseWriter, r *http.Request, err error, a
 	switch {
 	case errors.Is(err, ErrEntryNotFound):
 		middleware.JSONError(w, r, http.StatusNotFound, pkgerrors.CodeNotFound, err.Error())
-	case errors.Is(err, ErrFileNotFound) || errors.Is(err, ErrNotFileOwner) || errors.Is(err, ErrFileNotImage) || errors.Is(err, ErrRecordTimeCrossDay) || errors.Is(err, ErrCoverImageNotFromDiary):
+	case errors.Is(err, ErrFileNotFound) || errors.Is(err, ErrNotFileOwner) || errors.Is(err, ErrFileNotImage) || errors.Is(err, ErrCoverImageNotFromDiary):
 		middleware.JSONError(w, r, http.StatusBadRequest, pkgerrors.CodeBadRequest, err.Error())
 	case errors.Is(err, ErrFamilyMismatch):
 		middleware.JSONError(w, r, http.StatusForbidden, pkgerrors.CodeForbidden, "diary does not belong to current family")
@@ -404,8 +404,8 @@ func (h *Handler) CreateMemory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	contentLen := utf8.RuneCountInString(strings.TrimSpace(req.Content))
-	if contentLen > 10000 {
-		middleware.JSONError(w, r, http.StatusBadRequest, pkgerrors.CodeBadRequest, "内容最长 10000 个字")
+	if contentLen == 0 || contentLen > 10000 {
+		middleware.JSONError(w, r, http.StatusBadRequest, pkgerrors.CodeBadRequest, "内容需为 1-10000 个字")
 		return
 	}
 
@@ -447,8 +447,8 @@ func (h *Handler) UpdateMemory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	contentLen := utf8.RuneCountInString(strings.TrimSpace(req.Content))
-	if contentLen > 10000 {
-		middleware.JSONError(w, r, http.StatusBadRequest, pkgerrors.CodeBadRequest, "内容最长 10000 个字")
+	if contentLen == 0 || contentLen > 10000 {
+		middleware.JSONError(w, r, http.StatusBadRequest, pkgerrors.CodeBadRequest, "内容需为 1-10000 个字")
 		return
 	}
 

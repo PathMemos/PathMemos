@@ -33,6 +33,8 @@ interface EventSourceParams {
   data?: any;
   onopen?: () => void;
   onmessage?: (data: any) => void;
+  // 服务端非终止性提示事件（event: notice，如 AI 回答被超时截断）；不进入 onmessage 正文流。
+  onnotice?: (data: any) => void;
   onclose?: () => void;
   onerror?: (err: Error) => void;
   // 网络类失败自动重连前回调：调用方借此清空半截输出，避免新流与旧内容拼接。
@@ -40,7 +42,7 @@ interface EventSourceParams {
 }
 
 export function eventSource(params: EventSourceParams) {
-  const { url, method = 'POST', header = {}, data = {}, onopen, onmessage, onclose, onerror, onreconnect } = params;
+  const { url, method = 'POST', header = {}, data = {}, onopen, onmessage, onnotice, onclose, onerror, onreconnect } = params;
   if (!url) {
     throw new Error(i18n.t('error.urlEmpty'));
   }
@@ -51,7 +53,7 @@ export function eventSource(params: EventSourceParams) {
   let reconnectAttempted = false;
   let buffer = '';
   let requestTask: WechatMiniprogram.RequestTask;
-  const decoder = new TextDecoder('utf-8');
+  let decoder = new TextDecoder('utf-8');
   const MAX_BUFFER_SIZE = 64 * 1024; // 64KB，与服务端 SSE 消息体大小限制对齐
 
   const onHeadersReceived = (res: any) => {
@@ -109,6 +111,9 @@ export function eventSource(params: EventSourceParams) {
         if (!reconnectAttempted && !errorFired && !ended) {
           reconnectAttempted = true;
           buffer = '';
+          // 重连必须换新 TextDecoder：流式解码器保留多字节半字符状态，
+          // 旧流末尾的半个 UTF-8 字符会污染新流开头的解码结果（buffer 清不掉）。
+          decoder = new TextDecoder('utf-8');
           logger.warn('[eventSource] transport fail, auto reconnect once', err?.errMsg || err);
           _safeCallback(onreconnect);
           startRequest();
@@ -120,7 +125,7 @@ export function eventSource(params: EventSourceParams) {
         abort();
       },
     });
-    // R2-F09：低版本基础库可能无这两个回调 API，做存在性守卫防止崩溃。
+    // 低版本基础库可能无这两个回调 API，做存在性守卫防止崩溃。
     requestTask.onHeadersReceived?.(onHeadersReceived);
     requestTask.onChunkReceived?.(onChunkReceived);
   }
@@ -129,7 +134,7 @@ export function eventSource(params: EventSourceParams) {
 
   function processBuffer() {
 
-    // R2-F08：兼容 CRLF 分隔（服务端若按规范输出 \r\n\r\n 也能正确切分）。
+    // 兼容 CRLF 分隔（服务端若按规范输出 \r\n\r\n 也能正确切分）。
     for (;;) {
       const m = /(\r?\n){2}/.exec(buffer);
       if (!m || m.index === undefined) break;
@@ -179,6 +184,11 @@ export function eventSource(params: EventSourceParams) {
       errorFired = true;
       _safeCallback(onerror, error);
       abort();
+      return;
+    }
+    if (eventName === 'notice') {
+      // 非终止性提示（如截断标记）：单独分发，不混入正文消息流。
+      _safeCallback(onnotice, { data: dataText });
       return;
     }
     if (onmessage) {

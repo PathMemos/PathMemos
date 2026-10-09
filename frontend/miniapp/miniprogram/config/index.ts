@@ -18,9 +18,18 @@ const isDevelop = envVersion === 'develop';
 
 // 阶段二：用户可在设置页切换为 'private'，经 Cloudflare Worker 路由到私有化后端。
 // SaaS 版本默认直连源站，避免 Cloudflare Worker 带来的延迟。
+// 开发版（含微信开发者工具）默认同样直连线上 SaaS——工具联调生产接口是主路径；
+// 本地后端联调需显式在 Storage 写入 dev_use_local_backend = true 才回落 localhost。
 export function getBaseURL(): string {
   if (isDevelop) {
-    return DEV_BASE_URL;
+    try {
+      const devLocal = wx.getStorageSync('dev_use_local_backend');
+      if (devLocal === true || devLocal === 'true') {
+        return DEV_BASE_URL;
+      }
+    } catch (_err) {
+      // ignore
+    }
   }
   try {
     const mode = wx.getStorageSync(STORAGE_KEY_MODE);
@@ -53,6 +62,7 @@ export const OSS_PUBLIC_URL = 'https://ppfj-images.oss-cn-hangzhou.aliyuncs.com'
 export const NEW_USER_FREE_VIP_ID = 'vip-free-0001';
 
 export const ABNORMAL_TEMPLATE_ID = 'i7mcEEMDbhYU1oAC1-E0G0xvIBCmTl6f9c3jOq11m3g';
+
 
 const SAAS_HELP_BASE = 'https://papafeiji.cn';
 

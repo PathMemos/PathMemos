@@ -245,6 +245,8 @@ func (h *Handler) JoinByInviteLink(w http.ResponseWriter, r *http.Request) {
 			middleware.JSON(w, r, http.StatusOK, map[string]interface{}{})
 		case ErrFamilyFull:
 			middleware.JSONBizError(w, r, errors.BizFamilyFull, err.Error())
+		case ErrRemovedRejoinCooldown:
+			middleware.JSONBizError(w, r, errors.BizRemovedRejoinCooldown, err.Error())
 		case ErrOperationInProgress:
 			middleware.JSONBizError(w, r, errors.BizOperationInProgress, err.Error())
 		default:
@@ -258,28 +260,37 @@ func (h *Handler) JoinByInviteLink(w http.ResponseWriter, r *http.Request) {
 	middleware.JSON(w, r, http.StatusOK, map[string]interface{}{})
 }
 
+// grantJoinReward 发放入家邀请奖励（被邀请人 +3 / 邀请人 +7 天 VIP，见 02d F-5）。
+// 奖励属资金相关发放：任何失败分支记 Error 级结构化日志并带 alert=invite_reward_failed
+// 关键字（scripts/alert-watch.sh 按关键字扫描触达告警通道，DEPLOYMENT §10），
+// 但不向客户端报错、不影响 JoinByInviteLink 的 200。
 func (h *Handler) grantJoinReward(ctx context.Context, userID, familyID string) {
 	if _, err := h.pool.Queries().GetUserInviteByUserID(ctx, toNullText(userID)); err == nil {
 		return
 	} else if !stderrors.Is(err, pgx.ErrNoRows) {
-		slog.WarnContext(ctx, "check user invite failed", "user_id", userID, "error", err)
+		slog.ErrorContext(ctx, "alert=invite_reward_failed: check user invite failed", "user_id", userID, "error", err)
 		return
 	}
 
 	u, err := h.pool.Queries().GetUserByID(ctx, userID)
 	if err != nil {
-		// F-5：奖励路径任何失败仅 slog.WarnContext，不向客户端报错；瞬时 DB 错误不静默吞掉。
-		slog.WarnContext(ctx, "grant join reward: get user failed", "user_id", userID, "error", err)
+		// 奖励路径任何失败不向客户端报错；alert= 关键字保证告警触达，瞬时 DB 错误不静默吞掉。
+		slog.ErrorContext(ctx, "alert=invite_reward_failed: grant join reward get user failed", "user_id", userID, "error", err)
 		return
 	}
-	// R-23：奖励窗口与 /auth/inviter 统一为注册后 7 天（原 5 分钟惩罚弱网/慢扫码新用户，
+	// 奖励窗口与 /auth/inviter 统一为注册后 7 天（原 5 分钟惩罚弱网/慢扫码新用户，
 	// 且两入口窗口不一致无决策依据）；inviter 侧另有月度 14 天封顶。
 	if time.Since(u.CreatedAt.Time) > 7*24*time.Hour {
 		return
 	}
 
 	ownerID, err := h.pool.Queries().GetFamilyOwner(ctx, familyID)
-	if err != nil || ownerID == "" {
+	if err != nil {
+		// F-5 第 5 步：任何失败仅记日志、不影响主流程 200——alert= 关键字走告警通道，不能无声跳过。
+		slog.ErrorContext(ctx, "alert=invite_reward_failed: grant join reward get family owner failed", slog.String("user_id", userID), slog.String("family_id", familyID), slog.Any("error", err))
+		return
+	}
+	if ownerID == "" {
 		return
 	}
 	if ownerID == userID {
@@ -290,14 +301,14 @@ func (h *Handler) grantJoinReward(ctx context.Context, userID, familyID string) 
 		if _, innerErr := q.GetUserInviteByUserID(ctx, toNullText(userID)); innerErr == nil {
 			return nil
 		} else if !stderrors.Is(innerErr, pgx.ErrNoRows) {
-			slog.WarnContext(ctx, "check user invite failed", "user_id", userID, "error", innerErr)
+			slog.ErrorContext(ctx, "alert=invite_reward_failed: check user invite failed", "user_id", userID, "error", innerErr)
 			return nil
 		}
 
 		if _, checkErr := q.GetUserByID(ctx, ownerID); checkErr != nil {
-			// ErrNoRows（owner 已不存在）为预期跳过；其余 DB 错误按 F-5 记 Warn 后跳过奖励，不静默吞掉。
+			// ErrNoRows（owner 已不存在）为预期跳过；其余 DB 错误按 F-5 记 alert 告警日志后跳过奖励，不静默吞掉。
 			if !stderrors.Is(checkErr, pgx.ErrNoRows) {
-				slog.WarnContext(ctx, "grant join reward: check owner failed, skip reward", "user_id", userID, "owner_id", ownerID, "error", checkErr)
+				slog.ErrorContext(ctx, "alert=invite_reward_failed: grant join reward check owner failed, skip reward", "user_id", userID, "owner_id", ownerID, "error", checkErr)
 			}
 			return nil
 		}
@@ -306,24 +317,38 @@ func (h *Handler) grantJoinReward(ctx context.Context, userID, familyID string) 
 		if err != nil {
 			return fmt.Errorf("generate invite id: %w", err)
 		}
-		// R-21：冗余被邀请人 openid（注销后行保留，user_id 置 NULL），终身一次判定依据。
+		// 冗余被邀请人 openid（注销后行保留，user_id 置 NULL），终身一次判定依据。
 		if _, err := q.CreateUserInvite(ctx, sqlc.CreateUserInviteParams{
 			ID:         inviteID,
 			UserID:     toNullText(userID),
 			InviterID:  toNullText(ownerID),
 			UserOpenID: toNullText(u.OpenID),
 		}); err != nil {
-			return fmt.Errorf("create user invite: %w", err)
+			if !dbx.IsUniqueViolation(err) {
+				return fmt.Errorf("create user invite: %w", err)
+			}
+			// 与 BindInviter 补绑路径并发时撞 user_id 唯一索引：对端事务已建行并发奖，本路径幂等跳过（家庭加入不被 500 打断）。
+			slog.InfoContext(ctx, "invite record created concurrently, skip join reward", slog.String("user_id", userID))
+			return nil
 		}
 
-		// R-21：先标记后发奖——同一微信主体（openid）已终身领取过被邀请奖励时跳过 +3
-		//（uq_user_invites_user_open_id 在 DB 层兜底），inviter 侧奖励不受影响。
+		// openid 曾领过被邀请奖励（墓碑行保留于 user_invites）则跳过全部奖励：
+		// +3/+7 均不发，邀请行照常创建且对邀请人可见，家庭加入主流程不受影响。
+		rewarded, rewardedErr := q.ExistsInviteeRewardByOpenID(ctx, toNullText(u.OpenID))
+		if rewardedErr != nil {
+			slog.ErrorContext(ctx, "alert=invite_reward_failed: check openid tombstone failed", slog.String("user_id", userID), slog.Any("error", rewardedErr))
+			return nil
+		}
+		if rewarded {
+			slog.InfoContext(ctx, "join rewards skipped: openid already rewarded (re-registration)", slog.String("user_id", userID))
+			return nil
+		}
+
+		// 先标记后发奖：上方墓碑预检已排除重注册身份，reward_invitee_at 只会在此处由 NULL 翻转一次；
+		// 并发双绑由行锁 + IS NULL 条件自然去重，唯一索引 uq_user_invites_user_open_id 仅作 DB 层兜底。
 		markRows, err := q.MarkInviteeRewarded(ctx, inviteID)
 		if err != nil {
-			if !dbx.IsUniqueViolation(err) {
-				return fmt.Errorf("mark invitee rewarded: %w", err)
-			}
-			slog.InfoContext(ctx, "invitee reward skipped: openid already rewarded", "user_id", userID)
+			return fmt.Errorf("mark invitee rewarded: %w", err)
 		}
 		if markRows > 0 {
 			if err := h.vipService.ExtendVIPDaysWithTx(ctx, userID, 3, q); err != nil {
@@ -359,7 +384,8 @@ func (h *Handler) grantJoinReward(ctx context.Context, userID, familyID string) 
 
 		return nil
 	}); err != nil {
-		slog.WarnContext(ctx, "grant join reward failed", "user_id", userID, "family_id", familyID, "error", err)
+		// 奖励事务失败不回滚家庭加入、不重试（02d F-5）；alert= 关键字保证发放失败经告警通道触达。
+		slog.ErrorContext(ctx, "alert=invite_reward_failed: grant join reward failed", "user_id", userID, "family_id", familyID, "error", err)
 	}
 }
 

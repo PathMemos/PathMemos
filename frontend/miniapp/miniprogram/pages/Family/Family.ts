@@ -1,6 +1,8 @@
 
 import request, { getBaseInfo, needShowXPa, createCancelToken, resetLoading } from '../../utils/request';
 import { logger } from '../../utils/logger';
+import { getErrorMessage } from '../../utils/http';
+import { localizedBizCodeMessage } from '../../utils/errorMessages';
 import { getPendingLinkId, setPendingLinkId, clearPendingLinkId } from '../../utils/storage';
 import themeBehavior from '../../behaviors/theme';
 import i18nBehavior from '../../behaviors/i18n';
@@ -74,6 +76,7 @@ Page({
     (this as any)._isDestroyed = false;
     (this as any)._isHidden = false;
     (this as any)._applyPendingSetData();
+    (this as any)._safeSetData({ isAppEnv: !!(getApp() as any)?.globalData?.isAppEnv });
     if (!(this as any)._cancelToken) {
       (this as any)._createCancelToken();
     }
@@ -200,9 +203,17 @@ Page({
         aborted = true;
         return;
       }
+      // 失效链接/家庭已满/已在家庭等业务失败必须清掉 pendingLinkId：否则 auth 层
+      // 每次登录见 pendingLinkId 就强制跳转家庭页重试，循环打扰可达链接 TTL 7 天。
+      // 纯网络/5xx 属瞬时错误（无业务 code），保留链接等待下次成功。
+      if (error?.code) {
+        clearPendingLinkId();
+      }
       if ((this as any)._isDestroyed || (this as any)._isHidden) return;
       wx.hideLoading();
-      wx.showToast({ title: error?.data?.msg || (this as any).$t('family.actionFail'), icon: 'none' });
+      // closeTheErrorMessage 抑制了 http 层通用 toast，此处优先按 biz_code 本地化
+      //（如被移除冷却 REMOVED_REJOIN_COOLDOWN），再回退后端 message/通用文案
+      wx.showToast({ title: localizedBizCodeMessage(error?.data?.biz_code) || error?.data?.message || (this as any).$t('family.actionFail'), icon: 'none' });
     } finally {
       if (!(this as any)._isDestroyed && !(this as any)._isHidden && !aborted) {
         this.fetch().catch(() => {});
@@ -225,6 +236,35 @@ Page({
       path: `/pages/Family/Family?linkId=${encodeURIComponent(linkId)}`,
       imageUrl: '/image/family_invite.png',
     };
+  },
+
+  // 多端 App 分享：open-type="share" 的微信转发能力在 App 内不可用，改用
+  // wx.miniapp.shareMiniProgramMessage 分享小程序卡片（参数与 onShareAppMessage 同构）。
+  onAppShare() {
+    const self = this as any;
+    const api = (wx as any).miniapp?.shareMiniProgramMessage;
+    if (typeof api !== 'function') {
+      wx.showToast({ title: self.$t('error.DEFAULT'), icon: 'none' });
+      return;
+    }
+    const baseInfo = self.data.baseInfo || {};
+    const linkId = self.data.inviteLinkId;
+    const payload = linkId
+      ? {
+          title: self.$t('family.inviteTitle', { name: baseInfo.nickName || self.$t('invite.me') }),
+          path: `/pages/Family/Family?linkId=${encodeURIComponent(linkId)}`,
+          imageUrl: '/image/family_invite.png',
+        }
+      : {
+          title: self.$t('family.defaultShareTitle', { brand: self.$t('brand.name') }),
+          path: '/pages/index/index',
+          imageUrl: '/image/family_invite.png',
+        };
+    api({
+      ...payload,
+      success: () => wx.showToast({ title: self.$t('invite.sharedOk'), icon: 'success' }),
+      fail: (e: any) => wx.showToast({ title: getErrorMessage(e, self.$t('error.DEFAULT')), icon: 'none' }),
+    });
   },
 
   quitFamily(e: any) {

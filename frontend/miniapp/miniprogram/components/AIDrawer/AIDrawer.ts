@@ -52,7 +52,7 @@ Component({
   _aiTextDirty: false,
   _aiFlushTimer: null as any,
   _sending: false,
-  // PPJ-A04：发送代次。每次 send 自增，旧 SSE 的回调据此失效，避免旧流 abort 时同步复位 _sending。
+  // 发送代次。每次 send 自增，旧 SSE 的回调据此失效，避免旧流 abort 时同步复位 _sending。
   _sendSeq: 0,
   _diaryCardsCancelToken: null as CancelToken | null,
   _loginCancelToken: null as CancelToken | null,
@@ -211,7 +211,7 @@ Component({
       try {
         if (self._sending || !prompt?.trim()) return;
 
-        // PD-7：与后端 maxMessageCodePoints 统一为 2500，避免两端口径不一致。
+        // 与后端 maxMessageCodePoints 统一为 2500，避免两端口径不一致。
         if ([...prompt].length > 2500) {
           wx.showToast({ title: (this as any).$t('aiDrawer.maxLength', { count: 2500 }), icon: 'none' });
           return;
@@ -280,7 +280,7 @@ Component({
 
     async _fetchDiaryCards(dates: string[], cancelToken?: CancelToken): Promise<any[]> {
       try {
-        // R3：AI 对话期间的后台卡片请求，偶发 401 不踢登录态（由 catch 静默处理）。
+        // AI 对话期间的后台卡片请求，偶发 401 不踢登录态（由 catch 静默处理）。
         const res = await request.post('/diary/info/dates', { data: { dates }, cancelToken }, false, 20000, true);
         return (res.data || [])
           .filter((item: any) => item && item.recordDate)
@@ -311,7 +311,7 @@ Component({
       const list = this.data.list as any[];
       const targetItem = list[targetIndex];
       if (!targetItem || targetItem.type !== MESSAGE_TYPES.PPFJ) return;
-      // F2-08：先记录目标消息的 _msgId，回填完成时按 _msgId 重新定位当前索引，
+      // 先记录目标消息的 _msgId，回填完成时按 _msgId 重新定位当前索引，
       // 避免请求期间列表被裁剪（trim/新消息插入）导致卡片挂到错误消息上。
       const targetMsgId = targetItem._msgId;
       if ((this as any)._diaryCardsCancelToken) {
@@ -373,7 +373,7 @@ Component({
         return;
       }
       self._aiTextDirty = false;
-      // PPJ-A04：先递增发送代次并置发送锁，再中止旧 SSE。
+      // 先递增发送代次并置发送锁，再中止旧 SSE。
       // 旧 SSE 的 abort 会同步触发其 onclose/onerror，代次不匹配时旧回调直接返回，
       // 不会把 _sending 复位导致新流在锁失效下运行（慢网/连点并发发送）。
       const sendSeq = ((self._sendSeq as number) || 0) + 1;
@@ -435,7 +435,7 @@ Component({
         }
       }
 
-      // R4：本轮消息的幂等标识。eventSource 断线重连会复用同一 data 对象重发，
+      // 本轮消息的幂等标识。eventSource 断线重连会复用同一 data 对象重发，
       // 后端据此精确识别"同一轮消息的重连"而非"重复发了两条相同消息"。
       const requestId = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
       const sse = eventSource({
@@ -481,6 +481,21 @@ Component({
               (this as any)._aiFlushTimer = null;
             }
             self._finalizeAIResponse();
+          }
+        },
+        onnotice: (res: any) => {
+          if (this._isDestroyed || this._isDetached) return;
+          if (sendSeq !== self._sendSeq) return;
+          // 服务端超时截断标记（done 前送达）：把不完整提示追加到本轮回文末尾。
+          try {
+            const notice = JSON.parse(res?.data || '');
+            if (notice?.type === 'truncated') {
+              self._aiText += (this as any).$t('aiDrawer.truncatedSuffix');
+              self._aiTextDirty = true;
+              this._scheduleAITextFlush();
+            }
+          } catch {
+            // 无法解析的提示事件忽略——正文流不受影响。
           }
         },
         onclose: () => {

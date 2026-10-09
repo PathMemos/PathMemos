@@ -86,9 +86,10 @@ type DiaryEntryImage struct {
 }
 
 type Family struct {
-	ID         string             `json:"id"`
-	IsPersonal bool               `json:"isPersonal"`
-	CreatedAt  pgtype.Timestamptz `json:"createdAt"`
+	ID             string             `json:"id"`
+	IsPersonal     bool               `json:"isPersonal"`
+	CreatedAt      pgtype.Timestamptz `json:"createdAt"`
+	RemovedMembers []byte             `json:"removedMembers"`
 }
 
 type FamilyDailyCover struct {
@@ -140,7 +141,6 @@ type Order struct {
 	Channel       string             `json:"channel"`
 	State         string             `json:"state"`
 	Amount        int32              `json:"amount"`
-	PrepayID      pgtype.Text        `json:"prepayId"`
 	TransactionID pgtype.Text        `json:"transactionId"`
 	PaidAt        pgtype.Timestamptz `json:"paidAt"`
 	CreatedAt     pgtype.Timestamptz `json:"createdAt"`

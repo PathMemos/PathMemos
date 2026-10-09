@@ -30,18 +30,6 @@
       </view>
       <image class="field-input-icon" src="../../image/icon_calendar.png" />
     </view>
-    <CalendarPicker
-      visible="{{calendarVisible}}"
-      value="{{form.date}}"
-      bind:confirm="onCalendarConfirm"
-      bind:close="onCalendarClose"
-    />
-    <TimePicker
-      visible="{{timePickerVisible}}"
-      value="{{form.time}}"
-      bind:confirm="onTimeConfirm"
-      bind:close="onTimeClose"
-    />
     <text class="drawer-title">{{_i18n['memoryEdit.content']}}</text>
     <view class="field-textarea">
       <view class="field-textarea-wrapper">
@@ -55,9 +43,24 @@
         <text wx:if="{{!form.content}}" class="field-textarea-placeholder">{{_i18n['memoryEdit.contentPlaceholder']}}</text>
       </view>
     </view>
-    <view class="drawer-footer">
-      <view class="tool-btn save-btn" catchtap="submit">{{_i18n['memoryEdit.save']}}</view>
-      <view class="tool-btn cancel-btn" catchtap="cancel">{{_i18n['memoryEdit.cancel']}}</view>
-    </view>
   </view>
 </Drawer>
+
+<!-- 日历/时间选择器与底部按钮栏均为 fixed，挪出 Drawer 的 scroll-view slot 渲染
+     （状态与事件仍在本组件内），避免滚动容器劫持 fixed 包含块；z-index 压过抽屉 500 -->
+<CalendarPicker
+  visible="{{calendarVisible}}"
+  value="{{form.date}}"
+  bind:confirm="onCalendarConfirm"
+  bind:close="onCalendarClose"
+/>
+<TimePicker
+  visible="{{timePickerVisible}}"
+  value="{{form.time}}"
+  bind:confirm="onTimeConfirm"
+  bind:close="onTimeClose"
+/>
+<view class="drawer-footer">
+  <view class="tool-btn save-btn" catchtap="submit">{{_i18n['memoryEdit.save']}}</view>
+  <view class="tool-btn cancel-btn" catchtap="cancel">{{_i18n['memoryEdit.cancel']}}</view>
+</view>

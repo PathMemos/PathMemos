@@ -6,7 +6,7 @@ const CONTENT_FONT_SIZE = 28;
 const CONTENT_MAX_LINES = 3;
 // 卡片内固定占位（rpx）：圆点+间距 24 + 时间列 120 + memory-body 左右 padding 32 + 页面左右边距 48。
 // CSS 截断（max-height: 48rpx*3）按 .main 实际可用宽度折行，估算必须覆盖这些固定占位，
-// 否则字符数启发式偏宽会漏出"CSS 已截断但无展开按钮"的内容（F2-14）。
+// 否则字符数启发式偏宽会漏出"CSS 已截断但无展开按钮"的内容。
 const CONTENT_RESERVED_RPX = 24 + 120 + 32 + 48;
 const SCREEN_WIDTH_RPX = 750;
 const CONTENT_AVAILABLE_WIDTH_RPX = SCREEN_WIDTH_RPX - CONTENT_RESERVED_RPX;

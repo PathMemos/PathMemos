@@ -2,7 +2,8 @@
 import dayjs from '../../lib/dayjs';
 import { safeDayjs, getReverseAddress, flatDistanceMeters, formatTimeLabel, type ReverseAddressResult } from '../../utils/util';
 import request, { FILE_TYPE, getErrorMessage, createCancelToken, resetLoading } from '../../utils/request';
-import { opsLog, opsLogFail } from '../../utils/opslog';
+import { opsLog, opsLogFail, flushOpsLog } from '../../utils/opslog';
+import { isAppEnv, guideToAppAuthorizeSetting } from '../../utils/appPermission';
 import i18nBehavior from '../../behaviors/i18n';
 import { i18n } from '../../utils/i18n';
 
@@ -154,28 +155,40 @@ Component({
     },
 
     requestLocation() {
+      // 多端 App：不前置查询授权态（getAppAuthorizeSetting 在部分真机上不回调、
+      // 悬挂导致整个定位流程无任何输出，实测）。官方模式即「调用定位接口
+      // 触发系统授权」，系统授权弹窗在 doGetLocation 的 getLocation 时触发；
+      // 被拒场景由 doGetLocation 的 fail 回调处理（引导系统设置）。
+      if (isAppEnv()) {
+        this.doGetLocation();
+        return;
+      }
       wx.getSetting({
         success: (res) => {
           const locationAuth = res.authSetting['scope.userLocation'];
           if (locationAuth === true || locationAuth === undefined) {
             this.doGetLocation();
           } else if (locationAuth === false) {
-            this._safeSetData({
-              confirmDialog: {
-                visible: true,
-                title: (this as any).$t('noteEdit.locationRequired'),
-                content: (this as any).$t('noteEdit.locationRequiredDesc'),
-                cancelText: (this as any).$t('common.cancel'),
-                confirmText: (this as any).$t('noteEdit.openSettings'),
-                confirmType: 'default',
-                action: 'location',
-              },
-            });
+            this._showLocationRequiredDialog();
           }
         },
         fail: () => {
           if (!(this as any)._isAlive()) return;
           wx.showToast({ title: (this as any).$t('noteEdit.openSettingsFail'), icon: 'none', duration: 2000 });
+        },
+      });
+    },
+
+    _showLocationRequiredDialog() {
+      this._safeSetData({
+        confirmDialog: {
+          visible: true,
+          title: (this as any).$t('noteEdit.locationRequired'),
+          content: (this as any).$t('noteEdit.locationRequiredDesc'),
+          cancelText: (this as any).$t('common.cancel'),
+          confirmText: (this as any).$t('noteEdit.openSettings'),
+          confirmType: 'default',
+          action: 'location',
         },
       });
     },
@@ -187,9 +200,40 @@ Component({
       // 立刻显示占位文案，让用户知道正在获取位置
       self._safeSetData({ 'form.diaryAddress': self.$t('noteEdit.locating') || '获取位置中...' });
 
+      // 诊断包（0.0.42）：隐私同意态是定位 SDK 初始化的前置，先查官方
+      // wx.miniapp.getPrivacySetting 并上报，用于判别「未同意隐私协议导致定位被框架禁用」。
+      // 查询独立发起、不阻塞主流程（该 API 在部分环境可能不回调，不等待其结果）。
+      if (isAppEnv()) {
+        try {
+          (wx as any).miniapp.getPrivacySetting({
+            success: (res: any) => {
+              console.log('[location_diag] privacy =', JSON.stringify(res));
+              opsLog('location_diag', { step: 'privacy-check', needAuthorization: res?.needAuthorization });
+              void flushOpsLog();
+            },
+            fail: (err: any) => {
+              console.log('[location_diag] privacy query fail:', err?.errMsg);
+              opsLog('location_diag', { step: 'privacy-check-fail', errMsg: err?.errMsg });
+            },
+          });
+        } catch (e) {
+          console.log('[location_diag] privacy query threw:', e);
+        }
+      }
+      console.log('[location_diag] getLocation begin, appEnv =', isAppEnv());
+
       const LOCATION_TIMEOUT_MS = 15000;
       const locationPromise = new Promise<WechatMiniprogram.GetLocationSuccessCallbackResult>((resolve, reject) => {
-        wx.getLocation({ type: 'gcj02', success: resolve, fail: reject });
+        wx.getLocation({
+          type: 'gcj02',
+          success: resolve,
+          fail: (err: any) => {
+            console.log('[location_diag] getLocation fail:', JSON.stringify(err));
+            opsLog('location_diag', { step: 'get-fail', errCode: err?.errCode, errMsg: err?.errMsg });
+            void flushOpsLog();
+            reject(err);
+          },
+        });
       });
 
       let timeoutTimer: any = null;
@@ -200,6 +244,8 @@ Component({
 
       Promise.race([locationPromise, timeoutPromise])
         .then(async ({ latitude, longitude }: any) => {
+          console.log('[location_diag] getLocation ok:', latitude, longitude);
+          opsLog('location_diag', { step: 'get-ok', lat: Number(latitude) });
           // 与 catch 分支一致：切后台后才返回定位结果时不再发起逆向解析/常用地址请求。
           if (self._isDestroyed || self._isDetached || self._isHidden) return;
           // 逆向解析和常用地址查询互不依赖，并行请求
@@ -207,6 +253,8 @@ Component({
             getReverseAddress(latitude, longitude),
             request.get('/user/common-addresses', {}, true).catch(() => ({ data: { addresses: [] } } as any)),
           ]);
+          console.log('[location_diag] reverse result =', JSON.stringify(result)?.slice(0, 200));
+          opsLog('location_diag', { step: 'reverse-ok', hasResult: !!result });
           if (self._isDestroyed || self._isDetached || self._isHidden) return;
           if (!result) {
             if (!self._isHidden) {
@@ -219,6 +267,25 @@ Component({
           if (self._isDestroyed || self._isDetached || self._isHidden) return;
           // 超时/网络失败与权限拒绝区分文案，避免超时提示"权限被拒"误导用户。
           const timedOut = err?.message === 'location timeout';
+          // 诊断：失败原因直接显示在地址栏 + 上报（0.0.42）
+          const detail = String(err?.errMsg || err?.message || (timedOut ? 'timeout' : 'unknown')).slice(0, 80);
+          console.log('[location_diag] doGetLocation catch:', detail);
+          opsLog('location_diag', { step: 'doget-catch', errMsg: detail });
+          void flushOpsLog();
+          self._safeSetData({ 'form.diaryAddress': `${(this as any).$t('noteEdit.locationFailedPrefix')}[${detail}]` });
+          // App 端系统权限被拒（auth deny/denied）：引导去系统设置重新开启。
+          if (isAppEnv() && /auth\s*den|denied|permission/i.test(detail)) {
+            wx.showModal({
+              title: (this as any).$t('noteEdit.locationRequired'),
+              content: (this as any).$t('noteEdit.locationRequiredDesc'),
+              cancelText: (this as any).$t('common.cancel'),
+              confirmText: (this as any).$t('noteEdit.openSettings'),
+              success: (m) => {
+                if (m.confirm) guideToAppAuthorizeSetting();
+              },
+            });
+            return;
+          }
           wx.showToast({ title: (this as any).$t(timedOut ? 'noteEdit.locationFailNetwork' : 'noteEdit.locationFailPermission'), icon: 'none', duration: 2000 });
         }).finally(() => {
           clearTimeout(timeoutTimer);
@@ -323,10 +390,17 @@ Component({
           }
         },
         fail: (err: any) => {
+          // 选点失败诊断：Donut 端若 LBS/权限/Key 异常会走这里，上报原始
+          // errMsg 供 client_ops_logs 排查。
+          console.log('[location_diag] chooseLocation fail:', JSON.stringify(err));
+          opsLog('location_diag', { step: 'choose-fail', errCode: err?.errCode, errMsg: err?.errMsg });
+          void flushOpsLog();
           if (self._isDestroyed || self._isDetached || self._isHidden) return;
           if (err?.errMsg?.includes('auth deny') || err?.errMsg?.includes('fail auth')) {
             wx.showToast({ title: (this as any).$t('noteEdit.locationPermissionDenied'), icon: 'none', duration: 2000 });
+            return;
           }
+          wx.showToast({ title: (this as any).$t('noteEdit.locationFail'), icon: 'none', duration: 2000 });
         },
       });
     },
@@ -386,6 +460,12 @@ Component({
 
       if (action === 'upgrade') {
         wx.navigateTo({ url: '/pages/sub/Vip/Vip' });
+        return;
+      }
+
+      if (action === 'location' && isAppEnv()) {
+        // 多端 App：wx.openSetting 不可用，跳系统权限设置页；返回后用户重试定位。
+        guideToAppAuthorizeSetting();
         return;
       }
 
@@ -511,7 +591,7 @@ Component({
       }
 
       self._submitting = true;
-      // PPJ-B08：快照提升到 try 外，便于部分上传失败时把已成功图片的 id 落回 imgList。
+      // 快照提升到 try 外，便于部分上传失败时把已成功图片的 id 落回 imgList。
       let imgSnapshot: any[] = [];
 
       try {
@@ -545,7 +625,9 @@ Component({
           }
           // 上传完成时组件处于存活状态，使用 _safeSetData 同步 imgList，
           // 由 behavior 在隐藏期间暂存、返回前台后统一 flush。
-          (this as any)._safeSetData({ imgList: newImgList.filter((item: any) => item.type !== FILE_TYPE.DELETE) });
+          // 保留 DELETE 标记（PTextarea 对 DELETE 项不渲染，UI 不变）：
+          // 若此处提前过滤，保存失败重试时删除意图永久丢失、被删图片复活。
+          (this as any)._safeSetData({ imgList: newImgList });
         } else {
           imageIds = existingUploadedIds;
         }
@@ -583,11 +665,18 @@ Component({
 
         if (self._isDestroyed || self._isDetached) return;
         opsLog('manual_record_ok', { isUpdate, hasCard: !!res?.data?.card, recordDate: this.data.form.date });
-        this.triggerEvent('submit', { recordDate: this.data.form.date, card: res?.data?.card });
+        // recordDate 优先取后端返回 card 的目标日期（跨天改期时与上海时区口径一致），
+        // card 缺失（兜底失败）时回退表单日期；isUpdate 供页面区分「编辑改期」与「新建选日期」。
+        const card = res?.data?.card;
+        this.triggerEvent('submit', {
+          recordDate: (card && card.recordDate) || this.data.form.date,
+          card,
+          isUpdate,
+        });
         this.cancel();
       } catch (error: any) {
         if (!self._isAlive()) return;
-        // PPJ-B08：部分图片已上传成功但整批失败时，把成功项标记为 UPLOADED，
+        // 部分图片已上传成功但整批失败时，把成功项标记为 UPLOADED，
         // 下次提交只补传失败图，避免重复上传（孤儿文件 + 配额浪费）。
         if (imgSnapshot.length > 0 && imgSnapshot.length === this.data.imgList.length) {
           const patched = this.data.imgList.map((item: any, i: number) => {

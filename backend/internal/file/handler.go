@@ -183,25 +183,28 @@ type uploadedPartInfo struct {
 }
 
 // rollbackUploadedParts 删除记录、物理文件并回退配额，全部 best-effort（记录日志）。
+// 回滚多因客户端断开（正是最需要清理的场景）触发，必须脱离请求 ctx，
+// 否则 ctx 已取消导致 DB/存储操作全部失败，残留记录+配额+物理文件。
 func (h *Handler) rollbackUploadedParts(ctx context.Context, userID string, parts []uploadedPartInfo) {
+	bgCtx := context.WithoutCancel(ctx)
 	for _, p := range parts {
 		if p.fileID == "" {
 			continue
 		}
-		if err := h.pool.Queries().DeleteFile(ctx, p.fileID); err != nil {
-			slog.ErrorContext(ctx, "rollback delete file record failed", slog.String("user_id", userID), slog.String("file_id", p.fileID), slog.Any("error", err))
+		if err := h.pool.Queries().DeleteFile(bgCtx, p.fileID); err != nil {
+			slog.ErrorContext(bgCtx, "rollback delete file record failed", slog.String("user_id", userID), slog.String("file_id", p.fileID), slog.Any("error", err))
 		}
 		if p.path != "" {
 			if err := h.storage.DeleteFile(p.path, p.storageType); err != nil {
-				slog.ErrorContext(ctx, "rollback delete physical file failed", slog.String("user_id", userID), slog.String("file_id", p.fileID), slog.Any("error", err))
+				slog.ErrorContext(bgCtx, "rollback delete physical file failed", slog.String("user_id", userID), slog.String("file_id", p.fileID), slog.Any("error", err))
 			}
 		}
 		if p.size > 0 {
-			if err := h.pool.Queries().DecrementUserImageStorage(ctx, sqlc.DecrementUserImageStorageParams{
+			if err := h.pool.Queries().DecrementUserImageStorage(bgCtx, sqlc.DecrementUserImageStorageParams{
 				ID:                userID,
 				ImageStorageBytes: p.size,
 			}); err != nil {
-				slog.ErrorContext(ctx, "rollback decrement storage failed", slog.String("user_id", userID), slog.String("file_id", p.fileID), slog.Any("error", err))
+				slog.ErrorContext(bgCtx, "rollback decrement storage failed", slog.String("user_id", userID), slog.String("file_id", p.fileID), slog.Any("error", err))
 			}
 		}
 	}
@@ -214,7 +217,7 @@ var (
 	errStorageQuotaExceeded = stderrors.New("user image storage quota exceeded")
 )
 
-// storageLimitFor 计算当前用户的存储配额（B5-12 与 checkStorageLimit 共用，避免重复计算）。
+// storageLimitFor 计算当前用户的存储配额（与 checkStorageLimit 共用，避免重复计算）。
 func (h *Handler) storageLimitFor(ctx context.Context, userID string) int64 {
 	limit := h.cfg.UserImageStorageLimitBytes
 	if h.vipService != nil {
@@ -333,7 +336,7 @@ func (h *Handler) handleUploadPart(ctx context.Context, part *multipart.Part, co
 		}); err != nil {
 			return fmt.Errorf("create file record: %w", err)
 		}
-		// B5-12：条件原子扣减——超限时 0 行，杜绝并发 check-then-act 竞态。
+		// 条件原子扣减——超限时 0 行，杜绝并发 check-then-act 竞态。
 		rows, err := q.IncrementUserImageStorage(ctx, sqlc.IncrementUserImageStorageParams{
 			ID:                userID,
 			ImageStorageBytes: written,
@@ -356,13 +359,16 @@ func (h *Handler) handleUploadPart(ctx context.Context, part *multipart.Part, co
 
 	if useOSS {
 		if _, uploadErr := h.storage.SaveToOSSWithKey(tmpFile, key, written); uploadErr != nil {
-			_ = h.pool.Queries().DeleteFile(ctx, fileID) //nolint:errcheck // rollback cleanup is best-effort
-			_ = h.storage.DeleteFile(key, "oss")         //nolint:errcheck // rollback cleanup is best-effort
-			if decErr := h.pool.Queries().DecrementUserImageStorage(ctx, sqlc.DecrementUserImageStorageParams{
+			// 内联回滚同样必须脱离请求 ctx（02g F-1）：客户端断开后请求 ctx 已取消，
+			// 沿用它会让 DB/存储回滚全部失败，残留记录+配额+对象三态。
+			rollbackCtx := context.WithoutCancel(ctx)
+			_ = h.pool.Queries().DeleteFile(rollbackCtx, fileID) //nolint:errcheck // rollback cleanup is best-effort
+			_ = h.storage.DeleteFile(key, "oss")                 //nolint:errcheck // rollback cleanup is best-effort
+			if decErr := h.pool.Queries().DecrementUserImageStorage(rollbackCtx, sqlc.DecrementUserImageStorageParams{
 				ID:                userID,
 				ImageStorageBytes: written,
 			}); decErr != nil {
-				slog.ErrorContext(ctx, "rollback decrement user image storage failed",
+				slog.ErrorContext(rollbackCtx, "rollback decrement user image storage failed",
 					slog.String("user_id", userID),
 					slog.String("file_id", fileID),
 					slog.Int64("size", written),
@@ -376,13 +382,14 @@ func (h *Handler) handleUploadPart(ctx context.Context, part *multipart.Part, co
 	if urlErr != nil {
 		// 与 OSS 上传失败路径一致：文件记录/配额已提交，URL 构造失败时须内联清理，
 		// 否则 DB 记录、配额增量、物理文件全部残留（仅靠 7 天孤儿清理兜底）。
-		_ = h.pool.Queries().DeleteFile(ctx, fileID) //nolint:errcheck
-		_ = h.storage.DeleteFile(key, storageType)   //nolint:errcheck
-		if decErr := h.pool.Queries().DecrementUserImageStorage(ctx, sqlc.DecrementUserImageStorageParams{
+		rollbackCtx := context.WithoutCancel(ctx)
+		_ = h.pool.Queries().DeleteFile(rollbackCtx, fileID) //nolint:errcheck
+		_ = h.storage.DeleteFile(key, storageType)           //nolint:errcheck
+		if decErr := h.pool.Queries().DecrementUserImageStorage(rollbackCtx, sqlc.DecrementUserImageStorageParams{
 			ID:                userID,
 			ImageStorageBytes: written,
 		}); decErr != nil {
-			slog.ErrorContext(ctx, "rollback decrement user image storage failed",
+			slog.ErrorContext(rollbackCtx, "rollback decrement user image storage failed",
 				slog.String("user_id", userID),
 				slog.String("file_id", fileID),
 				slog.Int64("size", written),

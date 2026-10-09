@@ -1,5 +1,6 @@
 
 import request, { createCancelToken, resetLoading } from '../../../utils/request';
+import { isSessionExpiredError, type CancelToken } from '../../../utils/http';
 import { doPay } from '../../../utils/pay';
 import { formatVipInfo } from '../../../utils/vip';
 import { openUrl } from '../../../utils/util';
@@ -9,7 +10,6 @@ import { getBackendMode } from '../../../utils/storage';
 import { getHelpBaseURL } from '../../../config/index';
 import themeBehavior from '../../../behaviors/theme';
 import i18nBehavior from '../../../behaviors/i18n';
-import type { CancelToken } from '../../../utils/http';
 
 Page({
   behaviors: [themeBehavior, i18nBehavior],
@@ -250,7 +250,7 @@ Page({
       wx.showToast({ title: (this as any).$t('vip.planInvalid'), icon: 'none' });
       return;
     }
-    if (this.data.vipInfo?.isVip === 1 && commodity.amount === 0) {
+    if (((this.data.vipInfo?.isVip ?? 0) > 0) && commodity.amount === 0) {
       wx.showToast({ title: (this as any).$t('vip.alreadyVip'), icon: 'none' });
       return;
     }
@@ -272,7 +272,12 @@ Page({
             this._finishPaying();
             return;
           }
-          this._pollOrderStatus(outTradeNo);
+          if (outTradeNo) {
+            this._pollOrderStatus(outTradeNo);
+          } else {
+            // 空 outTradeNo = App 跳转小程序支付：无 App 侧订单，返回后 onShow 刷新 VIP。
+            this._finishPaying();
+          }
         },
         () => {
           if (!(this as any)._isDestroyed && !(this as any)._isHidden) wx.hideLoading();
@@ -455,8 +460,9 @@ Page({
           this._finishPaying();
           return;
         }
-        const msg = e?.message || '';
-        if (msg === (this as any).$t('vip.loginExpired')) {
+        // 401 会话过期必须用哨兵判定：http 层 reject 的是内部哨兵字符串，
+        // 用 i18n 文案比较永远为假（文案可能改、语言可能切换），分支成死代码。
+        if (isSessionExpiredError(e)) {
           this._finishPaying();
           if (!(this as any)._isDestroyed && !(this as any)._isHidden) {
             wx.showToast({ title: (this as any).$t('vip.loginExpiredTip'), icon: 'none', duration: 2000 });

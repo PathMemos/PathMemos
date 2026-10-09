@@ -34,7 +34,10 @@
   </scroll-view>
 
   <view class="tool" wx:if="{{isLogin}}">
-    <button open-type="share" class="tool-btn share" disabled="{{!shareReady}}">
+    <button wx:if="{{!isAppEnv}}" open-type="share" class="tool-btn share" disabled="{{!shareReady}}">
+      <text>{{_i18n['family.inviteFamily']}}</text>
+    </button>
+    <button wx:else class="tool-btn share" disabled="{{!shareReady}}" bindtap="onAppShare">
       <text>{{_i18n['family.inviteFamily']}}</text>
     </button>
     <view class="tool-btn index" bindtap="toIndex">{{_i18n['family.viewDiary']}}</view>

@@ -2,8 +2,9 @@
 import dayjs from '../../lib/dayjs';
 import request, { createCancelToken, resetLoading } from '../../utils/request';
 import { closeAutoRecord, openAutoRecord } from '../../utils/autoRecord';
+import { isAppEnv } from '../../utils/appPermission';
 import { logger } from '../../utils/logger';
-import { setPendingInviter } from '../../utils/storage';
+import { getLoggedOut, getSessionId, needShowXPa, setNeedShowXPa, setPendingInviter } from '../../utils/storage';
 import type { CancelToken } from '../../utils/http';
 import themeBehavior from '../../behaviors/theme';
 import i18nBehavior from '../../behaviors/i18n';
@@ -95,7 +96,7 @@ Page({
       const { data } = await request.get('/invite/resolve', { params: { code: shortCode }, cancelToken: this._sceneCancelToken || undefined }, false);
       if (data?.userId) {
         setPendingInviter(data.userId);
-        // R4：登录已先于场景码解析完成时（极弱网 1.5s 竞态），补绑邀请人。
+        // 登录已先于场景码解析完成时（极弱网 1.5s 竞态），补绑邀请人。
         // 后端幂等：已有邀请人/注册超 7 天均静默成功，不会重复奖励。
         if (request.isLogin()) {
           request.post('/auth/inviter', { data: { inviter: data.userId } }, true).catch((e) => {
@@ -113,6 +114,23 @@ Page({
     (this as any)._isDestroyed = false;
     (this as any)._isHidden = false;
     (this as any)._applyPendingSetData();
+
+    // 主动退出/注销停留标记：不再静默登录，落登录页等手动点击（仅在登录页的主动
+    // 登录成功时清除；邀请 scene 在 onLoad 已解析进 storage，手动登录仍带邀请归属）。
+    // 有有效会话则不拦——邀请卡片补登等静默登录建立的会话对用户透明。
+    if (getLoggedOut() && !getSessionId()) {
+      wx.reLaunch({ url: '/pages/Login/Login' });
+      return;
+    }
+
+    // 新用户教程兜底：受邀注册的各入口路径（家庭卡片冷启动/静默补登）成功后
+    // 都会置 needShowXPa，在此统一补看 4 页教程（Guide 结束按 pendingLinkId
+    // 直达家庭页，无则回本页），堵住非登录页入口跳过教程的缺口。
+    if (needShowXPa()) {
+      setNeedShowXPa(false);
+      wx.redirectTo({ url: '/pages/Guide/Guide' });
+      return;
+    }
 
     // 场景码解析与首屏并行：invite/resolve 弱网下最长 20s，串行等待会造成白屏。
     // 最多等待 1.5s（覆盖绝大多数正常网络）；超时未完成则先渲染首屏，
@@ -168,17 +186,19 @@ Page({
     const initialCover = this.data.list.find((c: DiaryCard) => c.recordDate === recordDate)?.coverImg || '';
     let polls = 0;
     if (this._coverPollTimer) clearTimeout(this._coverPollTimer);
-    // R2-F14：setTimeout 链式调度，本轮请求完成后（含 catch）再排下一轮，弱网不并发叠加。
+    // setTimeout 链式调度，本轮请求完成后（含 catch）再排下一轮，弱网不并发叠加。
     const tick = async () => {
       if (++polls > 12 || this._isDestroyed || this._isHidden) {
         this._coverPollTimer = null;
         return;
       }
       try {
-        // R3：首页封面轮询属后台请求，偶发 401 不踢登录态。
+        // 首页封面轮询属后台请求，偶发 401 不踢登录态。
         const res: any = await request.get('/diary/cover-url', { params: { familyId, recordDate } }, true, true);
         const newCover = res?.data?.coverImg;
-        if (newCover && newCover !== initialCover) {
+        // 02b D-12：封面变化（含变空串——API 清空封面场景）即更新并停止轮询；
+        // 空串的占位图回退由渲染层承担。与 NoteDetail 同口径。
+        if (newCover !== undefined && newCover !== initialCover) {
           const idx = this.data.list.findIndex((c: DiaryCard) => c.recordDate === recordDate);
           if (idx >= 0) {
             this._safeSetData({ [`list[${idx}].coverImg`]: newCover });
@@ -219,7 +239,8 @@ Page({
       (this as any)._scrollThrottleTimer = null;
     }
     if ((this as any)._coverPollTimer) {
-      clearInterval((this as any)._coverPollTimer);
+      // _pollCoverForDate 为 setTimeout 链式调度，须用 clearTimeout 清理（同一句柄类型）。
+      clearTimeout((this as any)._coverPollTimer);
       (this as any)._coverPollTimer = null;
     }
     try { wx.hideLoading(); } catch {}
@@ -315,17 +336,22 @@ Page({
     }
     (this as any)._reloading = true;
     (this as any)._safeSetData({ refresherTriggered: true });
-    let prevCursor = '';
-    let prevFinished = false;
+    let prevCursor = this.cursorDate;
+    let prevFinished = this.finishedLoad;
     try {
       const isLogin = await this.ensureLogin((this as any)._loginCancelToken);
       if (!isLogin || (this as any)._isDestroyed) return;
-      prevCursor = this.cursorDate;
-      prevFinished = this.finishedLoad;
       this.cursorDate = '';
       this.finishedLoad = false;
-      await this.fetch({ skipReloadGuard: true, replace: true });
+      const ok = await this.fetch({ skipReloadGuard: true, replace: true });
       if ((this as any)._isDestroyed || (this as any)._isHidden) return;
+      if (!ok) {
+        // fetch 内部吞错（toast 已提示）：恢复旧游标。否则下次 loadMore 从空游标
+        // 重拉第一页并 append 到旧列表，造成整页重复。
+        this.cursorDate = prevCursor;
+        this.finishedLoad = prevFinished;
+        return;
+      }
       await this.fetchStats();
     } catch (e) {
       // 请求失败时恢复旧游标，避免下次 loadMore 从空游标重拉首页造成列表重复。
@@ -394,8 +420,9 @@ Page({
     }
   },
 
-  async fetch(options?: { skipReloadGuard?: boolean; replace?: boolean }) {
-    if (this.data.loading || this.finishedLoad || !this.data.isLogin || ((this as any)._reloading && !options?.skipReloadGuard) || (this as any)._isHidden) return;
+  /** 拉取列表。返回是否成功（守卫直返/成功为 true；失败/被取消为 false，供下拉刷新恢复游标）。 */
+  async fetch(options?: { skipReloadGuard?: boolean; replace?: boolean }): Promise<boolean> {
+    if (this.data.loading || this.finishedLoad || !this.data.isLogin || ((this as any)._reloading && !options?.skipReloadGuard) || (this as any)._isHidden) return true;
 
     this._resetListCancelToken();
     const cancelToken = this._listCancelToken;
@@ -417,7 +444,7 @@ Page({
           list: mappedData,
           loading: false,
         });
-        return;
+        return true;
       }
 
       const newList = this.data.list.concat(mappedData);
@@ -443,15 +470,17 @@ Page({
         });
         (this as any)._safeSetData(updateData);
       }
+      return true;
     } catch (err: any) {
       if (this._isRequestAbortError(err)) {
         (this as any)._safeSetData({ loading: false });
-        return;
+        return false;
       }
       if (!(this as any)._isDestroyed && !(this as any)._isHidden) {
         wx.showToast({ title: (this as any).$t('home.loadFail'), icon: 'none' });
       }
       (this as any)._safeSetData({ loading: false });
+      return false;
     }
   },
 
@@ -538,8 +567,11 @@ Page({
           if (res.confirm) {
             try {
               await openAutoRecord();
-              // 在 VIP 验证、后台定位授权和自动记录开启成功后，再引导订阅
-              (this as any)._safeSetData({ showSubscribePrompt: true });
+              // 在 VIP 验证、后台定位授权和自动记录开启成功后，再引导订阅（仅小程序；
+              // App 端通知已裁撤——不弹订阅授权、不记订阅，02g/06）
+              if (!isAppEnv()) {
+                (this as any)._safeSetData({ showSubscribePrompt: true });
+              }
             } catch {
               if (!(this as any)._isDestroyed && !(this as any)._isHidden) {
                 wx.showToast({ title: (this as any).$t('home.openFail'), icon: 'none' });

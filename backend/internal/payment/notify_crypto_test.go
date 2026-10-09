@@ -193,7 +193,7 @@ func TestNotify_DecryptFailure(t *testing.T) {
 	}
 }
 
-// TestNotify_ReceiveIDMismatch 解密成功但 receive_id 非本小程序 → 500 触发重试（VP-P2-03）。
+// TestNotify_ReceiveIDMismatch 解密成功但 receive_id 非本小程序 → 500 触发重试。
 func TestNotify_ReceiveIDMismatch(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {

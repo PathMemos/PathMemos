@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# PathMemos 数据库备份恢复脚本（R4）
+# PathMemos 数据库备份恢复脚本
 # 用途：迁移 squash 后无法用 migrate goto 回滚，schema 级恢复统一走本脚本。
 #
 # 用法：./scripts/restore-backup.sh <备份文件> [--yes]
@@ -47,14 +47,28 @@ if [[ "$YES" != "true" ]]; then
   [[ "${CONFIRM:-}" == "y" || "${CONFIRM:-}" == "Y" ]] || { echo "已取消"; exit 0; }
 fi
 
+# 恢复全程持有与 deploy/watchdog.sh 共享的 flock（/var/run/papafeiji-watchdog.lock）：
+# watchdog cron 每分钟取锁失败即让行，恢复期间「停 app/sse」不会被看门狗首轮探测拉起，
+# 取代旧流程「人工临时停用 watchdog cron」——无恢复后忘重启的问题（DEPLOYMENT §5）。
+exec 9>/var/run/papafeiji-watchdog.lock
+if ! flock -w 60 9; then
+  echo "警告：60 秒内未取得 watchdog 锁（看门狗正在执行？），继续恢复但期间看门狗可能干预" >&2
+fi
+
 mkdir -p backups
 SAFETY_BACKUP="backups/restore-safety-$(date +%Y%m%d%H%M%S).sql.gz"
 echo "恢复前安全备份 -> $SAFETY_BACKUP"
 docker exec "$DB_CONTAINER" pg_dump -U papafeiji papafeiji | gzip > "$SAFETY_BACKUP"
 
-# 恢复期间停掉依赖数据库的应用容器，避免写入冲突（不存在的服务忽略）。
+# 恢复期间停掉依赖数据库的应用容器，避免写入冲突。
+# 逐个停：compose 遇到不存在的服务名会整条失败且一个容器都不停（开源版根 compose 无 sse），
+# 逐个停 + 容错才能保证 app 一定被停掉。
 echo "停止应用容器..."
-docker compose stop app sse 2>/dev/null || true
+docker compose stop app 2>/dev/null || true
+docker compose stop sse 2>/dev/null || true
+if docker compose ps --status running --services 2>/dev/null | grep -q '^app$'; then
+  echo "警告：app 容器仍在运行，停止可能失败，请人工确认无写入后再继续" >&2
+fi
 
 restore_failed=0
 case "$BACKUP_FILE" in
@@ -83,6 +97,9 @@ if [[ "$restore_failed" -ne 0 ]]; then
 fi
 
 echo "启动应用容器..."
-docker compose start app sse 2>/dev/null || true
+# 与停止路径对称逐个启：compose 遇到不存在的服务名会整条失败且一个容器都不启
+# （开源版根 compose 无 sse，逐个启才能保证 app 一定被拉起）。
+docker compose start app 2>/dev/null || true
+docker compose start sse 2>/dev/null || true
 
 echo "恢复完成。"

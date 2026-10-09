@@ -1,6 +1,6 @@
 # PP-02H MCP 与开源版接入（L2）
 
-> 层级：L2 领域分册｜版本：V2.0｜状态：定稿（以当前代码为唯一事实源）
+> 层级：L2 领域分册｜版本：当前（以代码为唯一事实源）
 > 上游：PP-01 产品总览｜关联 ADR：无
 > 说明：本分册按当前代码实现整理；行内路径指向对应实现位置。行内 `路径` 为事实来源。
 
@@ -10,7 +10,7 @@
 - 解决的问题：让外部 AI 工具用 API Key 读写用户的日记与记忆；SaaS 侧隐藏源站、由 Cloudflare Worker 充当唯一公网 MCP 入口；开源版可直连自部署后端。
 - 本域边界：
   - 负责：API Key 生命周期（创建/查询/删除/轮换）、MCP Streamable HTTP 协议与两个工具、MCP REST 三件套、Worker 公网入口（`mcp.pathmemos.com`）、开源版公开 `/mcp/*`、api-worker 私有化路由（`api.pathmemos.com`）。
-  - 不负责：日记/记忆的业务语义（见 02b 与记忆相关分册）、AI 对话（见 02f）、VIP（见 02e）、Cloudflare 账号与 KV 的创建（见 `docs/mcp-worker-ops.md`）。
+  - 不负责：日记/记忆的业务语义（见 02b 与记忆相关分册）、AI 对话（见 02f）、VIP（见 02e）、Cloudflare 账号与 KV namespace 的创建（创建命令见 `api-worker/wrangler.toml` 注释；日常运维见 `docs/mcp-worker-ops.md`）。
 
 ## 2. 领域级架构决策
 
@@ -18,7 +18,7 @@
 |---|------|------|---------|
 | D1 | MCP 采用 Streamable HTTP（spec 2024-11-05），每次请求为无状态 POST，无持久连接/无 in-memory session | 降低源站连接与协议解析开销，免 session 清理（`backend/internal/mcp/server.go`） | 无 |
 | D2 | SaaS 唯一公网入口为 Cloudflare Worker `mcp.pathmemos.com`；源站仅暴露 `/internal/mcp/*`（`X-Worker-Secret` 保护） | 隐藏源站 IP、获得边缘接入（`docs/ARCHITECTURE.md` `2.3`） | 无 |
-| D3 | 开源版（`DEPLOYMENT_MODE=open`）源站直接注册公开 `/mcp`、`/mcp/diary`、`/mcp/memories`；`/internal/mcp/*` 仅在 SaaS 模式注册 | 不依赖 Worker 也能用（`main.go:235`；`mcp/rpc.go` `RegisterPublic`） | 无 |
+| D3 | 开源版（`DEPLOYMENT_MODE=open`）源站直接注册公开 `/mcp`、`/mcp/diary`、`/mcp/memories`；`/internal/mcp/*` 仅在 SaaS 模式注册 | 不依赖 Worker 也能用（`main.go` `run` open 分支 `mcpHandler.RegisterPublic`；`mcp/rpc.go` `RegisterPublic`） | 无 |
 | D4 | API Key 同时存明文（`api_keys.api_key`，产品要求永久展示）与 SHA-256（`key_hash`，认证用）；永不过期（`expires_at=9999-12-31T23:59:59Z` 占位） | 满足「永久展示」需求；认证只查 hash，不校验过期（`mcp/handler.go` `apiKeyNeverExpires`） | ADR-0007 |
 | D5 | Worker 边缘直接响应静态方法（`tools/list`、`prompts/list`、`prompts/get`），动态方法回源；GET 查询在 Worker 边缘缓存 | 减少回源与握手延迟（`mcp-worker/src/index.ts`） | 无 |
 | D6 | GET 缓存键叠加「记忆写版本」，`store_memory` 成功后换版本，使该 Key 全部查询缓存整体失效 | 让近期查询也可安全缓存，消除 store 后 30 分钟脏读（`mcp-worker/src/index.ts`） | 无 |
@@ -44,18 +44,20 @@
 验收标准：
 - 客户端访问 `https://mcp.pathmemos.com/mcp`，鉴权优先 `Authorization: Bearer <apiKey>`，其次 `?t=<token>` 查 KV `mcp_token:<token>`。
 - 两者都无 → HTTP 401 文本 `Unauthorized`。
-- `/mcp` 仅接受 POST；非 POST 返回 HTTP 405 + JSON-RPC 错误 `{"jsonrpc":"2.0","id":null,"error":{"code":-32601,"message":"Method Not Allowed: only POST is supported"}}`。注意 405 判定**先于鉴权**：未带凭据的非 POST 请求返回的是 405 而非 401。
-- 静态方法在 Worker 边缘响应：`tools/list`、`prompts/list`、`prompts/get`（内容须与 Go 后端 `server.go` 同步）；响应带 `X-Worker-Cache: STATIC`。这三处边缘响应的内容为 Go 后端 `server.go` 的副本，两处同步由 `scripts/check_mcp_static_sync.py` 机械对账 tools/prompts 的 name+description 与 prompt 正文首行（spec-check 提示级第 11 项，CI 同步执行）；正文全文仍为人工维护。静态方法响应前须回源校验 API Key（`GET /internal/mcp/diary?limit=0` + `X-Worker-Secret`，10s 超时，fail-closed）；校验结果正缓存 60s（Cache API `__keycheck/<sha256前16位>`）。
+- `/mcp` 仅接受 POST；非 POST 由 **Worker 边缘**直接返回 HTTP 405 + JSON-RPC 错误 `{"jsonrpc":"2.0","id":null,"error":{"code":-32601,"message":"Method Not Allowed: only POST is supported"}}`（Worker 本地生成，不回源）。注意 405 判定**先于鉴权**：未带凭据的非 POST 请求返回的是 405 而非 401；限流 429 判定**先于** 405 与鉴权，超限亦由 Worker 边缘返回 429 JSON-RPC 错误体（`-32000`）。**回源后的源站错误形态**（`mcp/server.go` `serveStreamable`，对齐 03-api §2.1）：协议类错误均为**纯文本**（`http.Error`）——非 POST 405、无/错 Bearer 401、坏 JSON 400、body 超限 413，仅业务错误以 200 + JSON-RPC error 返回；源站 REST 查询端点（`/internal/mcp/diary` 等）的错误经 `middleware.JSONError` 走统一 envelope（JSON 形态）；`workerSecretAuth` 密钥不匹配为纯文本 403（未配置返回 500，防御分支）。限流边界：120/min/IP **同覆盖 `handleProxy` 主链路、静态方法分支（tools/list 等）与匿名（无凭据）请求**（含无效 Bearer；静态分支若豁免，随机无效 Bearer 每请求都回源触发源站 Key 校验 DB 查询，构成零成本放大面，故与主链路同限），超限 429 JSON-RPC 错误体。已知取舍：`/mcp` POST 匿名分支的凭据解析（`resolveApiKey`，`?t=` 查 KV）发生在限流计数**之前**，随机 `?t=` 每请求消耗一次边缘 KV 读（KV 读廉价，429/401 判定仍在计数之后，维持现状）。
+- 静态方法在 Worker 边缘响应：`tools/list`、`prompts/list`、`prompts/get`（内容须与 Go 后端 `server.go` 同步）；响应带 `X-Worker-Cache: STATIC`。这三处边缘响应的内容为 Go 后端 `server.go` 的副本，两处同步由 `scripts/check_mcp_static_sync.py` 机械对账 tools/prompts 的 name+description 与 prompt 正文首行（spec-check 提示级 SR-11，CI 同步执行）；正文全文仍为人工维护。静态方法响应前须回源校验 API Key（`GET /internal/mcp/diary?limit=0` + `X-Worker-Secret`，10s 超时，fail-closed）；校验结果正缓存 60s（Cache API `__keycheck/<sha256前16位>`）。
 - 其余回源 `{BACKEND_URL}/internal/mcp/rpc`，转发头为**白名单重建**：仅 `Content-Type`（缺省补 application/json）、`Authorization: Bearer <apiKey>`、`X-Worker-Secret: <MCP_WORKER_SECRET>`、`X-Request-ID`、`Accept`，客户端其余请求头（Cookie、User-Agent 等）不透传；源站超时默认 `60s`，可经 `MCP_UPSTREAM_TIMEOUT_MS` 调整（限 5s~300s，非法回退 60s；超长流式响应被 60s 截断时调大）。
-- 源站 `serveStreamable` 校验 `X-Worker-Secret`（`workerSecretAuth`，常量时间比较；未配置返回 500——防御分支，启动校验后不可达）、限流、Bearer API Key（查 `key_hash`，认证忽略 `expires_at`）。
+- `X-Worker-Secret` 由路由挂载的 `workerSecretAuth` 在进入 `serveStreamable` 前校验（常量时间比较；未配置返回 500——防御分支，启动校验后不可达）；`serveStreamable` 内依次校验：方法（405）→ Bearer 存在性（缺失 401）→ 限流（429）→ Bearer API Key 认证（查 `key_hash`，认证忽略 `expires_at`）。
+- **边缘缓存 × 小程序侧删除（已知取舍）**：GET **Worker 边缘**缓存（近期 1min/历史 5min）仅因 `store_memory`/REST 写 bump 版本而失效，**不感知小程序侧删除**（删除发生在源站 REST 路径，无到 Worker 的失效通道）——已删日记/回忆最长 5 分钟仍可经 MCP 读到；读方须持有该用户 API Key（自访问场景），影响与源站缓存同步失效语义的差异见 02b D-11。源站 Redis 缓存（`mcp:diary/mem:<userID>`）则随小程序侧全部写/删路径同步失效（`diary/service.go` 各写路径 8 处 + 后台自动成文路径调用 `InvalidateUserCache`，见 02c AR-8.4）。
 
 ### MCP-3 绑定页 /auth
 
 验收标准：
 - `GET /auth` 返回 HTML 表单（粘贴 API Key）。
 - `POST /auth/bind`：按 IP 限流 10/min（超限 429 HTML）；缺 key 返回 400 HTML。
+- `/mcp`、`/mcp/diary`、`/mcp/memories` 主链路（`handleProxy`，含无效 Bearer）：按 IP 限流 120/min（跟踪上限 5000 IP），超限返回 HTTP 429 + JSON-RPC 错误 `{code:-32000,message:"Too Many Requests"}`；该判定**先于** 405 方法判定与鉴权，无效 Key 请求同样计数，不再每请求回源打后端 DB 校验。
 - 用该 key 调 `GET {BACKEND_URL}/internal/mcp/diary?limit=1`（带 `X-Worker-Secret`，10s 超时）校验：`401` → HTML「API Key 无效或已过期」401；非 2xx → 502；网络失败 → 502。
-- 校验成功：`token = crypto.randomUUID()` 写入 KV `mcp_token:<token>` → `apiKey`，TTL `30 天`；HTML 展示 `{origin}/mcp?t=<token>` 与 MCP 配置示例。
+- 校验成功：`token = crypto.randomUUID()` 写入 KV `mcp_token:<token>` → `apiKey`，TTL `30 天`；HTML 展示 `{origin}/mcp?t=<token>` 与 MCP 配置示例。已知取舍：`?t=` 即 30 天免 Header 凭据，经浏览器历史/截图/日志泄露的面与 Bearer 头同权——绑定页提示勿转发完整 URL，不改传递方式（改 Header 传递需客户端改造，收益不匹配）。
 
 ### MCP-4 工具调用 store_memory / query_memories
 
@@ -64,7 +66,7 @@
 - `notifications/initialized` 返回 202 Accepted（无响应体）；无 `id` 的通知类请求（notifications/*、tools/call、prompts/*、未知方法）返回 202；**例外**：`initialize` 与 `tools/list` 无 `id` 时仍返回 200 + result。
 - `tools/list` 返回两项：`store_memory`、`query_memories`（schema 见 5.4 节）。
 - `tools/call` `store_memory`：校验 `record_time`（RFC3339，必填）、`title`（trim 后 1–50 runes）、`content`（trim 后 1–10000 runes）；失败 `-32602`；DB 失败 `-32603 保存失败，请重试`；成功文本「已保存。ID: <memoryID>」。
-- `tools/call` `query_memories`：默认近 90 天、limit 默认 500；负值/0 归一为 500；上限 1000；日期跨度 >180 天 → `-32602`；成功返回格式化文本 + `truncated` 布尔；超预算时文本末尾附「[注意] 结果数量过多…」。工具参数 `limit≤0` 归一为默认 500；REST 端 `limit=0` 合法（返回空结果）。
+- `tools/call` `query_memories`：默认近 90 天、limit 默认 500；负值/0 归一为 500；上限 1000；日期跨度 >180 天 → `-32602`；成功返回格式化文本 + `truncated` 布尔；超预算时文本末尾附「[注意] 结果数量过多…」。另有独立于条目预算的第二层字节截断：单工具文本经 `appendToolText` 在 `maxToolTextBytes = maxMcpMessageSize - 512` 处截断并附「\n...（内容过长已截断）」（`mcp/server.go`）。工具参数 `limit≤0` 归一为默认 500；REST 端 `limit=0` 合法（返回空结果）；REST 端 limit 非法值（非数字/负数）由 `parseMcpLimit` 静默回落默认 500（宽松语义，仅日期参数报 400）。
 - 响应超 64KB：JSON-RPC 直接返回 `-32603 response too large`；REST 端走预算截断并返回 `truncated`，两种策略并存。
 - `prompts/list` 返回 `memory-sync` 与 `memory-digest`（`arguments: []`）；`prompts/get` 返回对应 description 与 user 文本（常量 `memorySyncPrompt`/`memoryDigestPrompt`）；未知 name → `-32602 prompt not found`。
 - 未知 method 且有 id → `-32601 method not found`；仅 `tools/call`/REST 会访问 DB。
@@ -72,7 +74,7 @@
 ### MCP-5 MCP REST 三件套
 
 验收标准：
-- `GET /internal/mcp/diary` 与 `GET /internal/mcp/memories`：先限流（`KeyRateLimiter 30/min`：分桶键取自 Authorization 头原文——无 Bearer 前缀时按 `anon:<IP>`，有 Bearer 前缀时按 `sha256(Bearer 原文)`；**分桶键未验证**，随机 Bearer 每请求新桶可绕过本层，防线与已接受风险见 `ARCHITECTURE-INVARIANTS.md` §9），再 Bearer API Key 认证（失败 401），再解析日期与 limit。
+- `GET /internal/mcp/diary` 与 `GET /internal/mcp/memories`：先限流（`KeyRateLimiter 30/min`：分桶键取自 Authorization 头原文——无 Bearer 前缀或 Bearer 为空时按 `anon:<IP>`，有 Bearer 前缀时按 `sha256(Bearer 原文)`；**分桶键未验证**，随机 Bearer 每请求新桶可绕过本层。随机 Bearer 的放大面已被 Worker 边缘 `120/min/IP`（代理与静态分支同限）封顶，Key 层对随机键空转不构成风险，见 `ARCHITECTURE-INVARIANTS.md` §9），再 Bearer API Key 认证（失败 401），再解析日期与 limit。
 - `GET /diary` 按日聚合输出 `[{recordDate, entryCount, entries:[{time,location,content}]}]` + `truncated`。
 - `GET /memories` 合并 memories 与 diary_entries，按时间倒序，输出 `[{created_at,title,content,location}]` + `truncated`。
 - `POST /memories`：Bearer + 限流；body ≤64KB（超出 HTTP 413 `code=4130`）；校验 `record_time`、`title`、`content`；失败 400 `code=4000` + 中文 message；成功 `code=0000` + `{"memory_id": "..."}`，并在同一事务 `CreateMemory` + `UpsertDiary`，成功后尽力失效 MCP 查询缓存。
@@ -90,9 +92,9 @@
 
 验收标准：
 - 注册：`POST /worker/register` body `{url, apiKey}`；`sessionId`（Bearer）非空为前置（空 → 401 `4010`）；POST/DELETE 按 `CF-Connecting-IP` 限流 10/min（超出 429 `4290`）。
-- URL 必须 `https://` 且为独立域名/根路径（带子路径、query、hash → 400 `4001`）；`apiKey` 长度 <16 → 400 `4000`。
-- 目标主机过 SSRF 黑名单：拒绝 localhost/`.local`/`.internal` 后缀、私网/链路本地/保留 IPv4 段与 IPv6 字面量（`api-worker/src/lib.ts` `isDisallowedBackendHost`），命中 → 400 `4001 backend host not allowed`。
-- 握手探测：`GET {url}/system/config` 必须 `data.mode=="open"`（否则 400 `4001`）；`GET {url}/vip` 不能返回 401（401 → 400 `4003`）；探测网络失败或响应非 JSON → 400 `4002`；探测超时各 10s。
+- URL 必须 `https://`（否则 400 `4000`）且为独立域名/根路径（带子路径、query、hash、URL 解析失败 → 400 `4001`）；`apiKey` 长度 <16 → 400 `4000`。
+- 目标主机过 SSRF 黑名单：拒绝 localhost/`.localhost`/`.local`/`.localdomain`/`.internal` 后缀、私网/链路本地/保留 IPv4 段与 IPv6 字面量（`api-worker/src/lib.ts` `isDisallowedBackendHost`），命中 → 400 `4001 backend host not allowed`。
+- 握手探测：`GET {url}/system/config` 必须 `data.mode=="open"`（否则 400 `4001`）；`GET {url}/vip` 不能返回 401（401 → 400 `4003`）；探测网络失败或响应非 JSON → 400 `4002`；探测超时各 10s。已知取舍：`/system/config` 探测只看 `data.mode` 不校验响应 `code`，`/vip` 只拦 401（其余 4xx/5xx 放行）——探测宽松的后果仅是注册者自身路由配置可能不可用（私有后端仍会独立鉴权），无越权/资损面。
 - 通过后 KV 写 `backend_api_key:<sha256hex(apiKey)>` → `{"type":"private","url":"..."}`（不存明文 key）；KV 写/删失败返回 502 `code=5001 storage temporarily unavailable, retry`（不裸抛 500）。
 - 注销：`DELETE /worker/register` body `{apiKey}` → 删除对应 KV，返回 `{"code":"0000","message":"ok","deleted":true}`；body 缺失或 `apiKey` 为空/非字符串时不删除任何 KV，返回 `{"code":"0000","message":"no apiKey provided","deleted":false}`，调用方据 `deleted` 可区分（api-worker/src/index.ts）。
 - `/worker/register` 以 session 非空为前置校验，实际可信性由「持有 API Key」与握手探测共同保证。
@@ -104,12 +106,12 @@
 ### MCP-8 Worker GET 缓存与记忆写版本
 
 验收标准：
-- 仅 GET `/mcp/diary`、`/mcp/memories` 可缓存；缓存键为「剔除 `t` 参数后的 URL + `_<sha256前16位(apiKey)>_<memVersion>`」。
+- 仅 GET `/mcp/diary`、`/mcp/memories` 可缓存；缓存键为「剔除 `t` 参数后的 URL + `_<sha256前16位(apiKey)>_<memVersion>`」，回源上游请求的查询串同样剔除 `t`（token 不进源站访问日志）。命中响应向客户端下发 `Cache-Control: public, max-age=<60/300>`（写缓存时设置、HIT 时原样返回）——MCP 客户端本地可能再缓存 1–5 分钟，store 后即使边缘版本已失效、客户端本地缓存仍可能陈旧（与边缘 TTL 同族的有界陈旧，已接受）。
 - TTL：无日期参数或查询范围含最近 3 天 → 1 分钟；纯历史 → 5 分钟（小程序写入不经 Worker，边缘缓存无法跨路径失效，故收窄陈旧窗口）。日期以 `new Date(s + "T00:00:00Z")` 按 UTC 解析，源站按上海时区，跨时区边界时两侧 TTL 档位可能相差一档。
 - `store_memory` 的 `tools/call` 或 `POST /mcp/memories` 返回 2xx 后，写新的 `memVersion`（UUID，Cache-Control max-age=3600）到 `caches.default`，key 为 `{BACKEND_URL}/__memver/<sha256前16位(apiKey)>`。
 - 命中缓存响应加 `X-Worker-Cache: HIT`；所有响应加 `X-Request-ID`（缺省由 Worker 生成 UUID）。
 - 缓存对象大小：源站结果 >64KB 时不写源站 Redis 缓存（源站侧判断），Worker 侧缓存由 `cacheable && status==200` 决定。
-- `tools/call` body 非 JSON/解析失败时**保守按写处理**（bump 写版本，宁多失效不脏读）；KV 写失败不裸抛：绑定页 `/auth/bind` 返回 502 可重试提示（mcp-worker）。
+- `tools/call` body 非 JSON/解析失败时**保守按写处理**（bump 写版本，宁多失效不脏读）；body 为合法 JSON 但非对象（数组/字符串等）时判为非写、不 bump——该形态在上游 `json.Unmarshal` 即失败（400），不可能成为成功写入，无脏读面。KV 写失败不裸抛：绑定页 `/auth/bind` 返回 502 可重试提示（mcp-worker）。
 
 ## 4. 数据模型
 
@@ -139,7 +141,7 @@
 | `mcp:diary:<userID>:<start>:<end>:<limit>` | 30min（`mcpCacheTTL`） | GET diary 结果（JSON 字节），>64KB 不写 |
 | `mcp:mem:<userID>:<start>:<end>:<limit>` | 30min | GET memories 结果（JSON 字节），>64KB 不写 |
 
-失效：`InvalidateUserCache` 以 `SCAN`（count 100）删除 `mcp:diary:<userID>:*` 与 `mcp:mem:<userID>:*`；由 `createMemoryForUser` 成功后尽力调用（Redis 不可用由 TTL 兜底）。
+失效：`InvalidateUserCache` 以 `SCAN`（count 100）删除 `mcp:diary:<userID>:*` 与 `mcp:mem:<userID>:*`；触发面为 `createMemoryForUser` 成功后尽力调用 **以及小程序侧日记/记忆全部写删路径**（`diary/service.go` 创建/更新/删除/整日删除/记忆删除等 8 处）与**后台自动成文路径**（`autorecord/service.go`，本轮有成文时锁释放后异步失效，见 02c AR-8.4；Redis 不可用由 TTL 兜底）。不删 `ai:family_summary:*`（AI 家庭背景缓存 30min TTL 兜底，见 02f AI-5 已知有界陈旧登记）。
 
 ## 5. API 契约
 
@@ -164,7 +166,7 @@ API Key 数据边界：Key 只能访问其属主用户本身有权限访问的�
 | POST | `/mcp/memories` | 同上 | API Key | 创建记忆 REST |
 | GET | `/mcp/memories` | 同上 | API Key | 记忆查询 REST |
 
-> 路由挂载：`apiRouter`（`WorkerAuth(cfg.WorkerSecret, "/api/prod/payment/virtualPayNotify", "/wx/callback", "/internal/mcp")`）。注意 `/internal/mcp` 在 WorkerAuth 的 skip 前缀内，即不由 `WORKER_SECRET` 校验，而由 `workerSecretAuth` 用 `MCP_WORKER_SECRET` 保护（`main.go:207`、`mcp/rpc.go`）。
+> 路由挂载：`apiRouter`（`WorkerAuth(cfg.WorkerSecret, "/api/prod/payment/virtualPayNotify", "/wx/callback", "/internal/mcp")`）。注意 `/internal/mcp` 在 WorkerAuth 的 skip 前缀内，即不由 `WORKER_SECRET` 校验，而由 `workerSecretAuth` 用 `MCP_WORKER_SECRET` 保护（`main.go` `run` 的 WorkerAuth 挂载、`mcp/rpc.go`）。
 
 ### 5.2 Worker 公网端点（mcp-worker，`mcp.pathmemos.com`）
 
@@ -179,6 +181,8 @@ API Key 数据边界：Key 只能访问其属主用户本身有权限访问的�
 | GET | `/mcp/memories` | Bearer 或 `?t=` | 回源 `/internal/mcp/memories`，含边缘缓存 |
 | 其他 | 任意 | — | 404 `Not Found` |
 
+> `/health` 为公开探测面：不校验 HTTP 方法，每个请求回源一次（15s 超时，大陆白天高峰 CF→源站国际链路拥塞、回源 5s+ 属常态，见 uptime-check.sh 拨测面 20s 超时）；**按 IP 限流 60/min**（`isHealthRateLimited`，与主链路同款滑动窗口工厂）——防零成本请求打满 Worker 请求配额殃及主链路正常流量；拨测（5 分钟一探）余量充足。「不校验方法 + 回源探测源站连通性」保持现状（拨测语义需要）。
+
 ### 5.3 api-worker 端点（`api.pathmemos.com`）
 
 | 方法 | 路径 | 鉴权 | 说明 |
@@ -187,7 +191,7 @@ API Key 数据边界：Key 只能访问其属主用户本身有权限访问的�
 | DELETE | `/worker/register` | 同上 | 注销；返回 `{"code":"0000","message":"ok","deleted":true}`；缺 body / 空 `apiKey` 返回 `{"code":"0000","message":"no apiKey provided","deleted":false}` |
 | 其他 | 任意 | Bearer/`X-Private-Api-Key` | 按上文路由转发；无法识别的私有 key 组合返回 4031 |
 
-api-worker 错误码：`4000`（url/apiKey 不合法）、`4001`（URL 形状/非 open 后端）、`4002`（目标不可达）、`4003`（apiKey 被后端拒绝）、`4010`（缺 session）、`4031`（私有路由停用/未注册）、`4050`（方法不允许）、`4290`（注册限流）、`5020`（转发不可达）、`5030`（KV 读取失败）。
+api-worker 错误码：`4000`（url/apiKey 不合法）、`4001`（URL 形状/非 open 后端）、`4002`（目标不可达）、`4003`（apiKey 被后端拒绝）、`4010`（缺 session）、`4031`（私有路由停用/未注册）、`4050`（方法不允许）、`4290`（注册限流）、`5001`（注册/注销 KV 写入失败）、`5020`（转发不可达）、`5030`（KV 读取失败）。
 
 > 上述错误码是 **api-worker 自有词汇**，与源站 `code` 固定枚举（03-api §3.1）相互独立，勿混用或改写源站枚举。
 
@@ -229,7 +233,7 @@ api-worker 错误码：`4000`（url/apiKey 不合法）、`4001`（URL 形状/�
 | 分页默认 / 上限 | 500 / 1000（`defaultMcpPageSize` / `maxMcpEntries`） | `mcp/handler.go` |
 | 默认回溯天数 | 90 天（`mcpDiaryDefaultDaysBack`） | `mcp/handler.go`、`mcp/server.go` |
 | 日期跨度上限 | 180 天（`maxMcpDateRangeDays`） | 同上 |
-| API Key 限流 | 30/min，maxBuckets 5000，key=sha256(apiKey) 或 `anon:<IP>` | `mcp/handler.go` `NewKeyRateLimiter` |
+| API Key 限流 | 30/min，maxBuckets 5000，key=sha256(apiKey) 或 `anon:<IP>`（无 Bearer 前缀/空 Bearer） | `mcp/handler.go` `NewKeyRateLimiter` |
 | open 公开 IP 限流 | 60/min | `mcp/rpc.go` `RegisterPublic` |
 | 源站 Redis 缓存 TTL | 30min | `mcp/handler.go` `mcpCacheTTL` |
 | API Key 永久有效期 | `9999-12-31T23:59:59Z` | `mcp/handler.go` `apiKeyNeverExpires` |
@@ -238,8 +242,9 @@ api-worker 错误码：`4000`（url/apiKey 不合法）、`4001`（URL 形状/�
 | Worker 记忆写版本 TTL | 3600s | `mcp-worker/src/index.ts` |
 | 绑定 token TTL | 30 天 | `mcp-worker/src/index.ts` |
 | /auth/bind 限流 | 10/min/IP，跟踪上限 1000 IP | `mcp-worker/src/index.ts` |
+| /mcp 主链路限流 | 120/min/IP，跟踪上限 5000 IP（含无效 Bearer，超限 429 JSON-RPC -32000） | `mcp-worker/src/lib.ts isRateLimited` / `index.ts handleProxy` |
 | api-worker 注册限流 | 10/min/IP，跟踪上限 10000 IP | `api-worker/src/index.ts` |
-| Worker 上游超时 | 代理 60s；绑定校验 10s；/health 探测 5s；静态方法 key 校验回源 10s | `mcp-worker/src/index.ts` |
+| Worker 上游超时 | 代理 60s；绑定校验 10s；/health 探测 15s（高峰国际链路回源 5s+ 属常态，探活只判「不通」）；静态方法 key 校验回源 10s | `mcp-worker/src/index.ts` |
 | api-worker 转发超时 | 默认 60s；`/file/upload`、`/file/download` 360s；`/ai/chat` 不设超时 | `api-worker/src/lib.ts` |
 | serverInfo | `memory-mcp` / `1.0.0` | `mcp/server.go` |
 | 最低协议版本 | `2024-11-05` | `mcp/server.go` |
@@ -253,6 +258,7 @@ api-worker 错误码：`4000`（url/apiKey 不合法）、`4001`（URL 形状/�
 - `workerSecretAuth` 用 `crypto/subtle.ConstantTimeCompare` 比较 `X-Worker-Secret`；saas 模式 `MCP_WORKER_SECRET` 为空则 `config.validate` 启动失败；源站保留空值返回 500 的防御分支（启动校验通过后不可达）。
 - `createMemoryForUser` 单事务写 `memories` + `UpsertDiary`；`record_date` = `record_time` 转上海时区后的 Y/M/D，但以 UTC 零点存入（`time.Date(..., time.UTC)`）。
 - 缓存失效：`InvalidateUserCache` 用 `context.WithoutCancel` 执行，避免客户端断开中断清理。
+- **失效钩子纪律（新增日记/记忆写路径时必查）**：任何新增的用户数据写路径都必须调用 `mcp.InvalidateUserCache`（异步 safe.Go，TTL 兜底）——多层缓存失效矩阵（源站 30min + Worker 边缘 1/5min + 记忆写版本）的例外表靠人工维护，漏一行即产生静默陈旧窗口。
 - 触发器注意：`api_keys.user_id` 有 UNIQUE，`CreateKey` 依赖冲突后回查实现幂等。
 
 ## 7. 前端接入
@@ -285,16 +291,17 @@ api-worker 错误码：`4000`（url/apiKey 不合法）、`4001`（URL 形状/�
 ### 8.2 Worker 配置与部署（`docs/mcp-worker-ops.md`）
 
 - `mcp-worker/wrangler.toml`：name `papafeiji-mcp`，route/custom_domain `mcp.pathmemos.com`，vars `BACKEND_URL=https://pro.papafeiji.cn`，KV binding `KV`（id `a2230a743e1b408ea1aa5b0abf4f3b0a`）；`MCP_WORKER_SECRET` 用 `wrangler secret put` 注入。
-- 已知取舍：api-worker KV 私有路由映射（`backend_api_key:<sha256>`）生命周期独立于源站 `api_keys`——源站 rotate/删除/注销不清理 KV；旧键映射残留无数据风险（回源 401），仅 KV 条目残留，按需经 `DELETE /worker/register` 手动清理。
+- 已知取舍：api-worker KV 私有路由映射（`backend_api_key:<sha256>`）生命周期独立于源站 `api_keys`——源站 rotate/删除/注销不清理 KV；旧键映射残留的残余面分两种：私有后端未重置 key 时旧 key 照常路由可用（已接受风险，简单优先不联动清理）；已重置时回源 401 无数据，仅 KV 条目残留，按需经 `DELETE /worker/register` 手动清理。
+- 已知取舍（SSRF 残余面，保持现状）：`/worker/register` 的 URL 校验只查 scheme/host/port 与私网主机名**字面量**黑名单（字面量清单未含 CGNAT 100.64.0.0/10、TEST-NET 等保留段——CF Workers 出网到这些段不可达源站内网，可达风险≈0）——URL userinfo（`https://user:pass@host/`）可通过、公网域名解析到私网 IP 不拦；实际影响受三重制约（Cloudflare Workers fetch 对私网地址本身不可达、注册写限流 10/min/IP、私有路由回源须目标返回 open 模式 JSON 才可用），按「容忍 hacker」接受，不加 DNS 解析复核。
 - `api-worker/wrangler.toml`：name `papafeiji-api`，custom_domain `api.pathmemos.com`，vars `SAAS_BACKEND_URL=https://pro.papafeiji.cn`、`ENABLE_PRIVATE_BACKEND="true"`，KV id `05b183e932a34cc9b8b4c1ef3d55d0ea`；`WORKER_SECRET` 同样用 secret 注入。
-- `api-worker/src/lib.ts`：从 `index.ts` 抽出的纯函数与共享逻辑（`CF-Connecting-IP` 解析、`/worker/register` 写操作内存限流 10 次/分/IP、跟踪 IP 上限 10000）；有存量 vitest 单测（2026-09 验收策略下为资产、非门禁）。
+- `api-worker/src/lib.ts`：从 `index.ts` 抽出的纯函数与共享逻辑（`CF-Connecting-IP` 解析、`/worker/register` 写操作内存限流 10 次/分/IP、跟踪 IP 上限 10000）；有存量 vitest 单测（资产、非门禁）。`mcp-worker/src/lib.ts` 同样从 `index.ts` 抽离（静态 MCP 判定、缓存 TTL、`isRateLimited` 限流工厂：/auth/bind 10/min 与 /mcp 主链路 120/min 共用），有 vitest 单测。
 - 部署：`cd mcp-worker && npx wrangler deploy`、`cd api-worker && npx wrangler deploy`；验证 `curl https://mcp.pathmemos.com/health`。
 - 回滚：`npx wrangler deployments list` + `npx wrangler rollback <version-id>`。
-- 平台层限流需在 Cloudflare Dashboard 手动配置（`/mcp*` 60/min/IP、`/auth*` 10/min/IP），不在 wrangler.toml。
+- Worker 应用层已内建限流：`/auth/bind` 10/min/IP、`/mcp*` 120/min/IP（代理与静态分支同限，含无效 Key）；源站另有 KeyRateLimiter 30/min 第二层；Cloudflare 平台层限流为可选加固（Dashboard 手动配置），运维细节见 [`mcp-worker-ops.md`](../mcp-worker-ops.md)。
 
 ### 8.3 任务
 
 - 无 MCP 专属后台任务（stateless）；`Handler.Stop()` 释放限流器（当前实现无后台 goroutine，空操作）与公开 IP 限流器。
 - 源站缓存一致性依赖写后主动失效 + 30min TTL；Worker 缓存依赖记忆写版本 + 1/5min TTL（MCP-8）。
-- 数据清理：`api_keys` 仅由用户显式删除/换发（`DeleteExpiredAPIKeys` SQL 存在但全仓库无调用，key 永不过期）。
+- 数据清理：`api_keys` 仅由用户显式删除/换发（key 永不过期，无清理任务）。
 - KV 失败模式：mcp-worker `/auth/bind` 的 `KV.put` 与 api-worker 注册/注销的 `KV.put`/`KV.delete` 失败均被捕获并返回 502 `code=5001`（可重试，不裸抛 500）；仅 api-worker 的 KV **读**有 503 `5030` 兜底。

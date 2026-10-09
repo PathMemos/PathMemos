@@ -28,3 +28,7 @@
 
 - 持锁占用一个 PostgreSQL 连接，后台任务并发度需关注连接池容量。
 - advisory lock 无超时：长任务必须自带 `maxDuration` context 约束。
+
+**两类锁的边界**：本 ADR 口径针对**会话级任务锁**（`db.AdvisoryLock`，`pg_try_advisory_lock` + 显式 unlock——锁随连接存续，断连自动释放，持锁占用后台池一个连接）。业务事务内的串行化另有**事务级** `pg_advisory_xact_lock`（如 `invite.sql` `LockInviterReward`：COMMIT/ROLLBACK 自动释放、不占独立连接），其语义归各业务分册（02a A-6）；迁移使用专用会话级锁（`migration/migrate.go`，键域与业务锁错开）。行为语义差异：会话级为 try-lock（未抢到即 fail-fast，调用方报 429 `OPERATION_IN_PROGRESS`），事务级为阻塞等待（等待方在事务内排队直至持锁方提交）——两条链路「失败返回」与「静默串行」的观感差异源于此。
+
+> 注：「全部分布式锁统一为 advisory lock」的口径**不含 TTL 型在途/幂等标记**——`ai/service.go` 的同轮在途单飞标记（`ai:turn:*` Redis SetNX + TTL，其「等待-回放」语义 advisory lock 无法表达）、`wxmp` msgid 去重与资料刷新节流等标记不属锁范畴，仍用 Redis。轨迹去重不在此列：幂等由 `auto_record_trajectories` DB 唯一索引 `uq_auto_record_trajectories_point` + ON CONFLICT 保证（迁移 000005 注释明示不引入 Redis 去重）。

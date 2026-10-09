@@ -47,6 +47,30 @@ func (q *Queries) DeleteUserVIP(ctx context.Context, userID string) error {
 	return err
 }
 
+const getActiveVIPByID = `-- name: GetActiveVIPByID :one
+SELECT id, type, name, time_limit_mark, time_limit_number, product_id, sort, is_active, prices, created_at FROM vips WHERE id = $1 AND is_active = true
+`
+
+// trial 下线闸门：仅返回在售商品，0 行=已下线（注册路径静默跳过、端点 404）。
+// 支付发货沿用 GetVIPByID（不过滤 is_active），已支付订单不因商品下线而漏发。
+func (q *Queries) GetActiveVIPByID(ctx context.Context, id string) (Vip, error) {
+	row := q.db.QueryRow(ctx, getActiveVIPByID, id)
+	var i Vip
+	err := row.Scan(
+		&i.ID,
+		&i.Type,
+		&i.Name,
+		&i.TimeLimitMark,
+		&i.TimeLimitNumber,
+		&i.ProductID,
+		&i.Sort,
+		&i.IsActive,
+		&i.Prices,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getUserVIP = `-- name: GetUserVIP :one
 SELECT id, user_id, begin_time, expire_time, created_at FROM user_vips WHERE user_id = $1
 `
@@ -128,7 +152,7 @@ type HasVIPClaimByOpenIDParams struct {
 	VipID  string      `json:"vipId"`
 }
 
-// R-21：按微信主体判重（注销重注册后仍能识别已领取），openid 为空时调用方回退 HasVIPClaim。
+// 按微信主体判重（注销重注册后仍能识别已领取），openid 为空时调用方回退 HasVIPClaim。
 func (q *Queries) HasVIPClaimByOpenID(ctx context.Context, arg HasVIPClaimByOpenIDParams) (bool, error) {
 	row := q.db.QueryRow(ctx, hasVIPClaimByOpenID, arg.OpenID, arg.VipID)
 	var exists bool
@@ -217,7 +241,7 @@ INSERT INTO user_vips (id, user_id, begin_time, expire_time, created_at)
 VALUES ($1, $2, $3, $4, now())
 ON CONFLICT (user_id) DO UPDATE SET
     begin_time = EXCLUDED.begin_time,
-    -- GREATEST 防止并发/重复下发时缩短已购 VIP 时长（B2-11）
+    -- GREATEST 防止并发/重复下发时缩短已购 VIP 时长
     expire_time = GREATEST(user_vips.expire_time, EXCLUDED.expire_time)
 RETURNING id, user_id, begin_time, expire_time, created_at
 `
@@ -260,7 +284,7 @@ type UpsertVIPClaimParams struct {
 	OpenID pgtype.Text `json:"openId"`
 }
 
-// R-21：open_id 冗余发放主体；不带目标的 ON CONFLICT DO NOTHING 同时覆盖
+// open_id 冗余发放主体；不带目标的 ON CONFLICT DO NOTHING 同时覆盖
 // (user_id, vip_id) 与 (open_id, vip_id) 两级唯一，rowsAffected=0 → 409 已领取。
 func (q *Queries) UpsertVIPClaim(ctx context.Context, arg UpsertVIPClaimParams) (int64, error) {
 	result, err := q.db.Exec(ctx, upsertVIPClaim,

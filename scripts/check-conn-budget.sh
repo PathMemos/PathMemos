@@ -2,6 +2,8 @@
 # 数据库连接预算硬门槛：两容器常态连接 2×(请求池上限 + 后台池上限) 必须 ≤ 170。
 # 请求池上限 DB_MAX_CONNS、后台池上限 DB_BG_MAX_CONNS 均取自 override 文件（缺省 75 / 10）。
 # max_connections=200，固定 reserve ≥ 30（迁移/备份/运维 CLI/advisory lock 持锁）。
+# 注意：170 以基线 max_connections=200 为准；deploy.sh --optimize 按硬件调大 max_connections
+# 后，门槛需经 DB_BUDGET_HARD_LIMIT 同步调整（算式 2×(请求+后台) ≤ max_connections−30）。
 # 用法: scripts/check-conn-budget.sh [override.yml]
 set -euo pipefail
 OVERRIDE="${1:-deploy/docker-compose.override.yml}"

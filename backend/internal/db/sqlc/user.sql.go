@@ -44,7 +44,7 @@ type BindUserPhoneIfAllowedParams struct {
 }
 
 // A-FIX-03：绑定手机号的原子日限——仅当 phone_bind_time 为空或不在今天（上海时区）时写入，
-// 避免「检查-再更新」竞态下并发绑定绕过日限、反复消耗微信认证额度。解绑走 UpdateUserPhone 不受此限。
+// 避免「检查-再更新」竞态下并发绑定绕过日限、反复消耗微信认证额度。
 func (q *Queries) BindUserPhoneIfAllowed(ctx context.Context, arg BindUserPhoneIfAllowedParams) (int64, error) {
 	result, err := q.db.Exec(ctx, bindUserPhoneIfAllowed,
 		arg.ID,
@@ -441,7 +441,7 @@ type IncrementUserImageStorageParams struct {
 	StorageLimit      int64  `json:"storageLimit"`
 }
 
-// B5-12：条件原子扣减——超限时更新 0 行，由调用方识别拒绝，杜绝 check-then-act 竞态。
+// 条件原子扣减——超限时更新 0 行，由调用方识别拒绝，杜绝 check-then-act 竞态。
 func (q *Queries) IncrementUserImageStorage(ctx context.Context, arg IncrementUserImageStorageParams) (int64, error) {
 	result, err := q.db.Exec(ctx, incrementUserImageStorage, arg.ID, arg.ImageStorageBytes, arg.StorageLimit)
 	if err != nil {
@@ -515,6 +515,26 @@ func (q *Queries) UpdateUserAvatar(ctx context.Context, arg UpdateUserAvatarPara
 	return err
 }
 
+const updateUserAvatarIfEmpty = `-- name: UpdateUserAvatarIfEmpty :execrows
+UPDATE users SET avatar = $2, avatar_file_id = $3, updated_at = now()
+WHERE id = $1 AND (avatar IS NULL OR avatar = '')
+`
+
+type UpdateUserAvatarIfEmptyParams struct {
+	ID           string      `json:"id"`
+	Avatar       pgtype.Text `json:"avatar"`
+	AvatarFileID pgtype.Text `json:"avatarFileId"`
+}
+
+// 仅当 avatar 仍为空时写入：注册后异步默认头像回写不覆盖登录链路已写入的微信头像（02a A-9）。
+func (q *Queries) UpdateUserAvatarIfEmpty(ctx context.Context, arg UpdateUserAvatarIfEmptyParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateUserAvatarIfEmpty, arg.ID, arg.Avatar, arg.AvatarFileID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const updateUserCurrentFamily = `-- name: UpdateUserCurrentFamily :exec
 UPDATE users SET current_family_id = $2, updated_at = now() WHERE id = $1
 `
@@ -538,7 +558,7 @@ type UpdateUserInvitedByParams struct {
 	InvitedBy pgtype.Text `json:"invitedBy"`
 }
 
-// 仅当尚无邀请人时写入（登录后补绑场景的幂等闸门，R4）。
+// 仅当尚无邀请人时写入（登录后补绑场景的幂等闸门）。
 func (q *Queries) UpdateUserInvitedBy(ctx context.Context, arg UpdateUserInvitedByParams) (int64, error) {
 	result, err := q.db.Exec(ctx, updateUserInvitedBy, arg.ID, arg.InvitedBy)
 	if err != nil {
@@ -595,21 +615,6 @@ type UpdateUserPersonalFamilyParams struct {
 
 func (q *Queries) UpdateUserPersonalFamily(ctx context.Context, arg UpdateUserPersonalFamilyParams) error {
 	_, err := q.db.Exec(ctx, updateUserPersonalFamily, arg.ID, arg.PersonalFamilyID)
-	return err
-}
-
-const updateUserPhone = `-- name: UpdateUserPhone :exec
-UPDATE users SET phone_number = $2, phone_bind_time = $3, updated_at = now() WHERE id = $1
-`
-
-type UpdateUserPhoneParams struct {
-	ID            string             `json:"id"`
-	PhoneNumber   pgtype.Text        `json:"phoneNumber"`
-	PhoneBindTime pgtype.Timestamptz `json:"phoneBindTime"`
-}
-
-func (q *Queries) UpdateUserPhone(ctx context.Context, arg UpdateUserPhoneParams) error {
-	_, err := q.db.Exec(ctx, updateUserPhone, arg.ID, arg.PhoneNumber, arg.PhoneBindTime)
 	return err
 }
 

@@ -61,7 +61,6 @@ var (
 	ErrFileNotImage              = errors.New("file is not an image")
 	ErrMemoryNotFound            = errors.New("memory not found")
 	ErrCoverImageNotFromDiary    = errors.New("cover image must be from today's diary")
-	ErrRecordTimeCrossDay        = errors.New("record time cannot cross day")
 	ErrCoverUpdateInProgress     = errors.New("cover update in progress")
 	ErrDailyReverseQuotaExceeded = errors.New("daily reverse geocode quota exceeded")
 	// ErrAutoEntryInProgress 表示该用户的自动记录用户锁被后台任务持有，HTTP 入口本次未获取到。
@@ -100,18 +99,33 @@ func (s *Service) SetNewPlaceAlerter(alerter NewPlaceAlerter) {
 	s.newPlaceAlerter = alerter
 }
 
+// GetFamilyMembers 单次往返取「当前家庭 + 成员列表」（原 GetUserByID + ListFamilyMembers
+// 两段串行，是 diary 全部端点的公共前缀）。返回类型保持 ListFamilyMembersRow 不变，
+// 调用方零改动。语义与旧实现逐一对齐：用户不存在 → ErrNoRows；有家庭无成员 → familyID 保留。
 func (s *Service) GetFamilyMembers(ctx context.Context, userID string) (string, []sqlc.ListFamilyMembersRow, error) {
-	user, err := s.pool.Queries().GetUserByID(ctx, userID)
+	rows, err := s.pool.Queries().ListFamilyMembersByUserID(ctx, userID)
 	if err != nil {
-		return "", nil, fmt.Errorf("get user: %w", err)
+		return "", nil, fmt.Errorf("list members by user: %w", err)
+	}
+	if len(rows) == 0 {
+		return "", nil, fmt.Errorf("get user: %w", pgx.ErrNoRows)
 	}
 
-	familyID := util.ToString(user.CurrentFamilyID)
-	members, err := s.pool.Queries().ListFamilyMembers(ctx, familyID)
-	if err != nil {
-		return "", nil, fmt.Errorf("list members: %w", err)
+	familyID := util.ToString(rows[0].CurrentFamilyID)
+	members := make([]sqlc.ListFamilyMembersRow, 0, len(rows))
+	for _, r := range rows {
+		if !r.UserID.Valid {
+			continue // 无家庭：LEFT JOIN 产生的全 NULL 行
+		}
+		members = append(members, sqlc.ListFamilyMembersRow{
+			UserID:       r.UserID.String,
+			Role:         r.Role.String,
+			JoinedAt:     r.JoinedAt,
+			Avatar:       r.Avatar,
+			AvatarFileID: r.AvatarFileID,
+			Nickname:     r.Nickname,
+		})
 	}
-
 	return familyID, members, nil
 }
 
@@ -178,7 +192,7 @@ func (s *Service) ListInfoCards(ctx context.Context, userID, cursorDate string, 
 		targetDates = append(targetDates, d)
 		lastIncludedDate = d
 	}
-	// R2-05：SQL LIMIT 作用在 distinct_dates CTE 上，dates 恒 ≤ size；
+	// SQL LIMIT 作用在 distinct_dates CTE 上，dates 恒 ≤ size；
 	// 取满一页即设置游标（下一页按 record_date < cursor 去重），否则更早记录不可达。
 	if len(targetDates) >= size {
 		nextCursor = lastIncludedDate
@@ -491,7 +505,11 @@ func (s *Service) GetStats(ctx context.Context, userID string) (map[string]inter
 	firstRecordDateStr := ""
 	if !firstRecordDate.Time.IsZero() && firstRecordDate.Time.Year() > 1970 {
 		firstRecordDateStr = firstRecordDate.Time.Format(dateFormat)
-		days = int(now.Sub(firstRecordDate.Time).Hours()/24) + 1
+		// D-13：按上海日历日差计算——pgtype.Date 扫描出的是 UTC 零点，直接减 now
+		// 会带 −8h 偏移，上海时间 00:00–07:59 期间整除截断会少算 1 天。
+		nowDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+		firstDate := time.Date(firstRecordDate.Time.In(now.Location()).Year(), firstRecordDate.Time.In(now.Location()).Month(), firstRecordDate.Time.In(now.Location()).Day(), 0, 0, 0, 0, now.Location())
+		days = int(nowDate.Sub(firstDate).Hours()/24) + 1
 	}
 
 	return map[string]interface{}{
@@ -597,7 +615,7 @@ func (s *Service) GetDetails(ctx context.Context, userID, familyID, recordDate, 
 		memories = append(memories, memoryToMap(m, memoryUserID, memberMap, s.sysCfg.DefaultAvatarURL))
 	}
 
-	coverURL, coverImageID, err := s.ResolveCoverImage(ctx, userID, familyID, recordDate)
+	coverURL, coverImageID, err := s.ResolveCoverImage(ctx, familyID, recordDate, memberIDs)
 	if err != nil {
 		coverURL = s.defaultCoverURL()
 		coverImageID = ""
@@ -712,24 +730,12 @@ func (s *Service) UpdateMemory(ctx context.Context, userID, memoryID, title, con
 			}
 			return fmt.Errorf("get old diary: %w", err)
 		}
-		entryCount, err := q.CountDiaryEntriesByDiaryID(ctx, diary.ID)
-		if err != nil {
-			return fmt.Errorf("count diary entries: %w", err)
+		// A1（docs/OBJECTIVES）：先锁日记头行再条件删除——与并发新增条目（FK KEY SHARE）
+		// 串行化，关闭「计数后删行」窗口内并发已提交条目被级联删除的丢失路径。
+		if _, err := q.LockDiaryByIDForUpdate(ctx, diary.ID); err != nil {
+			return fmt.Errorf("lock diary for delete: %w", err)
 		}
-		if entryCount > 0 {
-			return nil
-		}
-		memCount, err := q.CountMemoriesByUserAndDate(ctx, sqlc.CountMemoriesByUserAndDateParams{
-			UserID:  userID,
-			Column2: oldMemory.RecordDate,
-		})
-		if err != nil {
-			return fmt.Errorf("count memories: %w", err)
-		}
-		if memCount > 0 {
-			return nil
-		}
-		if err := q.DeleteDiaryByID(ctx, diary.ID); err != nil {
+		if _, err := q.DeleteDiaryIfEmpty(ctx, diary.ID); err != nil {
 			return fmt.Errorf("delete empty old diary: %w", err)
 		}
 		return nil
@@ -780,27 +786,12 @@ func (s *Service) DeleteMemory(ctx context.Context, userID, memoryID string) err
 			return fmt.Errorf("get diary: %w", err)
 		}
 
-		entryCount, err := q.CountDiaryEntriesByDiaryID(ctx, diary.ID)
-		if err != nil {
-			return fmt.Errorf("count diary entries: %w", err)
+		// A1（docs/OBJECTIVES）：先锁日记头行再条件删除——与并发新增条目（FK KEY SHARE）
+		// 串行化，关闭「计数后删行」窗口内并发已提交条目被级联删除的丢失路径。
+		if _, err := q.LockDiaryByIDForUpdate(ctx, diary.ID); err != nil {
+			return fmt.Errorf("lock diary for delete: %w", err)
 		}
-		if entryCount > 0 {
-			return nil
-		}
-
-		memCount, err := q.CountMemoriesByUserAndDate(ctx, sqlc.CountMemoriesByUserAndDateParams{
-			UserID:  userID,
-			Column2: memory.RecordDate,
-		})
-		if err != nil {
-			return fmt.Errorf("count memories: %w", err)
-		}
-		if memCount > 0 {
-			return nil
-		}
-
-		err = q.DeleteDiaryByID(ctx, diary.ID)
-		if err != nil {
+		if _, err := q.DeleteDiaryIfEmpty(ctx, diary.ID); err != nil {
 			return fmt.Errorf("delete empty diary: %w", err)
 		}
 		return nil
@@ -809,10 +800,9 @@ func (s *Service) DeleteMemory(ctx context.Context, userID, memoryID string) err
 		return err
 	}
 
-	// 记忆删除后异步失效 MCP 查询缓存，失败由 30 分钟 TTL 兜底。
-	safe.Go(context.WithoutCancel(ctx), nil, func() {
-		mcp.InvalidateUserCache(context.WithoutCancel(ctx), s.rdb, userID)
-	})
+	// 删除路径同步失效 MCP 查询缓存（与 DeleteEntry/DeleteDiary 一致，02b D-6：
+	// 已删内容不得在 TTL 内仍可经 MCP 读到）。
+	mcp.InvalidateUserCache(ctx, s.rdb, userID)
 	return nil
 }
 
@@ -1015,7 +1005,7 @@ func (s *Service) DeleteDiary(ctx context.Context, userID, familyID, recordDate 
 		}
 		// 在事务内删除图片关联并返回 file_id，再删除日记。
 		// 注意：当前 SQL 未加 SELECT ... FOR UPDATE 行锁，并发新增的图片条目可能在删除后成为孤儿；
-		// 孤儿文件由后台孤儿清理任务兜底（DA-P2-01：原注释误称有行锁，已按实现更正）。
+		// 孤儿文件由后台孤儿清理任务兜底。
 		fileIDs, err = q.DeleteDiaryImagesReturningFileIDs(ctx, diaryID.ID)
 		if err != nil {
 			return fmt.Errorf("delete diary images: %w", err)
@@ -1036,7 +1026,15 @@ func (s *Service) DeleteDiary(ctx context.Context, userID, familyID, recordDate 
 				return fmt.Errorf("clear image covers by file ids: %w", err)
 			}
 		}
-		if err := q.DeleteDiaryByID(ctx, diaryID.ID); err != nil {
+		// A1：先显式删本人当日条目，再锁头行条件删行——无条件级联删行会把
+		// 并发保存已提交的条目一并删除；条件删除使并发条目存活（行不删）。
+		if _, err := q.DeleteDiaryEntriesByDiaryID(ctx, diaryID.ID); err != nil {
+			return fmt.Errorf("delete diary entries: %w", err)
+		}
+		if _, err := q.LockDiaryByIDForUpdate(ctx, diaryID.ID); err != nil {
+			return fmt.Errorf("lock diary for delete: %w", err)
+		}
+		if _, err := q.DeleteDiaryIfEmpty(ctx, diaryID.ID); err != nil {
 			return fmt.Errorf("delete diary: %w", err)
 		}
 		return nil
@@ -1044,10 +1042,9 @@ func (s *Service) DeleteDiary(ctx context.Context, userID, familyID, recordDate 
 		return err
 	}
 
-	// 日记删除后异步失效 MCP 查询缓存，失败由 30 分钟 TTL 兜底。
-	safe.Go(context.WithoutCancel(ctx), nil, func() {
-		mcp.InvalidateUserCache(context.WithoutCancel(ctx), s.rdb, userID)
-	})
+	// 整日删除同步失效 MCP 查询缓存（与 DeleteEntry/DeleteMemory 一致，02b D-6：
+	// 已删内容不得在 TTL 内仍可经 MCP 读到）。
+	mcp.InvalidateUserCache(ctx, s.rdb, userID)
 
 	// 物理文件删除在 DB 提交后异步执行，避免条目较多时拖慢接口响应；
 	// 删除失败仅记录日志，由后台孤儿文件回收任务兜底（AGENTS.md §4.4）。
@@ -1176,7 +1173,7 @@ func (s *Service) CreateEntry(ctx context.Context, userID string, req *entryRequ
 			slog.String("record_date", recordDate),
 			slog.Any("error", cardErr))
 		coverURL := s.defaultCoverURL()
-		if resolvedURL, _, resolveErr := s.resolveFamilyDailyCover(ctx, familyID, recordDate); resolveErr == nil && resolvedURL != "" {
+		if resolvedURL, _, resolveErr := s.resolveFamilyDailyCover(ctx, familyID, recordDate, nil); resolveErr == nil && resolvedURL != "" {
 			coverURL = resolvedURL
 		}
 		card = map[string]interface{}{
@@ -1238,13 +1235,37 @@ func (s *Service) UpdateEntry(ctx context.Context, userID string, req *entryRequ
 			removedImageIDs = append(removedImageIDs, fid)
 		}
 	}
+	// 跨天改期：条目整体迁移到目标日期的日记（与记忆改期同语义，见 UpdateMemory）。
+	moveToDate := false
+	var newRecordDate pgtype.Date
 	if req.RecordTime != nil && *req.RecordTime != "" && updateParams.RecordTime.Valid {
-		newDate := updateParams.RecordTime.Time.In(timeutil.Shanghai).Format(dateFormat)
-		if newDate != diary.RecordDate.Time.Format(dateFormat) {
-			return "", "", nil, ErrRecordTimeCrossDay
+		newDateStr := updateParams.RecordTime.Time.In(timeutil.Shanghai).Format(dateFormat)
+		if newDateStr != diary.RecordDate.Time.Format(dateFormat) {
+			parsedDate, err := parseDate(newDateStr)
+			if err != nil {
+				return "", "", nil, fmt.Errorf("parse new record date: %w", err)
+			}
+			newRecordDate = parsedDate
+			moveToDate = true
 		}
 	}
+	sourceDiaryID := entry.DiaryID
 	err = db.WithTx(ctx, s.pool.Pool(), func(ctx context.Context, q *sqlc.Queries) error {
+		if moveToDate {
+			newDiaryID, err := util.NewUUID()
+			if err != nil {
+				return fmt.Errorf("generate diary id: %w", err)
+			}
+			targetDiaryID, err := q.UpsertDiary(ctx, sqlc.UpsertDiaryParams{
+				ID:         newDiaryID,
+				UserID:     userID,
+				RecordDate: newRecordDate,
+			})
+			if err != nil {
+				return fmt.Errorf("upsert target diary: %w", err)
+			}
+			updateParams.DiaryID = targetDiaryID
+		}
 		rowsAffected, err := q.UpdateDiaryEntry(ctx, updateParams)
 		if err != nil {
 			return fmt.Errorf("update diary entry: %w", err)
@@ -1260,29 +1281,59 @@ func (s *Service) UpdateEntry(ctx context.Context, userID string, req *entryRequ
 				return fmt.Errorf("create new entry images: %w", err)
 			}
 		}
-		if len(removedImageIDs) > 0 {
+		// 封面引用清理（按源日期）：同天编辑只清被移除的图；跨天移动时条目全部旧图
+		//（保留+移除）都不再属于源日期，一并清理，封面刷新时重评。
+		clearFileIDs := removedImageIDs
+		if moveToDate {
+			clearFileIDs = oldImageFileIDs
+		}
+		if len(clearFileIDs) > 0 {
 			if err := q.ClearFamilyDailyManualCoverByFileIDs(ctx, sqlc.ClearFamilyDailyManualCoverByFileIDsParams{
 				FamilyID:   familyID,
 				RecordDate: diary.RecordDate,
-				Column3:    removedImageIDs,
+				Column3:    clearFileIDs,
 			}); err != nil {
 				return fmt.Errorf("clear manual covers by file ids: %w", err)
 			}
 			if err := q.ClearFamilyDailyImageCoverByFileIDs(ctx, sqlc.ClearFamilyDailyImageCoverByFileIDsParams{
 				FamilyID:   familyID,
 				RecordDate: diary.RecordDate,
-				Column3:    removedImageIDs,
+				Column3:    clearFileIDs,
 			}); err != nil {
 				return fmt.Errorf("clear image covers by file ids: %w", err)
 			}
 		}
-		if err := q.TouchDiaryUpdatedAt(ctx, entry.DiaryID); err != nil {
-			return fmt.Errorf("touch diary updated at: %w", err)
+		if moveToDate {
+			if err := q.TouchDiaryUpdatedAt(ctx, updateParams.DiaryID); err != nil {
+				return fmt.Errorf("touch diary updated at: %w", err)
+			}
+			// 源日记清空且当日无记忆时删除，避免首页残留幽灵空卡片（与 D-6/D-8 一致）。
+			// A1：锁头行 + 条件删除；未删成（仍有条目/记忆）时按 D-5 语义 Touch 源日记。
+			if _, err := q.LockDiaryByIDForUpdate(ctx, sourceDiaryID); err != nil {
+				return fmt.Errorf("lock source diary for delete: %w", err)
+			}
+			deletedRows, err := q.DeleteDiaryIfEmpty(ctx, sourceDiaryID)
+			if err != nil {
+				return fmt.Errorf("delete empty source diary: %w", err)
+			}
+			if deletedRows == 0 {
+				if err := q.TouchDiaryUpdatedAt(ctx, sourceDiaryID); err != nil {
+					return fmt.Errorf("touch source diary updated at: %w", err)
+				}
+			}
+		} else {
+			if err := q.TouchDiaryUpdatedAt(ctx, entry.DiaryID); err != nil {
+				return fmt.Errorf("touch diary updated at: %w", err)
+			}
 		}
 		return nil
 	})
 	if err != nil {
 		return "", "", nil, err
+	}
+	// 跨天移动后 recordDate/card 均取目标日期。
+	if moveToDate {
+		recordDate = newRecordDate.Time.Format(dateFormat)
 	}
 
 	// 日记更新后异步失效 MCP 查询缓存，失败由 30 分钟 TTL 兜底。
@@ -1298,6 +1349,20 @@ func (s *Service) UpdateEntry(ctx context.Context, userID string, req *entryRequ
 				slog.String("family_id", familyID),
 				slog.String("record_date", recordDate),
 				slog.Any("error", refreshErr))
+		}
+		// 跨天移动时条目离开源日期，源日期封面可能需要回退，异步刷新不阻塞响应。
+		if moveToDate {
+			sourceDate := diary.RecordDate.Time.Format(dateFormat)
+			safe.Go(ctx, nil, func() {
+				bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+				defer cancel()
+				if err := s.RefreshFamilyDailyCover(bgCtx, familyID, sourceDate); err != nil {
+					slog.WarnContext(bgCtx, "refresh source cover after entry move failed",
+						slog.String("family_id", familyID),
+						slog.String("record_date", sourceDate),
+						slog.Any("error", err))
+				}
+			})
 		}
 	}
 	// 旧图片文件解引用与物理删除在 DB 提交后异步执行，避免拖慢接口响应；
@@ -1327,7 +1392,7 @@ func (s *Service) UpdateEntry(ctx context.Context, userID string, req *entryRequ
 			slog.String("record_date", recordDate),
 			slog.Any("error", cardErr))
 		coverURL := s.defaultCoverURL()
-		if resolvedURL, _, resolveErr := s.resolveFamilyDailyCover(ctx, familyID, recordDate); resolveErr == nil && resolvedURL != "" {
+		if resolvedURL, _, resolveErr := s.resolveFamilyDailyCover(ctx, familyID, recordDate, nil); resolveErr == nil && resolvedURL != "" {
 			coverURL = resolvedURL
 		}
 		card = map[string]interface{}{
@@ -1371,7 +1436,7 @@ func (s *Service) DeleteEntry(ctx context.Context, userID, entryID string) (fami
 		var err error
 		// 在事务内删除图片关联并返回 file_id，再删除条目。
 		// 注意：当前 SQL 未加 SELECT ... FOR UPDATE 行锁，并发新增的图片可能在删除后成为孤儿；
-		// 孤儿文件由后台孤儿清理任务兜底（DA-P2-01：原注释误称有行锁，已按实现更正）。
+		// 孤儿文件由后台孤儿清理任务兜底。
 		oldImageFileIDs, err = q.DeleteDiaryEntryImagesReturningFileIDs(ctx, entryID)
 		if err != nil {
 			return fmt.Errorf("delete diary entry images: %w", err)
@@ -1398,25 +1463,12 @@ func (s *Service) DeleteEntry(ctx context.Context, userID, entryID string) (fami
 		if err := q.TouchDiaryUpdatedAt(ctx, entry.DiaryID); err != nil {
 			return fmt.Errorf("touch diary updated at: %w", err)
 		}
-		entryCount, err := q.CountDiaryEntriesByDiaryID(ctx, entry.DiaryID)
-		if err != nil {
-			return fmt.Errorf("count diary entries: %w", err)
+		// A1（docs/OBJECTIVES）：先锁日记头行再条件删除——与并发新增条目（FK KEY SHARE）
+		// 串行化，关闭「计数后删行」窗口内并发已提交条目被级联删除的丢失路径。
+		if _, err := q.LockDiaryByIDForUpdate(ctx, entry.DiaryID); err != nil {
+			return fmt.Errorf("lock diary for delete: %w", err)
 		}
-		if entryCount > 0 {
-			return nil
-		}
-		memCount, err := q.CountMemoriesByUserAndDate(ctx, sqlc.CountMemoriesByUserAndDateParams{
-			UserID:  diary.UserID,
-			Column2: diary.RecordDate,
-		})
-		if err != nil {
-			return fmt.Errorf("count memories: %w", err)
-		}
-		if memCount > 0 {
-			return nil
-		}
-		err = q.DeleteDiaryByID(ctx, entry.DiaryID)
-		if err != nil {
+		if _, err := q.DeleteDiaryIfEmpty(ctx, entry.DiaryID); err != nil {
 			return fmt.Errorf("delete empty diary: %w", err)
 		}
 		return nil
@@ -1425,8 +1477,10 @@ func (s *Service) DeleteEntry(ctx context.Context, userID, entryID string) (fami
 		return "", "", err
 	}
 
-	// MCP 查询缓存含日记条目与回忆，删除后必须失效，避免 30 分钟 TTL 内 MCP 端仍能读到已删条目。
-	mcp.InvalidateUserCache(context.WithoutCancel(ctx), s.rdb, userID)
+	// MCP 查询缓存含日记条目与回忆，删除后必须失效——02b D-6：删除路径为
+	// **同步**失效（隐私语义：已删内容不得在 TTL 内仍可经 MCP 读到；新建/更新
+	// 路径内容只增不减，异步无害）。InvalidateUserCache 为 Redis 删除，毫秒级。
+	mcp.InvalidateUserCache(ctx, s.rdb, userID)
 
 	safe.Go(ctx, nil, func() {
 		bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
@@ -1483,7 +1537,7 @@ func (s *Service) CreateAutoEntry(ctx context.Context, userID string, lat, lon f
 		return "", "", "", fmt.Errorf("invalid coordinates: %w", err)
 	}
 
-	// R2-06：按用户日配额限制逆地理编码调用，防止恶意坐标耗尽腾讯地图配额影响正常用户。
+	// 按用户日配额限制逆地理编码调用，防止恶意坐标耗尽腾讯地图配额影响正常用户。
 	if !location.CheckReverseQuota(ctx, s.rdb, userID) {
 		return "", "", "", ErrDailyReverseQuotaExceeded
 	}
@@ -1505,7 +1559,7 @@ func (s *Service) CreateAutoEntry(ctx context.Context, userID string, lat, lon f
 		return "", "", "", err
 	}
 
-	// DA-P1-04：与后台 autorecord.processUser 共用 lock:auto_record:{userID}，
+	// 与后台 autorecord.processUser 共用 lock:auto_record:{userID}，
 	// 避免 HTTP 入口与后台任务并发对同一驻留点各生成一条自动条目。
 	if s.lock != nil {
 		lockKey := "lock:auto_record:" + userID
@@ -1523,7 +1577,7 @@ func (s *Service) CreateAutoEntry(ctx context.Context, userID string, lat, lon f
 		}()
 	}
 
-	// R-22：与后台 autorecord 共用同日地址并集判重（可识别同日折返旧地点），
+	// 与后台 autorecord 共用同日地址并集判重（可识别同日折返旧地点），
 	// 命中时直接返回已存在条目 id（响应契约不变）。
 	addrRows, err := s.pool.Queries().ListAutoEntryAddressesByDate(ctx, sqlc.ListAutoEntryAddressesByDateParams{
 		CreatedBy:  userID,
@@ -1586,7 +1640,10 @@ func (s *Service) CreateAutoEntry(ctx context.Context, userID string, lat, lon f
 	}
 
 	// 自动成文同样影响 MCP 日记/回忆查询，失效缓存避免 MCP 端看不到刚生成的记录。
-	mcp.InvalidateUserCache(context.WithoutCancel(ctx), s.rdb, userID)
+	// 与同文件其余写路径一致异步化（失败由 30 分钟 TTL 兜底）。
+	safe.Go(context.WithoutCancel(ctx), nil, func() {
+		mcp.InvalidateUserCache(context.WithoutCancel(ctx), s.rdb, userID)
+	})
 
 	// OPS-LOG：自动记录条目创建审计日志（用于数据问题复盘）。
 	slog.InfoContext(ctx, "diary auto entry created",
@@ -1624,7 +1681,7 @@ func (s *Service) reverseGeocode(ctx context.Context, lat, lon float64) (landmar
 	}
 	landmark, address, ok := pickGeocodeResult(res)
 	if !ok {
-		// DA-P2-03：只有 POI 与地址都为空才是真正的上游空结果；地址空但 POI 非空时
+		// 只有 POI 与地址都为空才是真正的上游空结果；地址空但 POI 非空时
 		// 仍按 landmark 成文（与后台 autorecord 路径一致），避免首次即时成文 500。
 		return "", "", fmt.Errorf("reverse geocode returned empty landmark and address")
 	}
@@ -1715,11 +1772,11 @@ func (s *Service) deleteIfOnlySelfReferenced(ctx context.Context, fileID, selfEn
 		if err != nil {
 			return fmt.Errorf("get file references: %w", err)
 		}
-		if refs.UsedByCover || refs.AvatarUserCount > 0 {
-			return nil
-		}
+		// 与 file 包共用判定谓词 RefsAllowPhysicalDelete（selfEntryID 参数化区分语义）：
+		// otherEntryRefCount 为排除自身条目后仍引用该文件的条目数（>0 即还有他人引用），
+		// 仅在 refs.UsedByEntry 为真时需要查询。
+		otherEntryRefCount := 0
 		if refs.UsedByEntry {
-
 			rows, err := q.GetDiaryEntriesByImageID(ctx, sqlc.GetDiaryEntriesByImageIDParams{
 				FileID:       fileID,
 				DiaryEntryID: selfEntryID,
@@ -1727,9 +1784,10 @@ func (s *Service) deleteIfOnlySelfReferenced(ctx context.Context, fileID, selfEn
 			if err != nil {
 				return fmt.Errorf("check entry reference: %w", err)
 			}
-			if len(rows) > 0 {
-				return nil
-			}
+			otherEntryRefCount = len(rows)
+		}
+		if !file.RefsAllowPhysicalDelete(refs, selfEntryID, otherEntryRefCount) {
+			return nil
 		}
 		// FOR UPDATE 在 files 行上串行化「引用检查→删除→扣减」，防止同一文件被两个并发
 		// 删除事务先后通过引用检查而双扣配额（与 file.DeletePhysicalIfUnreferenced 对齐）。
@@ -2047,14 +2105,16 @@ func (s *Service) refreshCoverAsync(familyID, recordDate string) {
 	})
 }
 
-func (s *Service) ResolveCoverImage(ctx context.Context, userID, familyID, recordDate string) (coverURL string, coverFileID string, err error) {
+// ResolveCoverImage 的 memberIDs 由调用方透传（GetDetails 已取得成员列表），
+// 避免封面行缺失的降级路径重复执行 ListFamilyMembers；非 diary 详情入口传 nil。
+func (s *Service) ResolveCoverImage(ctx context.Context, familyID, recordDate string, memberIDs []string) (coverURL string, coverFileID string, err error) {
 	if familyID == "" {
 		return s.defaultCoverURL(), "", nil
 	}
-	return s.resolveFamilyDailyCover(ctx, familyID, recordDate)
+	return s.resolveFamilyDailyCover(ctx, familyID, recordDate, memberIDs)
 }
 
-func (s *Service) resolveFamilyDailyCover(ctx context.Context, familyID, recordDate string) (coverURL string, coverFileID string, err error) {
+func (s *Service) resolveFamilyDailyCover(ctx context.Context, familyID, recordDate string, memberIDs []string) (coverURL string, coverFileID string, err error) {
 	recordDateTime, err := parseDate(recordDate)
 	if err != nil {
 		return "", "", err
@@ -2083,14 +2143,19 @@ func (s *Service) resolveFamilyDailyCover(ctx context.Context, familyID, recordD
 
 	// D6：读路径（详情）封面行缺失或 URL 失效时，与列表路径一致先做无锁评估
 	// 即时返回可用封面，再异步触发完整刷新（30s 去重节流）由后端持久化纠正。
-	members, memberErr := s.pool.Queries().ListFamilyMembers(ctx, familyID)
-	if memberErr != nil {
-		slog.WarnContext(ctx, "list family members for cover resolve failed", slog.String("family_id", familyID), slog.String("record_date", recordDate), slog.Any("error", memberErr))
-	} else if len(members) > 0 {
-		memberIDs := make([]string, 0, len(members))
-		for _, m := range members {
-			memberIDs = append(memberIDs, m.UserID)
+	// memberIDs 未透传时才查库（详情入口已随 GetFamilyMembers 取得，免重复查询）。
+	if memberIDs == nil {
+		members, memberErr := s.pool.Queries().ListFamilyMembers(ctx, familyID)
+		if memberErr != nil {
+			slog.WarnContext(ctx, "list family members for cover resolve failed", slog.String("family_id", familyID), slog.String("record_date", recordDate), slog.Any("error", memberErr))
+		} else if len(members) > 0 {
+			memberIDs = make([]string, 0, len(members))
+			for _, m := range members {
+				memberIDs = append(memberIDs, m.UserID)
+			}
 		}
+	}
+	if len(memberIDs) > 0 {
 		if evalURL, evalFileID, _, evalErr := s.evaluateCoverForDate(ctx, familyID, recordDate, memberIDs, nil); evalErr != nil {
 			slog.WarnContext(ctx, "evaluate cover for detail failed", slog.String("family_id", familyID), slog.String("record_date", recordDate), slog.Any("error", evalErr))
 		} else if evalURL != "" {
@@ -2210,7 +2275,18 @@ func (s *Service) generateTrajectoryMap(ctx context.Context, familyID, recordDat
 		return "", "", "", fmt.Errorf("empty staticmap image")
 	}
 
+	// 腾讯把业务错误包在 HTTP 200 + JSON 体里返回(如 status=348 参数错误)——
+	// 只查 HTTP 状态码会漏过,错误体一旦当图片落库,客户端拿到无法渲染的封面。
+	// 非图片响应体一律显式失败(带腾讯 status/message),由调用方回退默认封面。
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if !strings.Contains(contentType, "image/") {
+		snippet := data
+		if len(snippet) > 200 {
+			snippet = snippet[:200]
+		}
+		return "", "", "", fmt.Errorf("staticmap returned non-image body (content-type %s): %s", contentType, snippet)
+	}
+
 	ext := ".png"
 	if strings.Contains(contentType, "jpeg") || strings.Contains(contentType, "jpg") {
 		ext = ".jpg"
@@ -2409,6 +2485,17 @@ func (s *Service) buildCard(ctx context.Context, familyID, recordDate string, ro
 
 var parenthesisRegex = regexp.MustCompile(`[（(].*?[）)]`)
 
+// provincePrefixes 省级行政区前缀（包级只读，避免列表热路径每次调用重建 34 元素切片）。
+var provincePrefixes = []string{
+	"北京市", "天津市", "上海市", "重庆市",
+	"河北省", "山西省", "辽宁省", "吉林省", "黑龙江省",
+	"江苏省", "浙江省", "安徽省", "福建省", "江西省", "山东省",
+	"河南省", "湖北省", "湖南省", "广东省", "海南省",
+	"四川省", "贵州省", "云南省", "陕西省", "甘肃省", "青海省", "台湾省",
+	"内蒙古自治区", "广西壮族自治区", "西藏自治区", "宁夏回族自治区", "新疆维吾尔自治区",
+	"香港特别行政区", "澳门特别行政区",
+}
+
 func smartShortenAddress(addr string) string {
 	if addr == "" {
 		return addr
@@ -2416,16 +2503,7 @@ func smartShortenAddress(addr string) string {
 	addr = strings.TrimSpace(addr)
 	addr = parenthesisRegex.ReplaceAllString(addr, "")
 	addr = strings.TrimSpace(addr)
-	provinces := []string{
-		"北京市", "天津市", "上海市", "重庆市",
-		"河北省", "山西省", "辽宁省", "吉林省", "黑龙江省",
-		"江苏省", "浙江省", "安徽省", "福建省", "江西省", "山东省",
-		"河南省", "湖北省", "湖南省", "广东省", "海南省",
-		"四川省", "贵州省", "云南省", "陕西省", "甘肃省", "青海省", "台湾省",
-		"内蒙古自治区", "广西壮族自治区", "西藏自治区", "宁夏回族自治区", "新疆维吾尔自治区",
-		"香港特别行政区", "澳门特别行政区",
-	}
-	for _, p := range provinces {
+	for _, p := range provincePrefixes {
 		if strings.HasPrefix(addr, p) {
 			addr = strings.TrimPrefix(addr, p)
 			break
@@ -2604,6 +2682,7 @@ func buildCreateEntryParams(entryID, diaryID, userID string, req *entryRequest, 
 func mergeUpdateEntryParams(existing sqlc.DiaryEntry, req *entryRequest) (sqlc.UpdateDiaryEntryParams, error) {
 	params := sqlc.UpdateDiaryEntryParams{
 		ID:            existing.ID,
+		DiaryID:       existing.DiaryID,
 		Text:          existing.Text,
 		Lat:           existing.Lat,
 		Lon:           existing.Lon,
@@ -2681,7 +2760,7 @@ func (s *Service) coverURLFromParts(fileID, path, storageType string) (string, b
 }
 
 func (s *Service) coverURLFromRow(cover sqlc.GetFamilyDailyCoverRow) (string, bool, error) {
-	// M2：cover_type='default' 时不使用任何文件图，防止触发器保留的 cover_file_id（B3-08）或历史脏数据被误展示。
+	// M2：cover_type='default' 时不使用任何文件图，防止触发器保留的 cover_file_id或历史脏数据被误展示。
 	if cover.CoverType == "default" {
 		return "", false, nil
 	}
@@ -2701,7 +2780,7 @@ func (s *Service) coverURLFromRow(cover sqlc.GetFamilyDailyCoverRow) (string, bo
 }
 
 func (s *Service) coverURLFromListRow(c sqlc.ListFamilyDailyCoversRow) (string, bool, error) {
-	// M2：cover_type='default' 时不使用任何文件图，防止触发器保留的 cover_file_id（B3-08）或历史脏数据被误展示。
+	// M2：cover_type='default' 时不使用任何文件图，防止触发器保留的 cover_file_id或历史脏数据被误展示。
 	if c.CoverType == "default" {
 		return "", false, nil
 	}
@@ -2776,7 +2855,7 @@ func (s *Service) GetCoverURL(ctx context.Context, familyID, recordDate string) 
 		}
 		return "", err
 	}
-	// M2：cover_type='default' 时返回默认占位图，防止触发器保留的 cover_file_id（B3-08）或历史脏数据
+	// M2：cover_type='default' 时返回默认占位图，防止触发器保留的 cover_file_id或历史脏数据
 	// 被轮询端点误展示为旧图（与 coverURLFromRow/coverURLFromListRow 的 M2 防护保持一致）。
 	if cover.CoverType == "default" {
 		return s.defaultCoverURL(), nil

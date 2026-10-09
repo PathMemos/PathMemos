@@ -41,11 +41,20 @@ type InfoProvider interface {
 var _ InfoProvider = (*Service)(nil)
 
 // IssueTrialVIPWithTx 注册事务内发放 trial。同一微信主体注销重注册时，openid 墓碑
-// （user_vip_claims 部分唯一索引，R-21）使 UpsertVIPClaim rowsAffected==0；此处静默
-// 跳过发放而不回滚注册（R-26）——否则注销用户将永久无法重新注册。
-// /vip/new-user 端点的 409 语义由 ClaimTrialVIP→ActivateVIPWithTx 独立承载，不受影响。
+// （user_vip_claims 部分唯一索引）使 UpsertVIPClaim rowsAffected==0；此处静默
+// 跳过发放而不回滚注册——否则注销用户将永久无法重新注册。trial 商品下线
+// （is_active=false，GetActiveVIPByID 0 行）同样静默跳过、不回滚注册。
+// /vip/new-user 端点的 409/404 语义由 ClaimTrialVIP 独立承载，不受影响。
 func (s *Service) IssueTrialVIPWithTx(ctx context.Context, userID string, q *sqlc.Queries) error {
-	err := s.ActivateVIPWithTx(ctx, userID, trialVIPID, q)
+	vipRecord, err := s.getActiveTrialVIP(ctx, q)
+	if errors.Is(err, ErrTrialVIPDisabled) {
+		slog.InfoContext(ctx, "trial vip disabled, skip grant on registration", "user_id", userID)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	err = s.activateVIPWithTx(ctx, userID, vipRecord, q)
 	if trialGrantSkipped(err) {
 		slog.InfoContext(ctx, "trial already claimed (openid tombstone), skip grant on registration", "user_id", userID)
 		return nil
@@ -58,9 +67,27 @@ func trialGrantSkipped(err error) bool {
 	return errors.Is(err, ErrTrialVIPAlreadyClaimed)
 }
 
+// getActiveTrialVIP 读取在售的 trial 商品；商品不存在或已下线（is_active=false）
+// 返回 ErrTrialVIPDisabled。支付发货不走此查询（ActivateVIPWithTx 沿用 GetVIPByID），
+// 已支付订单不因商品下线而漏发。
+func (s *Service) getActiveTrialVIP(ctx context.Context, q *sqlc.Queries) (sqlc.Vip, error) {
+	vipRecord, err := q.GetActiveVIPByID(ctx, trialVIPID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return sqlc.Vip{}, ErrTrialVIPDisabled
+		}
+		return sqlc.Vip{}, fmt.Errorf("get active vip by id: %w", err)
+	}
+	return vipRecord, nil
+}
+
 func (s *Service) ClaimTrialVIP(ctx context.Context, userID string) error {
 	return db.WithTx(ctx, s.pool.Pool(), func(ctx context.Context, q *sqlc.Queries) error {
-		return s.ActivateVIPWithTx(ctx, userID, trialVIPID, q)
+		vipRecord, err := s.getActiveTrialVIP(ctx, q)
+		if err != nil {
+			return err
+		}
+		return s.activateVIPWithTx(ctx, userID, vipRecord, q)
 	})
 }
 
@@ -89,7 +116,7 @@ func (s *Service) hasVIPClaimWithQ(ctx context.Context, q *sqlc.Queries, userID,
 	if userID == "" {
 		return false, fmt.Errorf("empty user id")
 	}
-	// R-21：优先按微信主体（openid）判重——注销重注册得到新 user_id 后仍能识别已领取；
+	// 优先按微信主体（openid）判重——注销重注册得到新 user_id 后仍能识别已领取；
 	// openid 缺失（异常数据）时回退 user_id 维度。
 	claimant, err := q.GetUserByID(ctx, userID)
 	if err != nil {
@@ -137,7 +164,7 @@ func (s *Service) ExtendVIPDaysWithTx(ctx context.Context, userID string, days i
 		expire = base.AddDate(0, 0, days)
 		id = existing.ID
 	} else if errors.Is(err, pgx.ErrNoRows) {
-		// VP-P2-02：并发首次下发（无 user_vips 行）时 GetUserVIPForUpdate 锁不住不存在的行，
+		// 并发首次下发（无 user_vips 行）时 GetUserVIPForUpdate 锁不住不存在的行，
 		// 两个并发调用会各自按 now 计算 expire，UpsertUserVIP 的 GREATEST 只保留较大者，
 		// 较小档时长被吞。先 ON CONFLICT DO NOTHING 占位，再 FOR UPDATE 重读串行化创建。
 		newID, err := util.NewUUID()
@@ -194,6 +221,8 @@ func (s *Service) GetVIPInfo(ctx context.Context, userID string) (Info, error) {
 	return Info{IsVIP: isVIP, ExpireTime: expire}, nil
 }
 
+// ActivateVIPWithTx 按 vipID 激活（不过滤 is_active）：支付回调发货依赖它，
+// 商品下线不得阻断已支付订单的交付；trial 领取的下线闸门在 getActiveTrialVIP。
 func (s *Service) ActivateVIPWithTx(ctx context.Context, userID, vipID string, q *sqlc.Queries) error {
 	vipRecord, err := q.GetVIPByID(ctx, vipID)
 	if err != nil {
@@ -210,7 +239,7 @@ func (s *Service) activateVIPWithTx(ctx context.Context, userID string, vipRecor
 
 	now := timeutil.NowShanghai()
 
-	// R-21：冗余记录发放主体 openid——注销后领取墓碑行（user_id 置 NULL）仍凭 open_id 防重。
+	// 冗余记录发放主体 openid——注销后领取墓碑行（user_id 置 NULL）仍凭 open_id 防重。
 	claimant, err := q.GetUserByID(ctx, userID)
 	if err != nil {
 		return fmt.Errorf("get claimant user: %w", err)
@@ -254,7 +283,7 @@ func (s *Service) activateVIPWithTx(ctx context.Context, userID string, vipRecor
 		case "day":
 			added = base.AddDate(0, 0, duration)
 		case "month":
-			added = base.AddDate(0, duration, 0)
+			added = addMonthsClamped(base, duration)
 		case "year":
 			added = base.AddDate(duration, 0, 0)
 		}
@@ -299,7 +328,7 @@ func (s *Service) activateVIPWithTx(ctx context.Context, userID string, vipRecor
 		case "day":
 			extended = base.AddDate(0, 0, duration)
 		case "month":
-			extended = base.AddDate(0, duration, 0)
+			extended = addMonthsClamped(base, duration)
 		case "year":
 			extended = base.AddDate(duration, 0, 0)
 		}
@@ -329,4 +358,19 @@ func ParseVIPDuration(mark string, number int) (int, string, error) {
 	default:
 		return 0, "", fmt.Errorf("invalid vip time_limit_mark: %s", mark)
 	}
+}
+
+// addMonthsClamped 以月加法并把溢出日钳制到目标月最后一天。
+// Go 的 AddDate 会把 1/31 + 1 月归一化到 3/2，导致到期日比购买预期多 2-3 天，
+// 且后续续期锚点随之漂移。
+func addMonthsClamped(base time.Time, months int) time.Time {
+	y, m, d := base.Date()
+	firstOfTarget := time.Date(y, m+time.Month(months), 1, base.Hour(), base.Minute(), base.Second(), base.Nanosecond(), base.Location())
+	lastDay := time.Date(firstOfTarget.Year(), firstOfTarget.Month()+1, 0, 0, 0, 0, 0, firstOfTarget.Location()).Day()
+	day := d
+	if day > lastDay {
+		day = lastDay
+	}
+	return time.Date(firstOfTarget.Year(), firstOfTarget.Month(), day,
+		base.Hour(), base.Minute(), base.Second(), base.Nanosecond(), base.Location())
 }

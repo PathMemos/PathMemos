@@ -58,8 +58,6 @@ lint-worker:
 	@cd api-worker && npm run typecheck
 	@cd mcp-worker && npm run typecheck
 
-audit-patterns:
-	@bash scripts/audit-patterns.sh
 
 clean:
 	rm -rf bin/

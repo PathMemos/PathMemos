@@ -39,7 +39,7 @@ export const themeManager = {
 
     if (!_themeChangeRegistered) {
       _themeChangeRegistered = true;
-      // R2-F02：低版本基础库可能无此 API，做能力检测防止启动崩溃。
+      // 低版本基础库可能无此 API，做能力检测防止启动崩溃。
       if (typeof wx.onThemeChange !== 'function') return;
       wx.onThemeChange((res: any) => {
         // 同步失效系统信息缓存：运行期主题切换后，getSystemInfo().theme 消费方

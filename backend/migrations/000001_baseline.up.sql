@@ -35,7 +35,7 @@ CREATE FUNCTION public.fix_cover_type_on_null_fk() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-    -- B3-08：manual→default 回退时保留 cover_file_id（可恢复信息），不再连带清空。
+    -- manual→default 回退时保留 cover_file_id（可恢复信息），不再连带清空。
     IF NEW.manual_cover_file_id IS NULL AND NEW.cover_type = 'manual' THEN
         NEW.cover_type := 'default';
     END IF;

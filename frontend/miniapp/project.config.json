@@ -40,7 +40,8 @@
     "disableSWC": true,
     "lessSetting": {
       "commonUseFilePath": "app.less"
-    }
+    },
+    "urlCheck": true
   },
   "simulatorType": "wechat",
   "simulatorPluginLibVersion": {
@@ -53,7 +54,7 @@
     "tabSize": 2
   },
   "appid": "wxe56d190a14826b0d",
-  "libVersion": "3.8.3",
+  "libVersion": "3.8.12",
   "packOptions": {
     "ignore": [],
     "include": [

@@ -32,10 +32,16 @@
               <view class="corner-badge">{{_i18n['invite.joined']}}</view>
             </block>
             <block wx:else>
-              <button open-type="share"
+              <button wx:if="{{!isAppEnv}}" open-type="share"
                 class="invite-family-btn"
                 data-share-type="family"
                 disabled="{{!shareReady}}"
+              >{{_i18n['invite.inviteJoinFamily']}}</button>
+              <button wx:else
+                class="invite-family-btn"
+                data-share-type="family"
+                disabled="{{!shareReady}}"
+                bindtap="onAppShare"
               >{{_i18n['invite.inviteJoinFamily']}}</button>
               <view class="corner-badge">{{_i18n['invite.registered']}}</view>
             </block>
@@ -49,7 +55,10 @@
   </scroll-view>
 
   <view class="tool">
-    <button open-type="share" class="tool-btn share">
+    <button wx:if="{{!isAppEnv}}" open-type="share" class="tool-btn share">
+      <text>{{_i18n['invite.shareFriend']}}</text>
+    </button>
+    <button wx:else class="tool-btn share" bindtap="onAppShare" data-share-type="invite">
       <text>{{_i18n['invite.shareFriend']}}</text>
     </button>
     <view class="tool-btn index" bindtap="saveShareImage">{{_i18n['invite.shareMoment']}}</view>

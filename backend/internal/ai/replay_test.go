@@ -77,7 +77,7 @@ func TestChatWithPrompt_ReplayFromCache(t *testing.T) {
 	}
 
 	var chunks []string
-	got, err := svc.chatWithPrompt(context.Background(), "u1", "你好", func(chunk string) error {
+	got, _, err := svc.chatWithPrompt(context.Background(), "u1", "你好", func(chunk string) error {
 		chunks = append(chunks, chunk)
 		return nil
 	}, "", &config.SysConfig{}, "req00000002")
@@ -113,7 +113,7 @@ func TestChatWithPrompt_WaitsForInFlightTurn(t *testing.T) {
 	}()
 
 	var chunks []string
-	got, err := svc.chatWithPrompt(context.Background(), "u2", "在途消息", func(chunk string) error {
+	got, _, err := svc.chatWithPrompt(context.Background(), "u2", "在途消息", func(chunk string) error {
 		chunks = append(chunks, chunk)
 		return nil
 	}, "", &config.SysConfig{}, "req00000003")

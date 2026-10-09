@@ -35,7 +35,7 @@ func phoneRequest(path, body string) *http.Request {
 	return req.WithContext(middleware.WithUserID(req.Context(), "u1"))
 }
 
-// TestBindPhone_LockedToday 当日已绑定 → 400 且不调用微信、不写库（A-AC-15）。
+// TestBindPhone_LockedToday 当日已绑定 → 400 且不调用微信、不写库。
 func TestBindPhone_LockedToday(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
@@ -50,56 +50,6 @@ func TestBindPhone_LockedToday(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.BindPhone(rec, phoneRequest("/auth/phone/bind", `{"code":"x"}`))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
-}
-
-// TestUnbindPhone_PreservesPhoneBindTime A-AC-16：解绑清 phone_number，保留 phone_bind_time（日限据此判定）。
-func TestUnbindPhone_PreservesPhoneBindTime(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("mock: %v", err)
-	}
-	defer mock.Close()
-
-	bindTime := pgtype.Timestamptz{Time: timeutil.NowShanghai(), Valid: true}
-	h := &Handler{pool: db.NewPoolWithDBTX(mock)}
-	mock.ExpectQuery("FROM users WHERE id = \\$1").
-		WithArgs("u1").
-		WillReturnRows(userRowPhone("u1", "13800000000", bindTime))
-	mock.ExpectExec("UPDATE users SET").
-		WithArgs("u1", pgtype.Text{}, bindTime).
-		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
-
-	rec := httptest.NewRecorder()
-	h.UnbindPhone(rec, phoneRequest("/auth/phone/unbind", `{}`))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
-}
-
-// TestUnbindPhone_NotBound 未绑定 → 400。
-func TestUnbindPhone_NotBound(t *testing.T) {
-	mock, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("mock: %v", err)
-	}
-	defer mock.Close()
-
-	h := &Handler{pool: db.NewPoolWithDBTX(mock)}
-	mock.ExpectQuery("FROM users WHERE id = \\$1").
-		WithArgs("u1").
-		WillReturnRows(userRowPhone("u1", "", pgtype.Timestamptz{}))
-
-	rec := httptest.NewRecorder()
-	h.UnbindPhone(rec, phoneRequest("/auth/phone/unbind", `{}`))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}

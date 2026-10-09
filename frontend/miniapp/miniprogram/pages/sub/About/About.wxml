@@ -13,6 +13,13 @@
       </view>
 
       <view class="cell-view">
+        <Cell bindtap="toFamilyApp" showArrow>
+          {{_i18n['about.otherProducts']}}
+          <view slot="suffix" class="app-suffix">
+            <image class="app-suffix-logo" src="../../../image/family_app_logo.png" />
+            <text class="app-suffix-name">{{_i18n['about.familyAppName']}}</text>
+          </view>
+        </Cell>
         <Cell bindtap="toChat" showArrow>{{_i18n['about.contactService']}}</Cell>
         <Cell bindtap="toGuide" showArrow>{{_i18n['about.usageGuide']}}</Cell>
         <Cell bindtap="openByPrivacyPolicy" showArrow>{{_i18n['about.privacyPolicy']}}</Cell>

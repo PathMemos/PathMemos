@@ -173,5 +173,4 @@
 
   <AIDrawer wx:if="{{showAIDrawer}}" id="aiDrawer" bind:hidden="hiddenAIDrawer"></AIDrawer>
 
-  <canvas type="2d" id="shareCanvas" class="share-canvas" style="width:1px;height:1px;"></canvas>
 </view>

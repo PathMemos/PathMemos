@@ -1,5 +1,5 @@
 /**
- * uploadFile 部分失败语义（PPJ-B08）：
+ * uploadFile 部分失败语义：
  * 整批失败时，已成功项必须把 fileId 回写到输入对象（uploadedId），
  * 使调用方（NoteEdit）能把成功项落为 UPLOADED，重试只补传失败项。
  */

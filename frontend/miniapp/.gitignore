@@ -9,7 +9,7 @@ SECRETS.md
 .env
 .env.local
 
-# R3：project.private.config.json 重新入库——团队默认需要 urlCheck:false 才能调试真机，
+# project.private.config.json 重新入库——团队默认需要 urlCheck:false 才能调试真机，
 # 删掉后新环境会被默认 urlCheck 拦截导致"线上接口调不通"。
 # 构建产物
 *.js.map

@@ -2,7 +2,9 @@ import request, { createCancelToken } from './request';
 import { getVipInfo, fetchVipInfo } from './vip';
 import { isIOS } from './util';
 import { logger } from './logger';
-import { opsLog, opsLogFail } from './opslog';
+import { opsLog, opsLogFail, flushOpsLog } from './opslog';
+import { isAppEnv } from './appPermission';
+import i18n from './i18n';
 
 
 const CENTROID_CALC_INTERVAL_MS = 30_000;     
@@ -200,7 +202,7 @@ const _shouldSkipReportDueToBackoff = (): boolean => {
 };
 
 const _serialFlushAndReport = async (cancelToken?: any, force = false): Promise<void> => {
-  // PPJ-A02：已有上报在进行时，不能直接返回旧 promise——期间新入队的点会被排除在本轮之外。
+  // 已有上报在进行时，不能直接返回旧 promise——期间新入队的点会被排除在本轮之外。
   // 先等旧一轮结束，再用最新 storage 重跑一轮（force=true 时忽略退避，用于关闭前的最后一批）。
   if (_reportPromise) {
     try { await _reportPromise; } catch {}
@@ -239,7 +241,7 @@ const _flushToStorage = async (): Promise<void> => {
       if (combined.length > STORAGE_MAX_SIZE) {
         const dropped = combined.length - STORAGE_MAX_SIZE;
         combined.splice(0, dropped);
-        // PPJ-A01：头部淘汰的是最旧的点；同步前移「已上报前缀」计数，
+        // 头部淘汰的是最旧的点；同步前移「已上报前缀」计数，
         // 否则计数大于实际已上报前缀，_tryReportStorage 会跳过未上报的新点并最终误清。
         _reportedLeadingCount = Math.max(0, _reportedLeadingCount - dropped);
       }
@@ -502,6 +504,9 @@ const _getCurrentLocation = (
     const timeoutTimer = setTimeout(() => {
       if (settled) return;
       settled = true;
+      opsLog('location_diag', { step: 'get-fail', errMsg: 'getLocation: timeout' });
+      opsLogFail('location_get_fail', { errMsg: 'getLocation: timeout' });
+      void flushOpsLog();
       reject({ errMsg: 'getLocation: timeout' });
     }, timeoutMs);
     wx.getLocation({
@@ -518,6 +523,10 @@ const _getCurrentLocation = (
         if (settled) return;
         settled = true;
         clearTimeout(timeoutTimer);
+        const we = err as any;
+        opsLog('location_diag', { step: 'get-fail', errCode: we?.errCode, errMsg: we?.errMsg });
+        opsLogFail('location_get_fail', err);
+        void flushOpsLog();
         reject(err);
       },
     });
@@ -742,10 +751,54 @@ const _startLocationUpdate = (): Promise<void> => {
         resolve();
       },
       fail: (err) => {
+        // 多端 App 定位排障：失败原因（隐私未同意/权限拒绝/系统服务关闭）落到
+        // client_ops_logs，服务端可直接查询。
+        const we = err as any;
+        opsLog('location_diag', { step: 'start-background-fail', errCode: we?.errCode, errMsg: we?.errMsg });
+        opsLogFail('location_start_fail', err);
+        void flushOpsLog();
         reject(err);
       },
     });
   });
+};
+
+// 多端 App 的系统定位授权前置。
+// 多端 App 脱离微信权限体系：wx.authorize/getSetting/openSetting 均不可用，
+// 系统权限由框架在「调用对应能力的接口」时向 Android/iOS 申请。
+// 关键：Android 10+ 不允许一步到位申请后台定位——未获前台定位授权时直接
+// startLocationUpdateBackground 会被系统静默拒绝。因此 App 环境开启自动记录前
+// 先跑一次前台 wx.getLocation 主动触发系统授权弹窗。
+// 注意：不做 getAppAuthorizeSetting 前置决策查询——实测该 API 在部分
+// 真机上既不回调 success 也不回调 fail（悬挂），不能作为流程门卫；仅独立记录
+// 其结果用于诊断，无论结果如何都继续走前台定位。
+const _ensureAppLocationAuthorized = async (): Promise<void> => {
+  const appEnv = !!(wx as any).miniapp;
+  opsLog('location_diag', { step: 'ensure-begin', appEnv });
+  if (!appEnv) return; // 小程序环境走微信 scope 授权体系
+  try {
+    (wx as any).getAppAuthorizeSetting({
+      success: (res: any) => {
+        opsLog('location_diag', { step: 'auth-state', authorized: res?.locationAuthorized });
+        void flushOpsLog();
+      },
+      fail: (err: any) => {
+        opsLog('location_diag', { step: 'getAppAuthorizeSetting-fail', errMsg: (err as any)?.errMsg });
+      },
+    });
+  } catch (e: any) {
+    opsLog('location_diag', { step: 'getAppAuthorizeSetting-throw', errMsg: String(e?.message || e).slice(0, 100) });
+  }
+  // 未授权时系统弹窗在此触发，已授权时无感通过；失败（含用户 denied）直接抛出——
+  // _doOpenAutoRecord 捕获后中止开启并反向关闭后端开关（02c AR-1.1）。
+  try {
+    await _getCurrentLocation(LOCATION_TIMEOUT_MS, { highAccuracy: false, highAccuracyExpireTime: 2000 });
+    opsLog('location_diag', { step: 'foreground-getLocation-ok' });
+  } catch (e: any) {
+    opsLog('location_diag', { step: 'foreground-getLocation-fail', errMsg: (e as any)?.errMsg });
+    void flushOpsLog();
+    throw e;
+  }
 };
 
 
@@ -763,6 +816,8 @@ const _doOpenAutoRecord = async (onDone: (ok: boolean, err?: any) => void, start
 
   try {
     try { await _syncBackendConfig(true, token); } catch (e) { logger.error('autoRecord step1 syncBackendConfig failed', e); throw e; }
+    _checkAborted();
+    try { await _ensureAppLocationAuthorized(); } catch (e) { logger.error('autoRecord step1.5 app location permission failed', e); throw e; }
     _checkAborted();
     try { await _startLocationUpdate(); } catch (e) { logger.error('autoRecord step2 startLocationUpdate failed', e); throw e; }
     _checkAborted();
@@ -813,7 +868,7 @@ export const openAutoRecord = (): Promise<boolean> => {
       if (_lifecycleCancelToken) {
         try { _lifecycleCancelToken.cancel(); } catch {}
       }
-      // F1-15：超时可能发生在后端已接受 enabled=true（响应丢失/挂起）之后，
+      // 超时可能发生在后端已接受 enabled=true（响应丢失/挂起）之后，
       // 先查后端真实状态再决定本地开关，避免"本地置 off / 后端仍 on"的不一致窗口。
       // 查询失败或后端未开启时按关闭处理。
       let backendEnabled = false;
@@ -828,8 +883,7 @@ export const openAutoRecord = (): Promise<boolean> => {
       }
       if (backendEnabled) {
         // 后端已开启：保留本地开启态，不反向关闭后端开关。
-        // R4：立即尝试重建后台定位监听（原来要等下次进入小程序才恢复，
-        // 存在"界面显示已开启但监听未建立"的窗口）。
+        // 立即尝试重建后台定位监听（否则存在"界面显示已开启但监听未建立"的窗口）。
         _setRecordingState(true);
         logger.warn('autoRecord open timed out but backend enabled, keep local state on and restore immediately');
         tryRestoreAutoRecord().catch(() => {});
@@ -857,6 +911,14 @@ export const openAutoRecord = (): Promise<boolean> => {
       return;
     }
 
+    // 多端 App：wx.getSetting 不可用（API 总览 否[4]），原流程会静默 finish(false)。
+    // 后台定位授权由系统权限承担，_ensureAppLocationAuthorized 已前置处理
+    // （查授权态/引导设置/前台 getLocation 触发系统弹窗），直接进入开启流程。
+    if (isAppEnv()) {
+      _doOpenAutoRecord(finish, startGeneration);
+      return;
+    }
+
     wx.getSetting({
       success(res) {
         const bgAuth = (res.authSetting as any)['scope.userLocationBackground'];
@@ -876,10 +938,10 @@ export const openAutoRecord = (): Promise<boolean> => {
 
 function _showLocationSettingModal(onDone: (ok: boolean, err?: any) => void, startGeneration: number) {
   wx.showModal({
-    title: '需要后台定位权限',
-    content: '请开启"离开后允许"定位权限，以便后台记录行程',
-    confirmText: '去开启',
-    cancelText: '取消',
+    title: i18n.t('autoRecord.bgLocationTitle'),
+    content: i18n.t('autoRecord.bgLocationDesc'),
+    confirmText: i18n.t('autoRecord.goEnable'),
+    cancelText: i18n.t('common.cancel'),
     success: (modalRes) => {
       if (modalRes.confirm) {
         let settingTimedOut = false;
@@ -923,6 +985,9 @@ function _showLocationSettingModal(onDone: (ok: boolean, err?: any) => void, sta
 
 
 const _resetState = (preserveStorage = false) => {
+  // 上报进度计数同步清零：上一账号「上报成功但清空失败」的残留会让新账号驻留点
+  // 被 slice 跳过前 N 点不上报（登出/注销均经 closeAutoRecord → _resetState）
+  _reportedLeadingCount = 0;
   if (_iosResumeTimer != null) {
     clearTimeout(_iosResumeTimer);
     _iosResumeTimer = null;
@@ -1098,7 +1163,7 @@ export const tryRestoreAutoRecord = async (): Promise<boolean> => {
     }
 
     // 2. 网络校验：上报积压轨迹、VIP 校验、后端开关校验
-    // R5：恢复路径不得绕过 _serialFlushAndReport 的单飞链直调 _tryReportStorage——
+    // 恢复路径不得绕过 _serialFlushAndReport 的单飞链直调 _tryReportStorage——
     // 否则会与 push/close 路径的 _flushToStorage（读-改-写）并发交错，导致驻留点静默丢失或重复上报。
     await _serialFlushAndReport(token);
 
@@ -1115,7 +1180,8 @@ export const tryRestoreAutoRecord = async (): Promise<boolean> => {
       return false;
     }
     if (_closingGeneration !== startGeneration) {
-      _resetState();
+      // 期间用户已完成 open/close：现场归新的裁决者——这里拆监听/写开关会把
+      // "界面 off/后端 on"且监听死亡定格到下次冷启动。直接返回，不做任何清理。
       return false;
     }
     const isVip = vipInfo?.isVip > 0;
@@ -1128,7 +1194,7 @@ export const tryRestoreAutoRecord = async (): Promise<boolean> => {
 
     const { data } = await request.get('/auto-record/config', { cancelToken: token });
     if (_closingGeneration !== startGeneration) {
-      _resetState();
+      // 同上：现场归新的 open/close 裁决，不拆场。
       return false;
     }
     const enabled = data?.enabled ?? false;

@@ -1,6 +1,6 @@
 # PP-02C 自动记录（L2）
 
-> 层级：L2 领域分册｜版本：V2.0｜状态：定稿（以当前代码为唯一事实源）
+> 层级：L2 领域分册｜版本：当前（以代码为唯一事实源）
 > 上游：PP-01 产品总览｜关联 ADR：<无>
 > 说明：本分册按当前代码实现整理；行内路径指向对应实现位置。
 > 关键实现位置：`backend/internal/autorecord`、`backend/internal/location`、`backend/internal/jobs`、`backend/internal/redis`、`backend/internal/db/sqlc/auto_record.sql` 等。
@@ -34,6 +34,8 @@
 | D10 | 候选用户按 `user_id` keyset 公平轮转（游标 Redis `job:cursor:auto_record`） | 防止用户数扩展后低频用户饥饿；游标丢失仅从头重扫，不影响正确性（I2） | 无 |
 | D11 | 逆地理达到 `maxGeocodeAttempts` 的轨迹为终态：候选 EXISTS 与逐用户查询均排除，跨过上限时记一次 `geocode_discarded` | 终态不再参与聚类与告警，仍保留至 7 天清理，不物理删除 | 无 |
 
+> **判重粒度取舍（关联 D4 / AR-7.2）**：判重键 = 当天自动条目 address ∪ detail_address 字符串集合（`autorecord/service.go` `isDuplicateAutoAddress` / `FindDuplicateAutoEntry`）；同名 POI（连锁店 landmark 同名不同分店）同日会被误判为重复、不再成文，为**已接受取舍**。替代方案距离判重（如 300m 半径）会把该「同名漏判」换成「GPS 漂移导致同地重复成文 + 轨迹误删」（判重命中即删除本 cluster 全部轨迹，AR-7.2），问题面互换不划算，不做。
+
 ## 3. 核心流程（用户故事 + 时序）
 
 > 编号稳定；验收标准（AC）均可直接转成断言。
@@ -41,10 +43,12 @@
 ### AR-1 开启/关闭自动记录
 - 故事：VIP 用户在小程序首页打开「自动记录」开关。
 - AC：
-  1. 满足 `getVipInfo().isVip > 0` 后，前端依次执行 `PUT /auto-record/config {enabled:true}` → `wx.startLocationUpdateBackground` + `wx.onLocationChange`，全部成功后本地 storage 置 on（`frontend/miniapp/miniprogram/utils/autoRecord.ts`）。
+  1. 满足 `getVipInfo().isVip > 0` 后，前端依次执行 `PUT /auto-record/config {enabled:true}` →（**仅多端 App 环境**）`_ensureAppLocationAuthorized`：`wx.getAppAuthorizeSetting` 查询系统定位授权态——**查态结果仅作 `location_diag` 诊断日志、不做流程门卫**（前置查态在真机上会导致链路悬挂）——流程门卫是前台 `wx.getLocation` 主动触发系统授权弹窗（Android 10+ 直接申请后台定位会被系统静默拒绝，必须先前台授权；多端 App 无微信权限体系，`wx.authorize/getSetting` 不可用）；**前台 `getLocation` 失败（含用户 denied 拒绝授权弹窗）即开启失败**——中止开启流程、反向 `PUT /auto-record/config {enabled:false}` 对齐后端开关并复位本地状态（用户侧仅见首页通用「开启失败」toast）；`openAppAuthorizeSetting` 引导系统设置用于 NoteEdit 定位请求（`utils/appPermission.ts` 封装）与 Set 页（`pages/Set/Set.ts` 直调 `wx.openAppAuthorizeSetting`，不经封装）→ `wx.startLocationUpdateBackground` + `wx.onLocationChange`，全部成功后本地 storage 置 on（`frontend/miniapp/miniprogram/utils/autoRecord.ts`）。**小程序环境前置**：进入上述流程前先 `wx.getSetting` 检查 `scope.userLocationBackground`，未授权时弹窗引导 `wx.openSetting`（设置页 15 秒超时），确认授权后才开启；多端 App 无此步直接开启（`openAutoRecord`）。
   2. 后端在 `enabled=true` 时**严格校验 VIP**（`expire_time > 上海当前时间`，**无宽限期**），非 VIP 返回 HTTP 403、`code=4030`、`biz_code=NOT_VIP`。
-  3. 关闭时先上报积压驻留点再 `PUT /auto-record/config {enabled:false}`（顺序不可颠倒）；上报失败（含非 VIP 403 `NOT_VIP`）**不阻断关闭**，最后一批轨迹放弃（`closeAutoRecord` 吞上报错误后仍关后端开关，前后端状态保持一致）。
-  4. 开启流程整体 30 秒超时；超时后查询后端真实 `enabled`，若后端已开启则保留本地开启并立即尝试恢复监听。
+  3. 关闭时先上报积压驻留点再 `PUT /auto-record/config {enabled:false}`（顺序不可颠倒）；上报失败（含非 VIP 403 `NOT_VIP`）**不阻断关闭**：最后一批轨迹保留在本地 storage，本次关闭流程内不再重试，重新开启后由 `_tryReportStorage` 重新上报（后端按自然键幂等去重，AR-3.6/D9，数据不丢；`closeAutoRecord` 吞上报错误后仍关后端开关，前后端状态保持一致）。
+  4. **VIP 过期 × 开关残留组合语义**：VIP 过期不联动改写 `users.auto_record_enabled`（DB 值残留 true）；`GET /auto-record/config` 对非 VIP 恒 false（不暴露真实值）；前端 `tryRestoreAutoRecord` 自带 VIP 门（非 VIP 不恢复监听）；**续费后自动恢复采集，无需再确认**——恢复时点为续费后的下次启动/回前台 `tryRestoreAutoRecord` 触发（前端 VIP 门重新放行）；语义为「用户既有授权的延续」（App 端系统级后台定位授权也持续有效），视为有意设计。
+  5. 开启流程整体 30 秒超时；超时后查询后端真实 `enabled`（该查询自带独立 5s 竞速超时，失败按关闭处理），若后端已开启则保留本地开启并立即尝试恢复监听。
+  6. 上报遇会话失效且静默重登后仍 401：停止定位监听但保留本地开关，`_scheduleRestoreRetry()` 退避恢复（60s → 最长 5min 间隔），登录恢复后自动续采。
 
 ### AR-2 轨迹采集（前端，`autoRecord.ts`）
 - 故事：小程序按定位回调累积点，识别静止后产出驻留点。
@@ -55,6 +59,7 @@
   4. 静止判定：窗口质心与稳定质心平面距离平方 < 300m²；离开需连续 2 次越界确认。
   5. 驻留成熟：静止持续 ≥ 10 分钟后生成 1 个驻留点，坐标为 4 位小数四舍五入。
   6. 驻留点写入本地 storage（`papafeiji:autoRecordStayPoints`），上限 50，超出丢弃最旧。
+7. VIP 状态未知（缓存缺失、查询失败）时本次定位回调跳过并节流异步确认（`fetchVipInfo`），**不关闭自动记录**（防误杀，绝不回落为非 VIP）；确认非 VIP 才 `closeAutoRecord`。
 
 ### AR-3 轨迹上报与入库
 - 故事：驻留点批量上报服务端。
@@ -64,19 +69,19 @@
   3. 上报成功而清空 storage 失败时，用 `_reportedLeadingCount` 记录已上报前缀，后续只清空不重报。
   4. 后端一次最多 50 点（`maxBatchPoints`），body 最多 64 KiB（超限 413 `code=4130`），非 VIP 返回 403 `code=4030` + `biz_code=NOT_VIP`。
   5. 每点 `lat` / `lon` / `recordedAt`（RFC3339）必填；经纬度越界返回 400；缺字段返回 400。
-  6. 入库 `auto_record_trajectories`，每次上传请求执行一条 `INSERT ... SELECT unnest(...)` 批量语句（`InsertTrajectories`，整批一次入库而非每点一条），`geocode_attempts=0`，`ON CONFLICT DO NOTHING`（唯一索引 `uq_auto_record_trajectories_point`，迁移 000005）；每次上传都 best-effort 刷新 `users.last_active_at`。
-  7. 前端 `batchSeq` 被解析并随上传日志记录（`batch_seq`），仅用于观测；幂等不依赖它。
+  6. 入库 `auto_record_trajectories`，每次上传请求执行一条 `INSERT ... SELECT unnest(...)` 批量语句（`InsertTrajectories`，整批一次入库而非每点一条），`geocode_attempts=0`，`ON CONFLICT DO NOTHING`（唯一索引 `uq_auto_record_trajectories_point`，迁移 000005）；每次上传都 best-effort 刷新 `users.last_active_at`（`TouchActiveAt` 在 body 校验前执行：非法/超限请求同样报活——心跳语义为「请求到达即存活」，有意取舍）。入库坐标经 `formatCoord` 定型为 7 位小数字符串（前端驻留点与首次即时成文为 4 位、cluster 质心为 7 位）。
+  7. 前端 `batchSeq` 随上报请求体上送，服务端解析后仅写入上传日志（`batch_seq`）用于观测，不参与幂等；幂等不依赖它。
 
 ### AR-4 驻留点聚类（`autorecord/service.go mergeStayPoints`）
 - 故事：后台任务把轨迹点合并为停留点。
 - AC：
-  1. 一轮处理 `ListTrajectoriesByUser` 取该用户 `recorded_at ASC LIMIT 100`。
+  1. 一轮处理 `ListTrajectoriesByUser` 取该用户 `recorded_at ASC LIMIT 100`（`maxTrajectoriesPerRound`）。
   2. 连续点「与上一个点的平面距离 ≤ 300m」且「与聚类最后一点时间差 ≤ 30 分钟」则并入同一 cluster。
   3. cluster 代表坐标为全部成员的算术平均质心（7 位小数）；代表时间为成员中最大 `recorded_at`。
   4. 坐标 NaN 的点收入 invalid 集合被删除。
-  5. 无任何 cluster 时删除本轮全部轨迹点。
+  5. `mergeStayPoints` 顺序聚合，每个点必归属某个聚合组（组内链式 300m/30min），**聚类不设最小驻留/点数阈值**——孤立点照样自成一簇进入成文链路（前端仅上报驻留 ≥10 分钟的点，AR-2.5）；invalid 集合仅含坐标 NaN 或质心 `Numeric.Scan` 异常（如 ±Inf）的点/点组，当轮删除；全部点皆 invalid（clusters 为空）时删除本轮全部轨迹点。
   6. cluster 的 `record_date` 取代表时间（成员中最大 `recorded_at`）的上海日期，跨午夜时归入次日。
-  7. 候选用户由 `ListAutoRecordCandidates` 按 `user_id ASC` keyset 游标取前 100（`maxPendingPerUser`）；游标存 Redis `job:cursor:auto_record`；**仅当本轮候选取满 100（满批）时**才统计候选总数，>1000 记 `auto_record_backlog_warn`；候选仅含 VIP 未过期用户（`JOIN user_vips` 且 `expire_time > now()`），VIP 过期用户的存量轨迹不再进入聚类成文（保留至 7 天清理）。
+  7. 候选用户由 `ListAutoRecordCandidates` 按 `user_id ASC` keyset 游标取前 100（`maxCandidateBatch`）；游标存 Redis `job:cursor:auto_record`；**仅当本轮候选取满 100（满批）时**才统计候选总数，>1000 记 `auto_record_backlog_warn`；候选仅含 VIP 未过期用户（`JOIN user_vips` 且 `expire_time > now()`），VIP 过期用户的存量轨迹不再进入聚类成文（保留至 7 天清理）。
 
 ### AR-5 逆地理编码与地址生成
 - 故事：把 cluster 坐标翻译为地址。
@@ -87,6 +92,7 @@
   4. 地址取值：`address = result.address`；`detailAddress` 优先 `formatted_addresses.recommend` → `rough` → `title`；`landmark` 优先 `title` → 第一个 POI 标题 → `detail`；autorecord 层再兜底：`landmark` 仍为空时回退 `address`。
   5. 上游返回 error 时跳过该 cluster，对 cluster 内所有点统一 `geocode_attempts + 1`（`handleGeocodeRetry` 不做上限判断；终态由查询层 `geocode_attempts < maxGeocodeAttempts` 排除，跨过上限那一次记 `geocode_discarded`）；**不删除轨迹**。
   6. 空地址且空 landmark 时走与 5 相同的重试逻辑，仍保留轨迹。
+  7. **用户侧感知（产品取舍）**：逆地理终态丢弃（10 次失败）与日配额耗尽跳过 cluster 均为静默——用户对「自动记录漏记」无提示；轨迹仍保留 7 天（可手动补记窗口），运维侧靠 `geocode_discarded`/`auto_record_backlog_warn` 日志观测。
 
 ### AR-6 常用地址替换
 - 故事：用户把某地址命名为「家」，命中时成文直接用该名称。
@@ -101,7 +107,7 @@
   1. 按 cluster 日（`recorded_at` 的上海时区日期，格式 `2006-01-02`）查询该用户当天全部 `text='（自动记录）'` 条目的地址集合（`ListAutoEntryAddressesByDate`，每日期缓存一次；landmark/detail_address 非空值并入集合）。
   2. 候选的 `landmark` 与 `address` 分别对「当天全部自动条目的 address + detail_address 非空值」集合判重（`isDuplicateAutoAddress`：命中集合任一成员即重复，landmark 可命中历史条目的 detail_address，反之亦然）→ 判重，删除本 cluster 全部轨迹，不成文。
   3. 当天无自动记录时用零值哨兵缓存，不重复查库；成文成功后把新条目写回当天缓存，供后续 cluster 比较。
-  4. `POST /diary/details/auto`（手动首次成文）与后台共用同一集合判重（`ListAutoEntryAddressesByDate` + `FindDuplicateAutoEntry`，评审定稿统一）；判重时直接返回已存在条目 id（响应契约不变，ORDER BY record_time DESC 保证返回最新同址条目）。
+  4. `POST /diary/details/auto`（手动首次成文）与后台共用同一集合判重（`ListAutoEntryAddressesByDate` + `FindDuplicateAutoEntry`）；判重时直接返回已存在条目 id（响应契约不变，ORDER BY record_time DESC 保证返回最新同址条目）。
 
 ### AR-8 自动成文（后台）
 - 故事：cluster 生成一条自动日记条目。
@@ -109,7 +115,7 @@
   1. 事务内 `UpsertDiary`（`diaries(user_id, record_date)` 唯一）+ `CreateAutoRecordEntry`。
   2. 条目字段：`text='（自动记录）'`，`address=landmark`（landmark 为空时仍写空串且 Valid=true），`detail_address=address`（空时不写），`lat/lon`=质心，`record_time`=cluster 最大时间；`sort=0`、`color=NULL`。
   3. 成功后删除本 cluster 轨迹，并异步触发封面刷新 + 新地点提醒；事务失败时轨迹保留，等待下一轮重试。
-  4. 完成后（有新建日期且用户有 current_family_id）异步刷新家庭日封面，再删除 `ai:family_summary:{familyID}` 缓存；该异步任务在用户锁释放后才启动。
+  4. 完成后（有新建日期且用户有 current_family_id）异步刷新家庭日封面，再删除 `ai:family_summary:{familyID}` 缓存；该异步任务在用户锁释放后才启动。**本轮有成文时同样异步失效 MCP 用户日记缓存**（`mcp.InvalidateUserCache`，锁释放后 safe.Go——与手动成文 `POST /diary/details/auto` 同语义，两路径 MCP 可见性一致，延迟上限为 Worker 边缘缓存 TTL 1/5 分钟）。
   5. 单轮处理结果打 OPS-LOG（`trajectories` / `clusters` / `entries_created` / `deleted`）。
   6. 同日多 cluster 复用同一条 `diaries` 记录，同一条日记可同时包含手动条目与自动条目。
 
@@ -124,7 +130,7 @@
 ### AR-10 新地点提醒
 - 故事：每次生成新地点后给服务号订阅用户推送。
 - AC：
-  1. 仅服务号通道；仅 6:00–23:00（上海时区）内发送。
+  1. 仅服务号通道；仅 6:00–22:59（上海时区，h<6 或 h>=23 整点跳过——与 02g P-5 同一实现口径）内发送。
   2. 要求 `wx_mp_accounts.subscribed=true` 且 `mp_openid` 非空，否则跳过。
   3. 页面路径 `pages/NoteDetail/NoteDetail?baseInfo=<JSON>`；地点名取 `address`，为空则 `detail_address`。
   4. 发送失败只记日志；微信 `code=43004` 时将订阅状态置 false。
@@ -132,10 +138,10 @@
 ### AR-11 异常（失联）告警
 - 故事：开启了自动记录但长时间无轨迹/无报活的 VIP 用户，收到「异常」提醒。
 - AC：
-  1. 候选条件（`ListAbnormalAlertCandidates`）：`auto_record_enabled=true`、VIP 未过期（`v.expire_time > now()`，严格）、`abnormal_alert_sent_at` 为空或早于 1 小时前、`last_active_at` 为空或早于「当前时间 − 60 分钟」、最后一条轨迹时间早于「当前时间 − 60 分钟」，且（小程序已接受订阅（前端经 `POST /subscribe/record` 登记）或 服务号已订阅）。
-  2. 任务仅在 8:00–22:00（上海时区）执行；每批 100，循环取批直到取空或整批均为本轮已尝试用户。
+  1. 候选条件（`ListAbnormalAlertCandidates`）：`auto_record_enabled=true`、VIP 未过期（`v.expire_time > now()`，严格）、`abnormal_alert_sent_at` 为空或早于 1 小时前、`last_active_at` 为空或早于「当前时间 − 60 分钟」、最后一条轨迹时间早于「当前时间 − 60 分钟」，且（小程序已接受订阅（前端经 `POST /subscribe/record` 登记）或 服务号已订阅）。订阅登记仅小程序通道：`wx.requestSubscribeMessage`（异常告警模板）经 `POST /subscribe/record` 落库（`components/SubscribePrompt/SubscribePrompt.ts`；App 端通知已裁撤，不弹不记）。
+  2. 任务仅在 8:00–22:00（上海时区）执行；每批 100，循环取批直到取空或整批均为本轮已尝试用户。候选查询无 keyset 游标为有意取舍：发送持续失败的用户会反复出现在候选前列、可能占满单批 100，其余用户顺延下一周期（`jobs/runner.go runAbnormalAlertCheck`）。
   3. 发送前先 `MarkAbnormalAlertSent` 原子占位：仅当 `abnormal_alert_sent_at` 为空或上海日期早于今天才更新成功；更新 0 行表示今天已发，跳过 → **每自然日（上海）最多一次**。
-  4. 服务号与小程序通道各自独立尝试（`canMP` / `canMini`），两者都不可用时直接返回且不占位。
+  4. 服务号与小程序通道各自独立尝试（`canMP` / `canMini`），两者都不可用时直接返回且不占位；小程序通道落地页为 `pages/index/index`（`push/service.go SendAbnormalAlert`）。
   5. 发送失败不撤销占位（宁可漏报不重报）；微信 `code=43101` 时把 `abnormal_subscribe_accepted` 置 false，`43004` 时把服务号订阅置 false。
   6. VIP 判定使用 `vip.InfoProvider.GetVIPInfo`（严格，无宽限期），与候选 SQL 的 `v.expire_time > now()` 口径一致。
   7. `PUT /auto-record/active` 仅更新 `users.last_active_at`，不重置 `abnormal_alert_sent_at`；告警抑制由候选 SQL 的 `last_active_at < now()-1h` 条件实现。
@@ -166,11 +172,11 @@
 | `users` | `auto_record_enabled bool DEFAULT false`、`abnormal_subscribe_accepted bool DEFAULT false`、`abnormal_alert_sent_at timestamptz`、`last_active_at timestamptz`；索引 `idx_users_auto_record_enabled` | 开关与告警状态 |
 | `user_vips` | `user_id`、`expire_time timestamptz` | VIP 判定数据源 |
 
-> 源：`backend/migrations/000001_baseline.up.sql`；`backend/internal/db/sqlc/auto_record.sql`、`user_common_address.sql`、`diary_entry.sql`、`user.sql`、`vip.sql`。迁移 000002（封面 trigger）、000003（seed）、000004（client_ops_logs）、000006（drop sys_configs）与本域无直接关系。
+> 源：`backend/migrations/000001_baseline.up.sql`；`backend/internal/db/sqlc/auto_record.sql`、`user_common_address.sql`、`diary_entry.sql`、`user.sql`、`vip.sql`。迁移 000002（封面 trigger）、000003（seed）、000004（client_ops_logs）、000006~000011（drop sys_configs、pg_stat_statements、VIP 领取守卫、家庭封面 FK、user_vip_claims/user_invites 调整）与本域无直接关系。
 
 ## 5. API 契约
 
-统一响应信封见 03-api（成功 `code=0000, message=ok`；失败 `code`、`message`、`biz_code`）。以下路由均注册在 `main.go` 的 session 鉴权组内（`backend/cmd/server/main.go`），SaaS 外部经 Cloudflare Worker 原样转发（api-worker 不重写 path）。
+统一响应信封见 03-api（成功 `code=0000, message=ok`；失败 `code`、`message`、`biz_code`）。以下路由均注册在 `main.go` 的 session 鉴权组内（`backend/cmd/server/main.go`）；开源/私有化模式经 api-worker 原样转发（api-worker 不重写 path），SaaS 生产为小程序直连 nginx、不经 Worker（ARCHITECTURE §2.1）。
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |------|------|------|------|
@@ -181,11 +187,14 @@
 | GET | `/location/reverse` | Session | query `latitude,longitude`（可 `pois=0` 关闭 POI）；坐标 4 位小数取整；配额超限 429 `code=4290,biz_code=RATE_LIMITED`；上游失败 500；返回 `address/detailAddress/landmark/areaCode/areaName/pois` |
 | POST | `/diary/details/auto` | Session | body `{lat,lon}`，≤64KiB；非 VIP 403 `code=4030,biz_code=NOT_VIP`；坐标非法 400；配额超限 429 `code=4290`；与后台任务并发占用同一用户锁时 429 `code=4290,biz_code=OPERATION_IN_PROGRESS`；成功 `data.id` |
 
+> `/location/reverse` 与 `POST /diary/details/auto` 共享同一逆地理日配额池：同一 Redis 键 `location:reverse:{userID}:{date}`（200/日合并计算）。
+
 ### 5.1 错误码（本域实际抛出；code 固定枚举 + biz_code 语义码，见 03-api §3）
 
 | 场景 | HTTP | `code` | `biz_code` | 源 |
 |------|------|---------|-------------|----|
 | `PUT /auto-record/config` 非 VIP 开启 | 403 | 4030 | NOT_VIP | `autorecord/handler.go` |
+| `PUT /auto-record/config` DB 更新失败 | 500 | 5001 | — | `autorecord/handler.go` |
 | `POST /auto-record/trajectories` 非 VIP | 403 | 4030 | NOT_VIP | `autorecord/handler.go`（400 → 403） |
 | 轨迹 body 超限（>64KiB） | 413 | 4130 | — | `autorecord/handler.go` |
 | 轨迹 body 非法 / 超 50 点 / 坐标越界 / 时间非法 | 400 | 4000 | — | `autorecord/handler.go` |
@@ -196,6 +205,7 @@
 | `POST /diary/details/auto` 非 VIP | 403 | 4030 | NOT_VIP | `diary/handler.go` |
 | `POST /diary/details/auto` 配额超限 | 429 | 4290 | RATE_LIMITED | `diary/handler.go` |
 | `POST /diary/details/auto` 自动记录用户锁被后台占用 | 429 | 4290 | OPERATION_IN_PROGRESS | `diary/handler.go` |
+| `POST /diary/details/auto` 坐标非法 | 400 | 4000 | INVALID_COORDINATES | `diary/handler.go` |
 
 ## 6. 关键实现约束
 
@@ -205,7 +215,8 @@
 |------|-----|------|
 | `stayPointMergeRadiusM` | 300.0 m | `autorecord/service.go` |
 | `stayPointMergeWindow` | 30 min | 同上 |
-| `maxPendingPerUser` | 100 | 同上（**一名双义**：既是单用户单轮轨迹处理上限（AR-4.1 `LIMIT`），也是候选用户批上限（AR-4.7）；两处共用同一常量，调整需同时评估两处影响） |
+| `maxTrajectoriesPerRound` | 100 | `autorecord/service.go`（单用户单轮轨迹处理上限，AR-4.1 `LIMIT`；与候选批上限拆分具名） |
+| `maxCandidateBatch` | 100 | `autorecord/service.go`（候选用户批上限，AR-4.7；与轨迹上限拆分具名，两值独立可调） |
 | `processWorkers` | 5 | 同上 |
 | `maxGeocodeAttempts` | 10 | 同上 |
 | `commonAddressMatchRadiusM` | 300.0 m | 同上 |
@@ -221,12 +232,14 @@
 | 轨迹清理窗口 | `created_at < now() - interval '7 days'` | `auto_record.sql` |
 
 > VIP 判定一律严格（`expire_time > now()`），无宽限期常量；分布式锁为 PG advisory lock，无 TTL/续期常量（ADR-0005）。
+> 容量备注（维持现状，不设新告警）：`geoCoderRPS=10` 全站共享 ≈ 理论 ~86 万次/日逆地理上限，当前日用量低 2~3 个量级；增长后的积压面由 `auto_record_backlog_warn`（候选 >1000）与 `geocode_discarded`（单轨迹终态）覆盖，多 key 采购在 backlog 告警成为常态时再规划。
 
 ### 6.2 锁与幂等
 
-- 用户级锁 `lock:auto_record:{userID}`：PostgreSQL advisory lock（ADR-0005，无 TTL），获取失败立即返回 error（不自旋）；`defer Unlock` 用 `context.WithoutCancel`。`autorecord/service.go`。
-- 后台任务锁 `lock:background:{task}`：PostgreSQL advisory lock（无 TTL），获取失败静默跳过当轮；任务 context 受 `maxDuration` 约束，超时取消。`jobs/runner.go`。
-- 后台成文的游标 / 已处理标记仅为减少重复处理；丢失或过期时通过重新扫描 + DB 幂等（唯一约束 / `ON CONFLICT`）兜底，**不作为正确性前提**。
+- 用户级锁 `lock:auto_record:{userID}`：PostgreSQL advisory lock（ADR-0005，无 TTL）；后台轮次获取时**被占用**（手动即时成文并发持有或另一容器处理中）记 INFO `auto record lock busy, skip user` 并跳过该用户，**不计入** `auto_record_failed` 失败（轨迹保留、下轮自然重试，正常并发不是故障）；获取**出错**（DB 故障）才返回 error 计入失败告警；`defer Unlock` 用 `context.WithoutCancel`。`autorecord/service.go processUser`。
+- 后台任务锁 `lock:background:{task}`：PostgreSQL advisory lock（无 TTL），获取失败跳过当轮并留 INFO 日志 `background job lock busy, skip`；任务 context 受 `maxDuration` 约束，超时取消。`jobs/runner.go`。
+- **调度语义**：① interval 任务 ticker 以容器启动为基准，启动时若「最近一个应触发时刻」已过而无成功记录则立即补跑（`catchUpIfOverdue`）——防部署重启饥饿；② daily 任务（常用地址汇总）每轮按上海时区绝对时刻 Reset 无漂移，同款启动补跑；③ 成功/失败写 Redis `job:last_success:*` / `job:last_failure:*`，`watchJobHealth` 每分钟比对（>3×周期 → `job_stale` ERROR → alert-cron 触达 webhook）；人工补跑经 Redis `job:trigger:<name>` GETDEL 触发。`jobs/runner.go`。
+- 后台成文的游标（`job:cursor:auto_record`，无独立「已处理标记」）仅为减少重复处理；丢失或过期时通过重新扫描 + DB 幂等（唯一约束 / `ON CONFLICT`）兜底，**不作为正确性前提**。
 - 幂等/去重：
   - 自动记录同点去重（AR-7）无数据库唯一约束，靠应用层比较。
   - 异常告警每日一次靠 `MarkAbnormalAlertSent` 的条件 UPDATE（Shanghai 日期）。
@@ -238,8 +251,10 @@
 | 依赖 | 失败时行为 |
 |------|-----------|
 | Redis 配额检查 | `CheckReverseQuota` 返回 false（fail-closed）：`/location/reverse` 429；后台处理跳过 cluster 且不删轨迹；`/diary/details/auto` 429 |
+| VIP 判定 DB 查询 | 后端 `vipInfo` 出错按非 VIP 处理（fail-closed）：开启 403 `NOT_VIP`、`GET /auto-record/config` 返回 `enabled:false`、轨迹上报 403——DB 故障呈现为 403 而非 500，与 Redis 配额同族取舍 |
 | PG advisory 锁 | 获取失败记日志并跳过该用户/任务；DB 不可用时任务自然失败（幂等，下轮重试） |
 | 腾讯地图 | 重试 1 次后失败：跳过该 cluster（保留轨迹）；`/location/reverse` 500 |
+| 后台常用地址查询 | `ListUserCommonAddresses` 失败仅 warn 后跳过常用地址匹配，照常走配额+腾讯逆地理成文 |
 | Redis 缓存失效（`ai:family_summary`） | 仅 warn 日志，不影响成文 |
 | 推送（新地点 / 异常告警） | 仅记日志，不回滚已写数据/已占位告警 |
 
@@ -259,11 +274,11 @@
 
 ## 7. 前端接入
 
-- 文件：`frontend/miniapp/miniprogram/utils/autoRecord.ts`（采集/上报/恢复状态机）、`pages/index/index.ts`（开关入口）、`app.ts`（启动与前后台钩子）、`utils/concurrency.ts`（通用并发工具）。
+- 文件：`frontend/miniapp/miniprogram/utils/autoRecord.ts`（采集/上报/恢复状态机）、`pages/index/index.ts`（开关入口）、`app.ts`（启动与前后台钩子）、`utils/appPermission.ts`（多端 App 权限兼容层）、`utils/concurrency.ts`（通用并发工具）。
 - `pages/index/index.ts`：`toggleAutoRecord()` 是 index 页唯一手动开关入口（详情/编辑内另有 `components/AutoBtn/AutoBtn.ts` 的 `change`）；非 VIP 弹窗引导到 VIP 页；开启成功后置 `showSubscribePrompt=true` 引导订阅；`_changing` 防重复触发，且不在 `onHide` 复位。
 - `app.ts`：`onLaunch` 读 `STORAGE_KEY_ENABLED` 初始化 `globalData.openAutoRecorded`；登录失败也调用 `tryRestoreAutoRecord`；`onShow` 有 30 秒恢复冷却（仅成功才计时）；`onHide` 触发一次 flush+report。
 - 本地 storage key：`papafeiji:autoRecordEnabled`（开关）、`papafeiji:autoRecordStayPoints`（驻留点队列）。
-- 客户端审计日志：上报前后 `opsLog('auto_upload')` / `opsLogFail('auto_upload_fail')`；首次成文 `auto_entry_ok` / `auto_entry_fail`（写入 `client_ops_logs`，见 migration 000004）。
+- 客户端审计日志：上报前 `opsLog('auto_upload')`、上报失败 `opsLogFail('auto_upload_fail')`（静默重登重试仍失败也记）；首次成文 `auto_entry_ok` / `auto_entry_fail`；定位链路 `location_diag`（授权查态/隐私/开启各步骤诊断）与 `location_start_fail`（`startLocationUpdateBackground` 失败）、`location_get_fail`（`getLocation` 失败/超时），失败时即时 `flushOpsLog`（写入 `client_ops_logs`，见 migration 000004）。
 - 前端关键阈值（`autoRecord.ts`）：
 
 | 常量 | 值 |
@@ -279,10 +294,11 @@
 | 本地队列上限 | 50 |
 | 坐标精度 | 4 位小数 |
 | 精度过滤 | iOS 3000 / 其它 500 |
-| VIP 缓存有效期 | 5 min |
+| VIP 运行时轮询间隔（autoRecord 前台自检） | 5 min（`VIP_CHECK_INTERVAL_MS`，及时反映订阅/退订变化；权威源 02c §7） |
 | 心跳间隔 | 30 min |
-| 后台兜底 getLocation 间隔 | 5 min |
-| 上报退避 | 30s×2ⁿ，上限 5 min |
+| 后台兜底 getLocation | 定时器固定 5 min tick（无独立 60s 定时器）；tick 内按「距上次系统定位回调」新鲜度阈值决定是否兜底——已存驻留点且静止 ≤30 分钟阈值为 60s（几乎每次 tick 均触发），其余 5 min（近期有系统回调则跳过） |
+| iOS 回前台兜底 getLocation 延迟 | 300 ms（`IOS_RESUME_GET_LOCATION_DELAY_MS`） |
+| 上报退避 | 30s×2^(n-1)，上限 5 min |
 | 恢复重试退避 | 60s→5min；看门狗 60s |
 | 开启超时 | 30s |
 

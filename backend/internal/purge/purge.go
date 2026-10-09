@@ -1,4 +1,4 @@
-// Package purge 实现已物理删除的 OSS 对象的边缘缓存批量收敛（ADR-0013）：
+// Package purge 实现已物理删除的 OSS 对象的边缘缓存批量收敛：
 // 删除时把公开 URL 记入 Redis 集合，后台任务定期分批调用阿里云 CDN 刷新接口。
 // 队列属辅助状态（I2）：Redis 丢失仅导致少量对象错过刷新，不产生数据错误。
 package purge

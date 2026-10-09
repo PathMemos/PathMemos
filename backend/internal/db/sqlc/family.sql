@@ -1,3 +1,21 @@
+-- name: ListFamilyMembersByUserID :many
+-- 一次往返同时取用户当前家庭与其成员列表（替代 GetUserByID + ListFamilyMembers 两段串行，
+-- 是 diary 全部端点的公共前缀）。LEFT JOIN 保形：无家庭时返回单行全 NULL（fm.* 判空跳过），
+-- 用户不存在时 0 行（调用方转 ErrNoRows），与旧两查语义逐一对齐。
+SELECT
+    cur.current_family_id,
+    fm.user_id,
+    fm.role,
+    fm.joined_at,
+    mu.avatar,
+    mu.avatar_file_id,
+    mu.nickname
+FROM users cur
+LEFT JOIN family_members fm ON fm.family_id = cur.current_family_id
+LEFT JOIN users mu ON mu.id = fm.user_id
+WHERE cur.id = $1
+ORDER BY fm.joined_at ASC, fm.user_id ASC;
+
 -- name: ListFamilyMembers :many
 SELECT
     fm.user_id,
@@ -153,3 +171,11 @@ SELECT COUNT(*) FROM family_members WHERE family_id = $1;
 -- name: CountFamilyDailyCovers :one
 SELECT COUNT(*) FROM family_daily_covers WHERE family_id = $1;
 
+
+-- name: GetFamilyRemovedMembers :one
+SELECT removed_members FROM families WHERE id = $1;
+
+-- name: RecordRemovedMember :exec
+UPDATE families
+SET removed_members = COALESCE(removed_members, '{}'::jsonb) || $2::jsonb
+WHERE id = $1;

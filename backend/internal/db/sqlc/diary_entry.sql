@@ -16,15 +16,17 @@ ON CONFLICT (id) DO NOTHING;
 SELECT * FROM diary_entries WHERE id = $1;
 
 -- name: UpdateDiaryEntry :execrows
+-- diary_id 支持跨天编辑时把条目迁移到目标日期的日记（UpsertDiary 后由调用方传入）。
 UPDATE diary_entries SET
-    text = $2,
-    lat = $3,
-    lon = $4,
-    address = $5,
-    detail_address = $6,
-    record_time = $7,
-    sort = $8,
-    color = $9,
+    diary_id = $2,
+    text = $3,
+    lat = $4,
+    lon = $5,
+    address = $6,
+    detail_address = $7,
+    record_time = $8,
+    sort = $9,
+    color = $10,
     updated_at = now()
 WHERE id = $1;
 
@@ -73,7 +75,7 @@ RETURNING file_id;
 DELETE FROM diary_entries WHERE id = $1;
 
 -- name: ListAutoEntryAddressesByDate :many
--- R-20/R-22（同日去重集合化）：取当天全部自动条目的 id+地址，后台与手动即时成文共用；
+-- 同日去重集合化：取当天全部自动条目的 id+地址，后台与手动即时成文共用；
 -- 后者需要已存在条目 id 供响应契约（ORDER BY DESC 保证首条命中即最新）。
 SELECT e.id, e.address, e.detail_address
 FROM diary_entries e

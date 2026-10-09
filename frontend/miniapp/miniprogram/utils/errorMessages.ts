@@ -28,6 +28,7 @@ const BIZ_CODE_MESSAGE_KEYS: Record<string, string> = {
   INVALID_COORDINATES: 'error.bizInvalidCoordinates',
   AI_DAILY_QUOTA_EXCEEDED: 'error.bizAiDailyQuotaExceeded',
   RATE_LIMITED: 'error.bizRateLimited',
+  REMOVED_REJOIN_COOLDOWN: 'error.bizRemovedRejoinCooldown',
 };
 
 export function localizedBizCodeMessage(bizCode?: string | null): string {

@@ -75,7 +75,7 @@ func (s *Stream) Next() (string, error) {
 		data := strings.TrimPrefix(line, sseDataPrefix)
 		data = strings.TrimSpace(data)
 		if data == "[DONE]" {
-			// R2-L02：以 io.EOF 显式标记流结束，与空 chunk（心跳）区分开。
+			// 以 io.EOF 显式标记流结束，与空 chunk（心跳）区分开。
 			return "", io.EOF
 		}
 		var payload struct {
@@ -281,6 +281,16 @@ func writeSSEData(w http.ResponseWriter, flusher http.Flusher, data string) erro
 
 func writeSSEDone(w http.ResponseWriter, flusher http.Flusher) error {
 	if _, err := fmt.Fprint(w, "event: done\ndata: \n\n"); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+// writeSSENotice 下发非致命提示事件（当前唯一场景：AIStreamTimeout 截断且已有部分回复）。
+// 客户端展示提示后流仍以 done 正常收尾——与 error（终止性）语义相反（02f AI-6）。
+func writeSSENotice(w http.ResponseWriter, flusher http.Flusher, payload string) error {
+	if _, err := fmt.Fprintf(w, "event: notice\ndata: %s\n\n", payload); err != nil {
 		return err
 	}
 	flusher.Flush()

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"papafeiji/backend/internal/db"
 	"papafeiji/backend/internal/db/sqlc"
 	"papafeiji/backend/pkg/timeutil"
 
@@ -91,10 +92,10 @@ func claimantUserRow(openID string) *pgxmock.Rows {
 		"user_type", "phone_bind_time", "auto_record_enabled", "personal_family_id",
 		"current_family_id", "invited_by", "lang", "created_at", "updated_at",
 		"abnormal_subscribe_accepted", "last_active_at",
-	}).AddRow("u1", openID, nil, nil, nil, nil, nil, "normal", nil, false, nil, nil, nil, "zh", nil, nil, false, nil)
+	}).AddRow("u1", openID, nil, nil, nil, nil, nil, "wechat", nil, false, nil, nil, nil, "zh", nil, nil, false, nil)
 }
 
-// TestActivateVIPWithTx_TrialSecondClaim 领取防重：同一用户二次领取试用 VIP 必须被拒绝（C4 核心业务）。
+// TestActivateVIPWithTx_TrialSecondClaim 领取防重：同一用户二次领取试用 VIP 必须被拒绝（核心业务）。
 func TestActivateVIPWithTx_TrialSecondClaim(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
@@ -162,7 +163,7 @@ func TestActivateVIPWithTx_NewUser(t *testing.T) {
 	}
 }
 
-// TestActivateVIPWithTx_ExtendFromExpire 续期：已购 VIP 未过期时应从现有到期时间向后顺延，且 begin_time 不变（C4 核心业务）。
+// TestActivateVIPWithTx_ExtendFromExpire 续期：已购 VIP 未过期时应从现有到期时间向后顺延，且 begin_time 不变（核心业务）。
 func TestActivateVIPWithTx_ExtendFromExpire(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
@@ -173,7 +174,7 @@ func TestActivateVIPWithTx_ExtendFromExpire(t *testing.T) {
 	now := timeutil.NowShanghai()
 	begin := now.AddDate(0, 0, -10)
 	expire := now.AddDate(0, 0, 5) // 未过期
-	expectedExpire := expire.AddDate(0, 1, 0)
+	expectedExpire := addMonthsClamped(expire, 1)
 
 	mock.ExpectQuery("vips WHERE id = \\$1").
 		WithArgs("vip-month-0001").
@@ -274,7 +275,92 @@ func TestExtendVIPDaysWithTx_NewUserClaimsRow(t *testing.T) {
 	}
 }
 
-// TestHasVIPClaim_ByOpenID R-21：/vip/free/check 按微信主体判重——注销重注册后（新 user_id、同 openid）仍返回已领取。
+// TestIssueTrialVIPWithTx_DisabledProductSilentSkip 注册发放闸门：trial 商品已下线
+// （is_active=false，GetActiveVIPByID 0 行）时静默跳过发放、不回滚注册（与 openid 墓碑同型）。
+func TestIssueTrialVIPWithTx_DisabledProductSilentSkip(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery("vips WHERE id = \\$1 AND is_active = true").
+		WithArgs("vip-trial-0001").
+		WillReturnError(pgx.ErrNoRows)
+
+	s := &Service{}
+	if err := s.IssueTrialVIPWithTx(context.Background(), "u1", sqlc.New(mock)); err != nil {
+		t.Fatalf("disabled trial must skip silently on registration, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestIssueTrialVIPWithTx_ActiveProductGrants 商品在售时注册发放行为不变。
+func TestIssueTrialVIPWithTx_ActiveProductGrants(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectQuery("vips WHERE id = \\$1 AND is_active = true").
+		WithArgs("vip-trial-0001").
+		WillReturnRows(vipRows(mock, "vip-trial-0001", "trial", "day", 7))
+	mock.ExpectQuery("FROM users WHERE id = \\$1").
+		WithArgs("u1").
+		WillReturnRows(claimantUserRow("openid-u1"))
+	mock.ExpectExec("INSERT INTO user_vip_claims").
+		WithArgs(pgxmock.AnyArg(), pgtype.Text{String: "u1", Valid: true}, "vip-trial-0001", pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectQuery("FROM user_vips WHERE user_id = \\$1 FOR UPDATE").
+		WithArgs("u1").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectExec("INSERT INTO user_vips").
+		WithArgs(pgxmock.AnyArg(), "u1", pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectQuery("FROM user_vips WHERE user_id = \\$1 FOR UPDATE").
+		WithArgs("u1").
+		WillReturnRows(userVipRows("uv-1", "u1", time.Now(), time.Now().Add(time.Second)))
+	mock.ExpectQuery("INSERT INTO user_vips").
+		WithArgs(pgxmock.AnyArg(), "u1", pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnRows(userVipRows("uv-1", "u1", time.Now(), time.Now().AddDate(0, 0, 7)))
+
+	s := &Service{}
+	if err := s.IssueTrialVIPWithTx(context.Background(), "u1", sqlc.New(mock)); err != nil {
+		t.Fatalf("issue trial failed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestClaimTrialVIP_DisabledProduct 领取闸门：商品下线时 ClaimTrialVIP 返回 ErrTrialVIPDisabled
+// （handler 层映射为 404 trial vip disabled，对齐 free 档语义）。
+func TestClaimTrialVIP_DisabledProduct(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("new mock pool: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("vips WHERE id = \\$1 AND is_active = true").
+		WithArgs("vip-trial-0001").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectRollback()
+
+	s := &Service{pool: db.NewPoolWithDBTX(mock)}
+	if err := s.ClaimTrialVIP(context.Background(), "u1"); !errors.Is(err, ErrTrialVIPDisabled) {
+		t.Fatalf("want ErrTrialVIPDisabled, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestHasVIPClaim_ByOpenID /vip/free/check 按微信主体判重——注销重注册后（新 user_id、同 openid）仍返回已领取。
 func TestHasVIPClaim_ByOpenID(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
@@ -302,7 +388,7 @@ func TestHasVIPClaim_ByOpenID(t *testing.T) {
 	}
 }
 
-// TestHasVIPClaim_FallbackUserID R-21：openid 缺失（异常数据）时回退 user_id 维度判重。
+// TestHasVIPClaim_FallbackUserID openid 缺失（异常数据）时回退 user_id 维度判重。
 func TestHasVIPClaim_FallbackUserID(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
@@ -327,5 +413,28 @@ func TestHasVIPClaim_FallbackUserID(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestAddMonthsClamped 月度时长钳制：目标月无对应日时钳到该月最后一天
+// （Go AddDate 会把 1/31+1 月归一化到 3/2，多送 2-3 天且续期锚点漂移）。
+func TestAddMonthsClamped(t *testing.T) {
+	tests := []struct {
+		name   string
+		base   time.Time
+		months int
+		want   time.Time
+	}{
+		{"月末钳制平年", time.Date(2026, 1, 31, 10, 30, 0, 0, time.UTC), 1, time.Date(2026, 2, 28, 10, 30, 0, 0, time.UTC)},
+		{"月末钳制闰年", time.Date(2024, 1, 31, 0, 0, 0, 0, time.UTC), 1, time.Date(2024, 2, 29, 0, 0, 0, 0, time.UTC)},
+		{"无溢出不变", time.Date(2026, 3, 31, 8, 0, 0, 0, time.UTC), 2, time.Date(2026, 5, 31, 8, 0, 0, 0, time.UTC)},
+		{"跨年", time.Date(2026, 12, 31, 23, 59, 59, 0, time.UTC), 1, time.Date(2027, 1, 31, 23, 59, 59, 0, time.UTC)},
+		{"29日遇平年二月", time.Date(2026, 1, 29, 0, 0, 0, 0, time.UTC), 1, time.Date(2026, 2, 28, 0, 0, 0, 0, time.UTC)},
+		{"30日遇二月钳制", time.Date(2026, 1, 30, 0, 0, 0, 0, time.UTC), 1, time.Date(2026, 2, 28, 0, 0, 0, 0, time.UTC)},
+	}
+	for _, tt := range tests {
+		if got := addMonthsClamped(tt.base, tt.months); !got.Equal(tt.want) {
+			t.Errorf("%s: addMonthsClamped(%s, %d) = %s, want %s", tt.name, tt.base.Format("2006-01-02"), tt.months, got.Format("2006-01-02 15:04:05"), tt.want.Format("2006-01-02 15:04:05"))
+		}
 	}
 }

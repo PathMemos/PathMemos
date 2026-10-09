@@ -6,7 +6,9 @@ set -euo pipefail
 
 cd /opt/papafeiji
 HOURS="${1:-24}"
-docker compose logs --since "${HOURS}h" app 2>&1 | python3 - "${HOURS}" <<'PY'
+# /ai/chat 仅注册在 sse 容器（nginx location /ai/chat → papafeiji_sse），"ai chat usage"
+# 日志由 sse 产生；app 一并读取以覆盖公众号链路（wxmp 容器内）与其他潜在出口，双容器去重靠逐行解析。
+docker compose logs --since "${HOURS}h" app sse 2>&1 | python3 - "${HOURS}" <<'PY'
 import json, sys
 from collections import defaultdict
 

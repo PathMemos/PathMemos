@@ -36,7 +36,7 @@
         </view>
 
         <view class="key-value" bindtap="onKeyTap">
-          <text class="key-text" selectable>{{apiKey}}</text>
+          <text class="key-text" user-select>{{apiKey}}</text>
           <view class="copy-chip">{{_i18n['mcp.copy']}}</view>
         </view>
 
@@ -62,7 +62,7 @@
         <view class="tab-content" wx:if="{{activeTab === 'mcp'}}">
           <view class="tab-desc">{{_i18n['mcp.mcpTabDesc']}}</view>
           <view class="tip-code mcp-config-code">
-            <text selectable>{{mcpConfigText}}</text>
+            <text user-select>{{mcpConfigText}}</text>
           </view>
           <view class="copy-config-btn" bindtap="onCopyConfig">{{_i18n['mcp.copyConfig']}}</view>
         </view>
@@ -75,7 +75,7 @@
             <view class="step-item">{{_i18n['mcp.connectorStep3']}}</view>
           </view>
           <view class="tip-code">
-            <text selectable>{{authUrl}}</text>
+            <text user-select>{{authUrl}}</text>
           </view>
           <view class="copy-config-btn" bindtap="onCopyAuthUrl">{{_i18n['mcp.copyLink']}}</view>
         </view>
@@ -84,7 +84,7 @@
           <view class="tab-desc">{{_i18n['mcp.httpTabDesc']}}</view>
 
           <view class="section-title">{{_i18n['mcp.writeMemory']}}</view>
-          <view class="tip-code" selectable>
+          <view class="tip-code" user-select>
 POST {{memoryUrl}}
 Authorization: Bearer {{apiKey}}
 Content-Type: application/json
@@ -102,7 +102,7 @@ Content-Type: application/json
           </view>
 
           <view class="section-title http-section-gap">{{_i18n['mcp.queryMemory']}}</view>
-          <view class="tip-code" selectable>
+          <view class="tip-code" user-select>
 GET {{apiUrl}}?start_date=2024-01-01&end_date=2024-12-31
 Authorization: Bearer {{apiKey}}
           </view>

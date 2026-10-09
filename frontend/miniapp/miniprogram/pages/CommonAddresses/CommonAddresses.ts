@@ -65,7 +65,7 @@ Page({
       (this as any)._safeSetData({ loading: false });
       wx.showToast({ title: (this as any).$t('commonAddresses.loadFail'), icon: 'none' });
     } finally {
-      // R4：兜底复位 loading——任何提前返回路径都不让它卡在 true，
+      // 兜底复位 loading——任何提前返回路径都不让它卡在 true，
       // 否则 onShow 的防重判断会永久跳过后续刷新。
       if (!(this as any)._isDestroyed && (this as any).data.loading) {
         (this as any)._safeSetData({ loading: false });
@@ -102,6 +102,9 @@ Page({
   },
 
   async submitName() {
+    // 防重入：双击双发 PUT，第一次成功后 oldName 已不存在，第二次必报
+    // "修改失败"但实际已成功，用户被误导。
+    if ((this as any)._saving) return;
     const newName = this.data.tempName || '';
     const oldName = this.data.editingName;
     if (!newName) {
@@ -117,6 +120,7 @@ Page({
       return;
     }
 
+    (this as any)._saving = true;
     try {
       await request.put(
         `/user/common-addresses/${encodeURIComponent(oldName)}`,
@@ -130,6 +134,8 @@ Page({
     } catch (e: any) {
       if ((this as any)._isDestroyed || e?.message === 'request:abort') return;
       wx.showToast({ title: getErrorMessage(e, (this as any).$t('commonAddresses.modifyFail')), icon: 'none' });
+    } finally {
+      (this as any)._saving = false;
     }
   },
 });

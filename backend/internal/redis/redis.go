@@ -50,7 +50,7 @@ func NewClient(addr string) (*redis.Client, error) {
 
 	rdb := redis.NewClient(opt)
 
-	// B6a-08：启动时异步 Ping，失败仅告警不阻断启动；连接池与请求级重试自愈。
+	// 启动时异步 Ping，失败仅告警不阻断启动；连接池与请求级重试自愈。
 	safe.Go(context.Background(), nil, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

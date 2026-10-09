@@ -12,6 +12,8 @@
 
 **我决定**：删除 `sys_configs` 表（迁移 `000006_drop_sys_configs`）与 `default_diary_config`；配置全部来自环境变量或代码默认值（`config.go` 为纯环境变量）。000003 种子迁移中的 `sys_configs` 行仅为历史产物，由 000006 删除。
 
+> 注：`sys_configs` 的删除由独立迁移 `000006_drop_sys_configs` 完成——`000001_baseline` 建表、`000003_seed` 写种子行、`000006` 整表删除（现行迁移链 000001–000013 共 13 个；`deploy/legacy-migrations/` 为 squash 前历史归档，其中 0006 为另一用途的同名编号，无关）。决策本身不变：`sys_configs` 已不存在，配置只来自环境变量/代码默认值。
+
 ## 备选方案
 
 - 保留表 + 管理界面做热更新：否决——过度设计，运维成本高于收益。

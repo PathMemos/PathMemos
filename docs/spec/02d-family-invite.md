@@ -1,6 +1,6 @@
 # PP-02D 家庭与邀请（L2）
 
-> 层级：L2 领域分册｜版本：V2.0｜状态：定稿（以当前代码为唯一事实源）
+> 层级：L2 领域分册｜版本：当前（以代码为唯一事实源）
 > 上游：PP-01 产品总览｜关联 ADR：ADR-0010（邀请链接长期有效无撤销）、ADR-0012（owner 整家合并风险已接受）
 > 说明：本分册按当前代码实现整理；行内路径指向对应实现位置。
 
@@ -37,7 +37,7 @@
 
 | # | 决策 | 理由 | 关联 ADR |
 |---|------|------|---------|
-| D1 | 家庭模型：`families(is_personal)` + `family_members`；`users.personal_family_id` 恒定指向个人家庭，`users.current_family_id` 指向当前家庭 | 个人家庭是退出/解散/注销后的稳定落点 | 无 |
+| D1 | 家庭模型：`families(is_personal)` + `family_members`；正常注册用户 `users.personal_family_id` 恒定指向个人家庭（open 模式默认用户/异常数据可能为空，F-6/F-8 按空值分支处理），`users.current_family_id` 指向当前家庭 | 个人家庭是退出/解散/注销后的稳定落点 | 无 |
 | D2 | `family_members` 对 `(family_id, user_id)` 唯一，并对 `user_id` 有 DEFERRABLE INITIALLY DEFERRED 唯一约束 | 一个用户同时只在一个家庭；延迟约束允许事务内先删后插 | 无 |
 | D3 | 家庭成员上限 **6 人**；owner 携原家庭加入时按「源 + 目标总数 ≤ 6」校验 | 控制共享规模 | 无 |
 | D4 | 家庭变更使用家庭级 PostgreSQL advisory lock `lock:family:{id}`（ADR-0005，无 TTL），多锁按字典序获取；未抢到立即失败（429） | 成员上限是「先 count 再 insert」的跨请求竞态，RR 重试无法覆盖 | 无 |
@@ -46,6 +46,7 @@
 | D7 | 家庭邀请链接直接使用 `linkId = familyId`；任何成员均可生成；**长期有效、无撤销**（已接受取舍，ADR-0010） | 无需额外邀请令牌表；familyId 为 UUID v7 | ADR-0010 |
 | D8 | 家庭变更 / 加入 / 解散 / 链接奖励事务使用 `WithTxDeferrable`（邀请二维码文件记录替换用 `WithTx`）；缓存失效与物理文件删除在事务提交之后 | 非幂等副作用在事务提交后执行 | 无 |
 | D9 | 封面迁移与成员迁移在同一事务内完成 | 保证数据一致，避免孤儿封面 | 无 |
+| D10 | **移除冷却**：被 owner 移出的成员记录于 `families.removed_members`（jsonb `{userID: RFC3339}`），7 天内禁止经邀请链接重新加入目标家庭（直接加入与 owner 整家合并路径均检查）；再移除同一人覆写时间戳、冷却重新起算 | 收敛「移除-循环重入」访问循环（位置轨迹共享场景的敌意重入面）；小号重入/误操作恢复残余见 ADR-0019 | ADR-0019 |
 
 ## 3. 核心流程（用户故事 + 时序）
 
@@ -55,7 +56,7 @@
 
 **故事**：用户进入家庭页，看到当前家庭与成员列表。
 
-时序（源：`family/service.go:77` `GetFamily`、`family/handler.go:57` `GetFamily`）：
+时序（源：`family/service.go` `GetFamily`、`family/handler.go` `GetFamily`）：
 
 1. `GetUserByID` 取 `current_family_id`；为空 → 返回空 `FamilyInfo{}`（200，不是 500）。
 2. `GetFamilyByID` 取 `is_personal`。
@@ -69,13 +70,13 @@
 - 个人家庭响应 `isPersonal=true` 且 `ownerId == 当前登录用户 id`。
 - `current_family_id` 为空时返回 200 且 `familyId=""`、`members=[]`。
 - 头像 URL：`users.avatar` 有值用原值；否则默认头像基址 + userId；基址为空则为 `null`。
-- 任何 service 错误（含家庭不存在）→ HTTP 500 `failed to get family info`。
+- 任何 service 错误 → HTTP 500 `failed to get family info`（「家庭不存在」分支理论不可达——`current_family_id` 受 FK 约束指向存在家庭，注销/解散均先迁移成员；500 为 service 错误统一兜底，非 envelope 例外设计）。
 
 ### F-2 创建家庭
 
 **故事**：用户在个人家庭中点击「创建家庭」，得到一个新的共享家庭。
 
-时序（`family/service.go:125` `CreateFamily`）：
+时序（`family/service.go` `CreateFamily`）：
 
 1. 生成新 `familyID` / `membershipID`（UUID v7）。
 2. `WithTxDeferrable` 内：读用户；若 `current_family_id != personal_family_id` → `ErrAlreadyInFamily`；`CreateFamily(is_personal=false)`；删除个人家庭 membership；`UpsertFamilyMembership(role='owner')`；`UpdateUserCurrentFamily`。
@@ -92,7 +93,7 @@
 
 **故事**：任何家庭成员都能把家庭邀请链接分享给好友。
 
-时序（`family/handler.go:180` `CreateInviteLink`）：
+时序（`family/handler.go` `CreateInviteLink`）：
 
 1. `GetFamily`；`FamilyID == ""` → 404 `family not found`。
 2. 若 `IsPersonal` → 先 `CreateFamily`，`linkID = 新 familyID`；否则 `linkID = 当前 familyID`。
@@ -103,20 +104,21 @@
 - 个人家庭调用 → 自动创建普通家庭并返回其 id，当前家庭随之变为该 id。
 - 已在普通家庭 → 直接返回当前 `familyId`，不新建家庭。
 - 不限制调用者角色（owner / member 均可）。
+- 与并发加入家庭存在读-建竞态窄窗口：`CreateFamily` 返回 `ErrAlreadyInFamily` → 409 `ALREADY_IN_FAMILY`（用户重试即走「已在普通家庭」分支）。
 
 ### F-4 通过邀请链接加入家庭
 
 **故事**：好友打开分享链接，登录后加入该家庭。
 
-时序（`family/handler.go:215` `JoinByInviteLink` → `family/service.go:187` `JoinFamily`）：
+时序（`family/handler.go` `JoinByInviteLink` → `family/service.go` `JoinFamily`）：
 
 1. body `{linkId}`（≤64KiB）；`linkId` 为空 → 400。
 2. `GetFamilyByID` 失败 → `ErrFamilyNotFound`；`is_personal=true` → `ErrTargetIsPersonalFamily`。
 3. 当前用户已在目标家庭 → `ErrAlreadyInTargetFamily`。
 4. 计算锁集合：`lock:family:{target}`，若源家庭非个人家庭再加 `lock:family:{source}`；`TryLocks` 按字典序（PG advisory lock，ADR-0005）；未抢到 → `ErrOperationInProgress`。
-5. `WithTxDeferrable`：重算 current/personal；若 `current==target` 返回 `ErrAlreadyInTargetFamily`；判断是否源家庭 owner（**源家庭为个人家庭时不走 owner 合并路径**：一律按普通成员路径迁移本人，个人家庭不删除、不加 `lock:family:{source}` 锁——每个新用户当前家庭即个人家庭，此豁免是加入主流程的必经分支）；`CountFamilyMembers(target)`；owner 时再取 source count，`target+source > 6` → `ErrFamilyFull`；非 owner 时 `target >= 6` → `ErrFamilyFull`；执行 `joinFamilyTx`。
+5. `WithTxDeferrable`：从事务外读得的 user 快照取 current/personal（**不重读用户行**，见 §6.1）；若 `current==target` 返回 `ErrAlreadyInTargetFamily`；**移除冷却检查**（`checkRejoinCooldown`，ADR-0019）：当前用户在 `families.removed_members` 中且移除时间距今 <7 天 → `ErrRemovedRejoinCooldown`；判断是否源家庭 owner（**源家庭为个人家庭时不走 owner 合并路径**：一律按普通成员路径迁移本人，个人家庭不删除、不加 `lock:family:{source}` 锁——每个新用户当前家庭即个人家庭，此豁免是加入主流程的必经分支；源家庭无 owner 记录属异常数据，WARN 后按非 owner 加入——与 F-6/F-7/F-8 口径一致）；`CountFamilyMembers(target)`；owner 时再取 source count，`target+source > 6` → `ErrFamilyFull`；非 owner 时 `target >= 6` → `ErrFamilyFull`；执行 `joinFamilyTx`。
 6. `joinFamilyTx`：
-   - **源 owner**：`BatchUpsertFamilyMembership`（role='member'）把源家庭全员迁入目标 → `UpdateUsersCurrentFamily` → 迁移源家庭封面（`MigrateFamilyDailyCovers`，仅 `cover_type != 'default'`）→ `DeleteFamilyDailyCovers` → 删除源 memberships → 删除源家庭。
+   - **源 owner**：`ListFamilyMembers(source)` 后**对全部被迁移成员再次执行移除冷却检查**（任一命中 → `ErrRemovedRejoinCooldown`，防经第三方家庭整家合并走私冷却名单）→ `BatchUpsertFamilyMembership`（role='member'）把源家庭全员迁入目标 → `UpdateUsersCurrentFamily` → 迁移源家庭封面（`MigrateFamilyDailyCovers`，仅 `cover_type != 'default'`）→ `DeleteFamilyDailyCovers` → 删除源 memberships → 删除源家庭。
    - **普通成员**：删除本人在源家庭的 membership → 迁移本人封面（`MigrateUserDailyCoversToFamily`）→ 插入目标 membership（role='member'）→ 更新 current family。
 7. 事务提交后失效源 / 目标家庭的 `ai:family_summary:{familyID}` 缓存。
 8. handler 成功后调用 `grantJoinReward`（见 F-5），返回 200。
@@ -126,36 +128,38 @@
 - 已在目标家庭重复点击 → HTTP 200 幂等。
 - 目标为个人家庭 → HTTP 403，`code="4030"`，`biz_code="TARGET_IS_PERSONAL_FAMILY"`。
 - 家庭已满 → HTTP 409，`biz_code="FAMILY_FULL"`。
+- 被移除冷却命中（当前用户或合并成员任一处于目标家庭移除时间起 7 天内）→ HTTP 403，`biz_code="REMOVED_REJOIN_COOLDOWN"`（ADR-0019；再次移除同一人覆写时间戳、冷却重新起算）。
 - 未抢到家庭锁 → HTTP 429，`biz_code="OPERATION_IN_PROGRESS"`。
 - 源家庭 owner 加入 → 源家庭被删除、源全员 `current_family_id` = 目标家庭、源封面迁移到目标。
 - 普通成员加入 → 本人 `current_family_id` = 目标家庭，原家庭其他成员不变。
 - 个人家庭用户加入 → 本人迁移至目标家庭，个人家庭保留不删除。
 - 加入成功后目标家庭 `family_members` 中该用户 `role='member'`。
 - 链接 `linkId` 即目标 `familyId`，自生成起持续有效；任何已登录用户持有该 `linkId` 即可加入，无需邀请人确认（长期有效、无撤销为已接受取舍，见 ADR-0010）。**若当前用户是源家庭 owner，加入即触发整家合并且不可逆**（钓鱼/误点风险已接受，ADR-0012）。
+- 加入即把本人**加入前的全部个人历史日记**纳入新家庭共享视图（`diaries`/`diary_entries` 无 family_id、按当前成员集合实时聚合）；退出/被移除即收回，期内既有查看/导出副本不可追回（已接受取舍见 ADR-0017）。
 
 ### F-5 链接加入奖励（`grantJoinReward`）
 
 **故事**：新用户通过家庭邀请链接首次加入，双方获得 VIP 天数奖励。
 
-时序（`family/handler.go:254` `grantJoinReward`，在 `JoinByInviteLink` 成功后同步调用）：
+时序（`family/handler.go` `grantJoinReward`，在 `JoinByInviteLink` 成功后同步调用）：
 
 1. 若当前用户已有 `user_invites` 记录 → 直接返回（不奖励）。
-2. 读用户；`time.Since(created_at) > 7 天` → 返回（与 /auth/inviter 窗口统一：原 5 分钟与 7 天并存无决策依据，且惩罚弱网慢扫码用户）。
-3. `GetFamilyOwner(目标家庭)`；失败 / 空 / owner == 自己 → 返回。
-4. `WithTxDeferrable`：再次检查 user_invites；确认 owner 存在；插入 `user_invites`（含 `user_open_id`）；先 `MarkInviteeRewarded`（execrows，`WHERE reward_invitee_at IS NULL`；openid 撞 `uq_user_invites_user_open_id` 部分唯一索引 23505 时仅 Info 日志跳过）→ 标记成功（markRows>0）才被邀请人 +3 天 VIP；`LockInviterReward`；`CountInviterMonthlyRewardDays`；`< 14` 时 `MarkInviterRewarded` + 邀请人 +7 天。
-5. 任何失败仅 `slog.WarnContext`，不影响主流程 200。
+2. 读用户；`time.Since(created_at) > 7 天` → 返回（与 /auth/inviter 窗口统一，且不惩罚弱网慢扫码用户）。
+3. `GetFamilyOwner(目标家庭)`；失败 / 空 / owner == 自己 → 返回。**+7 天奖励归目标家庭 owner 而非分享成员**——家庭为单位的有意设计（任何成员分享、owner 受益），非缺陷，勿「修复」。
+4. `WithTxDeferrable`：再次检查 user_invites；确认 owner 存在；插入 `user_invites`（含 `user_open_id`；与 `/auth/inviter` 补绑路径并发时撞 `user_invites_user_id_key` 唯一索引 23505 → 幂等跳过奖励返回成功，加入不被 500 打断，对端路径已发奖）；被邀请人墓碑预检 `ExistsInviteeRewardByOpenID` 命中（该 openid 曾领过被邀请奖励——注销重注册身份）→ 跳过**全部**奖励（+3/+7 均不发，堵重注册小号刷邀请人 +7），邀请行照常创建且对邀请人可见；否则先 `MarkInviteeRewarded`（execrows，`WHERE reward_invitee_at IS NULL`；并发双绑由行锁 + IS NULL 条件去重，部分唯一索引仅作 DB 层兜底）→ 标记成功（markRows>0）才被邀请人 +3 天 VIP；`LockInviterReward`；`CountInviterMonthlyRewardDays`；`< 14` 时 `MarkInviterRewarded` + 邀请人 +7 天。
+5. 任何失败仅记日志（Error 级 `alert=invite_reward_failed`，经 `scripts/alert-watch.sh` 关键字扫描触达告警通道，关键字全集见 DEPLOYMENT §10），不影响主流程 200。
 
 **AC**
 
-- 注册 7 天内首次通过链接加入 → 被邀请人 +3 天（按 openid 终身一次，`user_invites.user_open_id` 部分唯一索引兜底）、邀请人 +7 天（当月上限 14 天）。
-- 已有邀请关系 / 注册超过 7 天 / 不存在 owner → 不发放，接口仍 200；被邀请奖励命中 openid 终身已领时跳过 +3，inviter 侧照常。
-- 奖励事务失败不回滚家庭加入、不重试，也不向客户端报错。
+- 注册 7 天内首次通过链接加入 → 被邀请人 +3 天（按 openid 终身一次，`user_invites.user_open_id` 部分唯一索引兜底；跨渠道删号重注册可绕过，已接受取舍见 ADR-0016）、邀请人 +7 天（当月上限 14 天）。
+- 已有邀请关系 / 注册超过 7 天 / 不存在 owner → 不发放，接口仍 200；被邀请奖励命中 openid 终身已领时跳过全部奖励（+3/+7 均不发，邀请行照常创建且对邀请人可见）。
+- 奖励事务失败不回滚家庭加入、不重试，也不向客户端报错；失败走 `alert=invite_reward_failed` 告警通道触达（并发撞唯一索引的幂等跳过除外，属预期不告警）。
 
 ### F-6 退出家庭
 
 **故事**：普通成员主动退出当前家庭，回到个人家庭。
 
-时序（`family/service.go:403` `LeaveFamily`）：
+时序（`family/service.go` `LeaveFamily`）：
 
 1. 读用户；`current == personal` → `ErrNotInNormalFamily`。
 2. `GetFamilyOwner`；owner == 自己 → `ErrOwnerCannotLeave`；无 owner 记录（`ErrNoRows`）WARN 后放行。
@@ -168,18 +172,18 @@
 - owner 调用 → HTTP 403，`biz_code="OWNER_CANNOT_LEAVE_FAMILY"`。
 - 已在个人家庭 → HTTP 400（无 `biz_code`）。
 - 成功后 `current_family_id = personal_family_id`，个人家庭中 role='owner'。
-- `personal_family_id` 为空时跳过重入，`current_family_id` 置 NULL（B-1 修复：空串 Valid=true 会命中 families 外键返回 500，与 dissolveFamilyTx 的 NULL 写法一致）。
+- `personal_family_id` 为空时跳过重入，`current_family_id` 置 NULL（空串 Valid=true 会命中 families 外键返回 500，与 dissolveFamilyTx 的 NULL 写法一致）。
 
 ### F-7 移除成员（仅 owner）
 
 **故事**：家庭 owner 把某个成员移出家庭。
 
-时序（`family/service.go:447` `RemoveMember`）：
+时序（`family/service.go` `RemoveMember`）：
 
 1. `ownerID == targetUserID` → `ErrCannotRemoveSelf`。
 2. 读 owner；`owner.current == owner.personal` → `ErrNotInNormalFamily`。
-3. `GetFamilyOwner` != ownerID → `ErrNotOwner`。
-4. 加家庭锁；`WithTxDeferrable`：读 target；`target.current != owner.current` → `ErrTargetNotInFamily`；`familyOwner == targetUserID` → `ErrCannotRemoveOwner`；`leaveToPersonalTx(target)`。
+3. `GetFamilyOwner`：无 owner 记录（ErrNoRows）WARN 后 → `ErrNotOwner`(403)；其余 DB 错误包装上抛 → 500。
+4. 加家庭锁；`WithTxDeferrable`：读 target；`target.current != owner.current` → `ErrTargetNotInFamily`；`familyOwner == targetUserID` → `ErrCannotRemoveOwner`；`leaveToPersonalTx(target)`；**记录移除冷却**（`RecordRemovedMember`：`removed_members` jsonb merge 写入 `{targetUserID: 移除时间}`，再次移除同一人覆写时间戳、冷却重新起算，ADR-0019）。
 5. 失效家庭 summary 缓存。
 
 **AC**
@@ -188,16 +192,17 @@
 - 移除自己 → HTTP 403 `biz_code="CANNOT_REMOVE_SELF"`；移除 owner → 403 `biz_code="CANNOT_REMOVE_OWNER"`。
 - 目标不在同一家庭 → HTTP 404（`code="4040"`）。
 - 被移除成员 `current_family_id` = 其个人家庭。
+- 被移除成员此后 7 天内经邀请链接重新加入目标家庭 → 403 `REMOVED_REJOIN_COOLDOWN`（见 F-4）。
 
 ### F-8 解散家庭（仅 owner）
 
 **故事**：owner 解散普通家庭，所有成员回到各自个人家庭。
 
-时序（`family/service.go:501` `DissolveFamily` → `dissolveFamilyTx`）：
+时序（`family/service.go` `DissolveFamily` → `dissolveFamilyTx`）：
 
 1. 读 owner；`current == personal` → `ErrCannotDissolvePersonal`。
-2. `GetFamilyOwner` != ownerID → `ErrNotOwner`。
-3. 加家庭锁；`WithTxDeferrable` → `dissolveFamilyTx`：`ListFamilyMemberPersonalFamilies` → 批量 `BatchUpsertFamilyMembershipOwner` 回个人家庭 → `BatchMigrateUsersDailyCoversToPersonal`（先于删除封面）→ `BatchUpdateUsersCurrentFamilyToPersonal` → 对无个人家庭的成员清空 `current_family_id` → `DeleteFamilyDailyCovers` → `ClearTrajectoryFamilyID`（实为清理 **files 表系统文件** 的 `metadata->>'family_id'`，即轨迹图文件的元数据键；`auto_record_trajectories` 表无 family_id 列；该清理匹配全部 `file_type='system'` 且 `family_id` 匹配的文件，含邀请二维码文件——属预期：旧二维码元数据被清后仅影响旧图查询，旧物理文件由 7 天系统文件清理任务兜底）→ `DeleteFamilyMembers` → `DeleteFamily`。
+2. `GetFamilyOwner`：无 owner 记录（ErrNoRows）WARN 后 → `ErrNotOwner`(403)；其余 DB 错误包装上抛 → 500。
+3. 加家庭锁；`WithTxDeferrable` → `dissolveFamilyTx`：`ListFamilyMemberPersonalFamilies` → 批量 `BatchUpsertFamilyMembershipOwner` 回个人家庭 → `BatchMigrateUsersDailyCoversToPersonal`（先于删除封面）→ `BatchUpdateUsersCurrentFamilyToPersonal` → 对无个人家庭的成员清空 `current_family_id` → `DeleteFamilyDailyCovers` → `ClearTrajectoryFamilyID`（实为清理 **files 表系统文件** 的 `metadata->>'family_id'`，即轨迹图文件的元数据键；`auto_record_trajectories` 表无 family_id 列；该清理匹配全部 `file_type='system'` 且 `family_id` 匹配的文件，含邀请二维码文件——属预期：旧二维码元数据被清后仅影响旧图查询，旧物理文件按 F-11 清理豁免由重生成替换/注销清理覆盖，`family_id` 被清后重生成替换不再命中、仅剩注销清理，见 §8.3）→ `DeleteFamilyMembers` → `DeleteFamily`。
 4. 失效家庭 summary 缓存。
 
 **AC**
@@ -215,7 +220,7 @@
 
 1. 公开路由 `GET /invite/resolve?code=XXXX`，叠加 60 次/小时/IP 的 `resolveLimiter`。
 2. `code` 空或不匹配 `^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$` → 400 `invalid invite code`（大小写敏感，必须大写）。
-3. `ResolveInviterFromCode`：`strings.ToUpper(TrimSpace(code))`；SQL `SELECT user_id FROM user_invite_codes WHERE short_code=$1 AND (expires_at IS NULL OR expires_at > now())`（纯读，无写副作用）。
+3. `ResolveInviterFromCode`：`strings.ToUpper(TrimSpace(code))`（入口已 regex 校验大写字符集，此处归一为防御性冗余）；SQL `SELECT user_id FROM user_invite_codes WHERE short_code=$1 AND (expires_at IS NULL OR expires_at > now())`（纯读，无写副作用）。
 4. `ErrNoRows` → 返回空 → 404 `invite code not found`；SQL 错误 → 500。
 5. 成功 → 200 `{userId}`。
 
@@ -231,11 +236,12 @@
 
 **故事**：邀请人查看自己邀请过的人及其是否已加入自己的家庭。
 
-时序（`invite/handler.go` `List`）：`ListUserInvitesByInviter(inviterID)`：`user_invites JOIN users`，`ORDER BY created_at DESC LIMIT 100`；`joined` = 被邀请人 `current_family_id` 非空、不等于其 personal、且等于邀请人的 `current_family_id`。
+时序（`invite/handler.go` `List`）：`ListUserInvitesByInviter(inviterID)`：`user_invites LEFT JOIN users`，`ORDER BY created_at DESC LIMIT 100`；`joined` = 被邀请人 `current_family_id` 非空、不等于其 personal、且等于邀请人的 `current_family_id`。
 
 **AC**
 
 - 返回 `{list: [{userId, nickName, avatarUrl, joined}]}`，最多 100 条、按邀请时间倒序。
+- 受邀人已注销的行（`user_id` 为 NULL 墓碑，000008）保留展示：`nickName="已注销"` 占位、`userId=null`，列表行数不因注销减少。
 - 被邀请人已加入邀请人当前家庭 → `joined=true`；否则 `false`。
 - DB 错误 → 500。
 
@@ -251,17 +257,21 @@
 4. `ensureShortCode`：`GetUserInviteCode` 命中即复用；否则 `util.NewShortCode(8)` 插入；`user_id` 唯一冲突则回查已有码复用；`short_code` 唯一冲突则换码重试（最多 3 次）。
 5. `fetchWxaCode`：POST `getwxacodeunlimit`，`scene=短码`、`page="pages/index/index"`、`is_hyaline=true`、`width=800`；响应体上限 2MB；微信 `errcode` 40001/42001 时 `ClearAccessToken` 后重试 1 次，其它错误直接失败。
 6. `raw=true` 直接保存 PNG；否则 `composite` 合成到背景图 `/app/assets/invite-share-cover.png`（二维码边长 = 背景宽 × 0.20，最小 120px；margin 40、右下内缩 300；JPEG quality 90）。
-7. `storage.SaveSystemWithName(..., 短码)` 保存；事务内查询同 raw 类型的旧文件记录 → `CreateFile(file_type='system', metadata={family_id, raw})` → `BatchDeleteFiles` 删除旧记录；提交后删除旧物理文件（跳过与新建同路径的文件）。
-8. 写回 Redis URL 缓存（6 天）；返回 `{url}`。
+7. `storage.SaveSystemWithName(..., 短码)` 保存；事务内查询同 raw 类型的旧文件记录 → `CreateFile(file_type='system', metadata={family_id, raw})`（`family_id` 取 `current_family_id`，为空时回退 `personal_family_id`——open 模式默认用户等无当前家庭场景海报仍带归属）→ `BatchDeleteFiles` 删除旧记录；提交后删除旧物理文件（跳过与新建同路径的文件）。
+8. 合成图（非 raw）追加生成**分享缩略图** `makeInviteThumb`：240px 宽起步（180/140 逐档降宽），JPEG 质量 80/65/50/40 逐档降质，取首个 ≤60KB 的产物（微信 OpenSDK `shareImageMessage` 的 thumbData ≤64KB 硬约束，超限报 `sendOpenReq:fail:check args fail`）；`SaveSystemWithName(..., 短码-thumb)` 确定性命名保存（不建文件记录，当月覆盖写），返回 `thumbUrl`。缩略图生成失败降级为 `thumbUrl` 为空（客户端回退压缩原图），不影响海报生成。
+9. 写回 Redis JSON 缓存 `{url, thumbUrl}`（6 天；旧版纯 URL 缓存解析失败视为过期重新生成）；返回 `{url, thumbUrl}`。
 
 **AC**
 
 - 首次调用生成并缓存；6 天内再次调用返回相同 URL（不再调微信）。
+- 生成失败 → 500；客户端中途断开（ctx 取消，nginx 499）记 Info 级 `invite qrcode generation aborted by client` 与真实故障的 Error 日志区分（响应仍 500，无人接收）。
 - 生成失败（微信 / 合成 / 存储）→ HTTP 500 `failed to generate invite qrcode`。
 - raw 与 合成图 各自独立缓存与文件记录，互不影响。
 - 同一用户并发生成不会互删对方刚写入的文件（按用户锁 + 跳过同路径）。
-- 二维码在线 URL 约 7 天有效（system 文件清理任务回收超过 7 天未更新的文件）；Redis URL 缓存 6 天先期过期，过期后访问重新生成新图。
-- 文件记录 `file_type='system'`、`metadata.family_id` 存在，用于与日记封面文件区分。
+- **海报 URL 不受 7 天系统文件清理影响**（`ScanOldSystemFiles` 带 `NOT metadata ? 'raw'` 豁免——`metadata.raw` 键为 invite 海报行独有，轨迹图/头像 marker 无此键）；已分发的海报 URL 失效仅发生在两条替代清理路径：①重生成替换（跨月时确定性命名换路径、删旧物理文件；同月同路径覆盖写 URL 不变）②注销清理（`DeleteAccount` 按 `created_by` 收集全部 files 路径删物理文件）。Redis URL 缓存 6 天过期后，再次访问触发重新生成（重生成替换即旧图回收路径）。
+- 缩略图确定性 ≤60KB（240px 宽起步）；生成失败仅影响 `thumbUrl`（为空），海报 URL 不受影响。
+- 缩略图无 files 行，行扫描型清理与注销按行收集（`ListFilesByCreator`）均不可见：当月重生成覆盖写；跨月遗留为存储孤儿（单个 ≤60KB，物理文件保留故旧 `thumbUrl` 仍可解析，存储损耗已接受）。
+- 文件记录 `file_type='system'`、`metadata.family_id` 存在，用于与日记封面文件区分；`metadata.raw` 键同时是清理豁免的识别条件。
 
 ### F-12 家庭配置（现状说明）
 
@@ -284,6 +294,7 @@
 | `id` | text | PK；UUID v7 |
 | `is_personal` | boolean | 默认 false；true = 个人家庭 |
 | `created_at` | timestamptz | 默认 now() |
+| `removed_members` | jsonb | 默认 `'{}'`；`{userID: 移除时间 RFC3339}`，移除冷却用（D10/ADR-0019，迁移 000014） |
 
 ### 4.2 `family_members`
 
@@ -296,6 +307,8 @@
 | `joined_at` | timestamptz | 默认 now() |
 
 其他约束：`UNIQUE(family_id, user_id)`（`family_members_family_id_user_id_key`）；索引 `idx_family_members_family_role (family_id, role)`。
+
+成员读取主路径：`ListFamilyMembersByUserID`（`family.sql`）一次往返同时取用户当前家庭与成员列表（替代 diary 端点公共前缀的 GetUserByID + ListFamilyMembers 两段串行）；LEFT JOIN 保形——无家庭时返回单行全 NULL（`fm.*` 判空跳过），用户不存在时 0 行（调用方转 ErrNoRows）。
 
 ### 4.3 `family_daily_covers`
 
@@ -313,7 +326,7 @@
 字段定义与约束见 PP-02A §4.2 / §4.3（同一批迁移）。本域使用要点：
 
 - `user_invite_codes`：一人一码、`short_code` 唯一、`expires_at` 恒 NULL、`used_at` 列保留但不再写入（解析已改纯读）。
-- `user_invites`：`user_id` 唯一（一人一个邀请人），`reward_inviter_at` / `reward_invitee_at` 控制奖励幂等；`inviter_id` 可空、FK `SET NULL`（000011：邀请人注销保留被邀请人墓碑行，`user_open_id` 部分唯一索引继续阻断重复领取被邀请奖励）。
+- `user_invites`：`user_id` 唯一（一人一个邀请人；000008 起可空、FK `SET NULL`——被邀请人注销保留 openid 墓碑行），`reward_inviter_at` / `reward_invitee_at` 控制奖励幂等；`inviter_id` 可空、FK `SET NULL`（000011：邀请人注销保留被邀请人墓碑行，`user_open_id` 部分唯一索引继续阻断重复领取被邀请奖励；跨渠道删号重注册可绕过的边界见 ADR-0016）。
 
 ### 4.5 `files`（邀请二维码使用）
 
@@ -342,7 +355,7 @@
 
 ## 5. API 契约
 
-> 全部路径为 Go 路由注册路径；家庭与邀请均为 Session 鉴权（`/invite/resolve` 除外）。
+> 全部路径为 Go 路由注册路径；家庭与邀请均为登录态鉴权（SaaS 模式 Session，`DEPLOYMENT_MODE=open` 为 OpenAuth；`/invite/resolve` 除外，公开）。
 > 统一响应包见 PP-02A §6.6。
 
 ### 5.1 端点登记
@@ -358,7 +371,7 @@
 | DELETE | `/family` | Session | owner 解散家庭 |
 | GET | `/invite/resolve?code=` | 公开（60/h/IP） | 解析 8 位邀请短码，返回 `{userId}` |
 | GET | `/invite/list` | Session | 邀请列表，返回 `{list:[...]}`（≤100） |
-| POST | `/invite/qrcode` | Session | body 可空 `{raw?:bool}`（≤64KiB）；返回 `{url}` |
+| POST | `/invite/qrcode` | Session | body 可空 `{raw?:bool}`（≤64KiB）；返回 `{url, thumbUrl}` |
 
 ### 5.2 响应字段
 
@@ -366,7 +379,7 @@
 - `POST /family`：`{familyId}`。
 - `POST /family/invite-link`：`{linkId}`（等于 familyId）。
 - `GET /invite/list`：`list` 项为 `{userId, nickName, avatarUrl, joined}`。
-- `POST /invite/qrcode`：`{url}`（本地/CDN 图片地址）。
+- `POST /invite/qrcode`：`{url, thumbUrl}`（本地/CDN 图片地址；`thumbUrl` 为 ≤60KB 分享缩略图，raw 请求时为空串）。
 
 ### 5.3 家庭错误码映射（`family/handler.go`）
 
@@ -377,6 +390,7 @@
 | 加入：目标是个人家庭 | `ErrTargetIsPersonalFamily` | 403 | 4030 | `TARGET_IS_PERSONAL_FAMILY` |
 | 加入：已在目标家庭 | `ErrAlreadyInTargetFamily` | 200 | 0000 | — （幂等成功） |
 | 加入：家庭已满 | `ErrFamilyFull` | 409 | 4090 | `FAMILY_FULL` |
+| 加入：被移除冷却命中（ADR-0019） | `ErrRemovedRejoinCooldown` | 403 | 4030 | `REMOVED_REJOIN_COOLDOWN` |
 | 退出：非普通家庭 | `ErrNotInNormalFamily` | 400 | 4000 | — |
 | 移除：非普通家庭 | `ErrNotInNormalFamily` | 403 | 4030 | — （与 `ErrNotOwner` 合并） |
 | 退出：owner 不能退出 | `ErrOwnerCannotLeave` | 403 | 4030 | `OWNER_CANNOT_LEAVE_FAMILY` |
@@ -421,6 +435,13 @@
 - 封面迁移与成员迁移必须同事务；`DeleteFamilyDailyCovers` 必须在封面迁移之后。
 - 批量操作使用 `unnest()` / `ANY($1)`，禁止逐成员循环（N+1）。
 
+**并发三层机制的真实分工**（D4 + §6.1 + 本节，防止错误归因）：
+
+- **正确性兜底是唯一约束**：`uq_family_members_user_id`（DEFERRABLE INITIALLY DEFERRED，提交时判定，RepeatableRead / ReadCommitted 两隔离级别下均成立）——并发双建家庭等写路径在 T2 提交时撞 23505 整体回滚，一人一家庭不会被并发破坏。
+- **advisory lock 的贡献** = 同家庭操作串行化（减少无效竞争与无谓回滚）。
+- **RR + Deferrable + 40001 重试（`db/pool.go` `WithTxDeferrable`）的贡献** = 等锁后的写冲突**提早失败**、进入干净重试路径，消除等锁后快照重评的边界路径——**RR 不是正确性必需**（唯一约束在两隔离级别下均兜底）；撤除 RR 会失去提早失败与路径收敛（维持现状）。
+- 例外：`CreateFamily`（F-2）的 check-then-act（`CurrentFamilyID == PersonalFamilyID` 判定）**不加 advisory lock**，靠 `uq_family_members_user_id` 唯一约束 + RR 写写冲突重试兜底。
+
 ### 6.3 家庭成员上限
 
 - 普通成员加入：目标家庭 `COUNT(*) >= 6` → 拒绝。
@@ -429,7 +450,7 @@
 
 ### 6.4 缓存失效
 
-- 家庭变更（加入 / 退出 / 移除 / 解散 / 注销）后删除 `ai:family_summary:{familyID}`（源 + 目标 + 受影响成员当前/个人家庭）。
+- 家庭变更后删除 `ai:family_summary:{familyID}`，按变更类型区分覆盖面：加入 = 源 + 目标家庭；退出 / 移除 / 解散 = 仅原家庭（离开者回落的个人家庭成员恒为本人、其汇总内容不变，缓存语义自洽，不失效）；注销 = 本人当前 + 个人家庭 + 受影响成员的当前/个人家庭（逐一失效）。
 - 失效在**事务提交之后**执行；删除失败仅 WARN。
 
 ### 6.5 二维码与缓存
@@ -461,7 +482,7 @@
 
 | 页面 / 模块 | 行为 |
 |---|---|
-| `pages/Family/Family.ts` | `onLoad` 有 `option.linkId` → `setPendingLinkId`；`onShow` 必要时登录后 `handlePendingInvite` → `POST /family/invite-link/join`；`fetch` → `GET /family`；`createInviteLink` → `POST /family/invite-link`；退出自己 `POST /family/leave`，移除他人 `DELETE /family/members/{userId}`；`onShareAppMessage` 路径 `/pages/Family/Family?linkId=...`；成员列表展示取 `familyList.slice(0, 50)` |
+| `pages/Family/Family.ts` | `onLoad` 有 `option.linkId` → `setPendingLinkId`；`onShow` 必要时登录后 `handlePendingInvite` → `POST /family/invite-link/join`（业务失败带 `error.code` 时 `clearPendingLinkId()`，终结失效链接 7 天循环跳转——含移除冷却 403；网络/5xx 保留链接；加入成功 toast 为知情文案「已加入，历史日记将共享给家庭」，ADR-0017 知情语义）；`fetch` → `GET /family`；`createInviteLink` → `POST /family/invite-link`；退出自己 `POST /family/leave`，移除他人 `DELETE /family/members/{userId}`；`onShareAppMessage` 路径 `/pages/Family/Family?linkId=...`；成员列表展示取 `familyList.slice(0, 50)` |
 | `pages/Invite/Invite.ts` | `fetch` → `GET /invite/list`；`createInviteLink` → `POST /family/invite-link`；`ensureQRCode` → `POST /invite/qrcode`；保存分享图（`wx.downloadFile` + `wx.showShareImageMenu`）；分享路径 `/pages/index/index?inviter={userId}`；列表展示取 `(data.list || []).slice(0, 50)` |
 | `pages/index/index.ts` | `option.inviter` → `setPendingInviter`；`option.scene` → 提取短码后 `GET /invite/resolve`；已有登录态时 `POST /auth/inviter` 补绑 |
 | `utils/storage.ts` | `pendingLinkId`（7 天过期）、`pendingInviter` |
@@ -486,7 +507,8 @@
 
 ### 8.3 后台任务
 
-- 本域无独立定时任务；邀请二维码旧物理文件在事务后同步删除，失败留孤儿文件，由通用孤儿文件清理任务（`jobs` 分册）兜底。
+- 本域无独立定时任务；邀请二维码旧物理文件在 DB 事务后同步删除（旧文件的 files 行已在事务内经 `BatchDeleteFiles` 删除）——物理删除失败会留下**无 files 行**的孤儿物理文件，行扫描型清理任务（孤儿文件/系统文件清理）对其不可见、无法回收，存储损耗；物理删除失败时对象停留于曾公开 URL（残余暴露面，已接受风险同 02a A-8）。
+- **邀请海报清理豁免（F-11）**：jobs 域 `cleanup_orphan_traj_maps` 的 `ScanOldSystemFiles`（7 天保留期，02g）带 `NOT COALESCE(metadata ? 'raw', false)` 条件——`metadata.raw` 键为邀请海报行独有（轨迹图为 `{family_id, record_date}`、头像 marker 为 `{}`），故海报**不再被 7 天窗口回收**，已分发到微信会话的 URL 不会静默 404。海报回收由两条替代路径覆盖：①重生成替换（generate 事务内 `ListUserInviteQRCodeFiles` + `BatchDeleteFiles` 删旧记录、提交后删旧物理文件）；②注销清理（`DeleteAccount` 经 `ListFilesByCreator` 按 `created_by` 收集全部 files 路径删物理文件，含海报行）。**边界**：家庭解散 `ClearTrajectoryFamilyID` 清掉海报行 `family_id` 后，①的查询（要求 `metadata ? 'family_id'`）不再命中该行，此部分旧海报仅剩路径②覆盖直至注销（量级为每用户数张海报，已接受）；分享缩略图无 files 行，两条路径均不覆盖（见 F-11 AC）。
 - 家庭锁、二维码生成锁均为 PostgreSQL advisory lock，无 TTL/续期任务（ADR-0005）。
 
 ### 8.4 迁移

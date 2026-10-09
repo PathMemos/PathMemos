@@ -23,6 +23,8 @@ export {
   getAvatar,
   isLogin,
   login,
+  loginAppWithCode,
+  loginWithCode,
   needShowXPa,
   setNeedShowXPa,
   getFamilyConfig,

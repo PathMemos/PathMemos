@@ -30,7 +30,7 @@ func doStatus(t *testing.T, mock pgxmock.PgxPoolIface, outTradeNo string) *httpt
 	return rec
 }
 
-// TestStatus_OrderNotFound 订单不存在 → 404 且下发 biz_code=ORDER_NOT_FOUND（VP-P2-04）。
+// TestStatus_OrderNotFound 订单不存在 → 404 且下发 biz_code=ORDER_NOT_FOUND。
 func TestStatus_OrderNotFound(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
@@ -57,7 +57,7 @@ func TestStatus_OrderNotFound(t *testing.T) {
 	}
 }
 
-// TestStatus_DBError 真实 DB 错误 → 500（而非伪装 404），避免掩盖故障（VP-P2-01）。
+// TestStatus_DBError 真实 DB 错误 → 500（而非伪装 404），避免掩盖故障。
 func TestStatus_DBError(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {

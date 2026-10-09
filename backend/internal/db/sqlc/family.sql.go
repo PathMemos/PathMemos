@@ -178,9 +178,15 @@ const getFamilyByID = `-- name: GetFamilyByID :one
 SELECT id, is_personal, created_at FROM families WHERE id = $1
 `
 
-func (q *Queries) GetFamilyByID(ctx context.Context, id string) (Family, error) {
+type GetFamilyByIDRow struct {
+	ID         string             `json:"id"`
+	IsPersonal bool               `json:"isPersonal"`
+	CreatedAt  pgtype.Timestamptz `json:"createdAt"`
+}
+
+func (q *Queries) GetFamilyByID(ctx context.Context, id string) (GetFamilyByIDRow, error) {
 	row := q.db.QueryRow(ctx, getFamilyByID, id)
-	var i Family
+	var i GetFamilyByIDRow
 	err := row.Scan(&i.ID, &i.IsPersonal, &i.CreatedAt)
 	return i, err
 }
@@ -194,6 +200,17 @@ func (q *Queries) GetFamilyOwner(ctx context.Context, familyID string) (string, 
 	var user_id string
 	err := row.Scan(&user_id)
 	return user_id, err
+}
+
+const getFamilyRemovedMembers = `-- name: GetFamilyRemovedMembers :one
+SELECT removed_members FROM families WHERE id = $1
+`
+
+func (q *Queries) GetFamilyRemovedMembers(ctx context.Context, id string) ([]byte, error) {
+	row := q.db.QueryRow(ctx, getFamilyRemovedMembers, id)
+	var removed_members []byte
+	err := row.Scan(&removed_members)
+	return removed_members, err
 }
 
 const isFamilyMember = `-- name: IsFamilyMember :one
@@ -295,6 +312,63 @@ func (q *Queries) ListFamilyMembers(ctx context.Context, familyID string) ([]Lis
 	return items, nil
 }
 
+const listFamilyMembersByUserID = `-- name: ListFamilyMembersByUserID :many
+SELECT
+    cur.current_family_id,
+    fm.user_id,
+    fm.role,
+    fm.joined_at,
+    mu.avatar,
+    mu.avatar_file_id,
+    mu.nickname
+FROM users cur
+LEFT JOIN family_members fm ON fm.family_id = cur.current_family_id
+LEFT JOIN users mu ON mu.id = fm.user_id
+WHERE cur.id = $1
+ORDER BY fm.joined_at ASC, fm.user_id ASC
+`
+
+type ListFamilyMembersByUserIDRow struct {
+	CurrentFamilyID pgtype.Text        `json:"currentFamilyId"`
+	UserID          pgtype.Text        `json:"userId"`
+	Role            pgtype.Text        `json:"role"`
+	JoinedAt        pgtype.Timestamptz `json:"joinedAt"`
+	Avatar          pgtype.Text        `json:"avatar"`
+	AvatarFileID    pgtype.Text        `json:"avatarFileId"`
+	Nickname        pgtype.Text        `json:"nickname"`
+}
+
+// 一次往返同时取用户当前家庭与其成员列表（替代 GetUserByID + ListFamilyMembers 两段串行，
+// 是 diary 全部端点的公共前缀）。LEFT JOIN 保形：无家庭时返回单行全 NULL（fm.* 判空跳过），
+// 用户不存在时 0 行（调用方转 ErrNoRows），与旧两查语义逐一对齐。
+func (q *Queries) ListFamilyMembersByUserID(ctx context.Context, id string) ([]ListFamilyMembersByUserIDRow, error) {
+	rows, err := q.db.Query(ctx, listFamilyMembersByUserID, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListFamilyMembersByUserIDRow{}
+	for rows.Next() {
+		var i ListFamilyMembersByUserIDRow
+		if err := rows.Scan(
+			&i.CurrentFamilyID,
+			&i.UserID,
+			&i.Role,
+			&i.JoinedAt,
+			&i.Avatar,
+			&i.AvatarFileID,
+			&i.Nickname,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const migrateFamilyDailyCovers = `-- name: MigrateFamilyDailyCovers :exec
 INSERT INTO family_daily_covers (
     family_id,
@@ -364,6 +438,22 @@ type MigrateUserDailyCoversToFamilyParams struct {
 
 func (q *Queries) MigrateUserDailyCoversToFamily(ctx context.Context, arg MigrateUserDailyCoversToFamilyParams) error {
 	_, err := q.db.Exec(ctx, migrateUserDailyCoversToFamily, arg.FamilyID, arg.UserID, arg.FamilyID_2)
+	return err
+}
+
+const recordRemovedMember = `-- name: RecordRemovedMember :exec
+UPDATE families
+SET removed_members = COALESCE(removed_members, '{}'::jsonb) || $2::jsonb
+WHERE id = $1
+`
+
+type RecordRemovedMemberParams struct {
+	ID      string `json:"id"`
+	Column2 []byte `json:"column2"`
+}
+
+func (q *Queries) RecordRemovedMember(ctx context.Context, arg RecordRemovedMemberParams) error {
+	_, err := q.db.Exec(ctx, recordRemovedMember, arg.ID, arg.Column2)
 	return err
 }
 

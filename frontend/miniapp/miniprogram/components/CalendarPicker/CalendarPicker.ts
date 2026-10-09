@@ -134,7 +134,7 @@ Component({
       if (!s) return new Date();
       const [y, m, d] = s.split('-').map(Number);
       const dt = new Date(y, (m || 1) - 1, d || 1);
-      // R2-F04：非法输入产出 Invalid Date 时回退今天，避免 NaN-NaN-NaN 空日历。
+      // 非法输入产出 Invalid Date 时回退今天，避免 NaN-NaN-NaN 空日历。
       if (isNaN(dt.getTime())) return new Date();
       return dt;
     },

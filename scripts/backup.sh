@@ -37,6 +37,8 @@ UPLOADS_DIR="./uploads"
 # 清理上次异常中断遗留的临时文件
 rm -f "$OUTPUT_DIR"/.db_*.sql "$OUTPUT_DIR"/.db_*.sql.gz "$OUTPUT_DIR"/.uploads_*.tar.gz
 
+failed=0
+
 # 数据库备份：先写临时文件，成功后原子替换，避免失败留下半个 gz
 if [[ -n "$DB_CONTAINER" ]]; then
   echo "备份数据库 -> $DB_BACKUP"
@@ -45,10 +47,12 @@ if [[ -n "$DB_CONTAINER" ]]; then
     rm -f "$DB_TMP"
   else
     rm -f "$DB_TMP" "$DB_BACKUP"
-    echo "错误：数据库备份失败，已清理半成品 $DB_BACKUP" >&2
+    echo "错误：数据库备份失败，已清理半成品 $DB_BACKUP alert=backup_failed" >&2
+    failed=1
   fi
 else
-  echo "警告：找不到运行中的 postgres 容器，跳过数据库备份" >&2
+  echo "错误：找不到运行中的 postgres 容器，数据库备份未执行 alert=backup_failed" >&2
+  failed=1
 fi
 
 # uploads 目录备份：同样先临时后原子替换
@@ -59,7 +63,8 @@ if [[ -d "$UPLOADS_DIR" ]]; then
     :
   else
     rm -f "$UPLOADS_TMP"
-    echo "错误：uploads 备份失败" >&2
+    echo "错误：uploads 备份失败 alert=backup_uploads_failed" >&2
+    failed=1
   fi
 else
   echo "警告：uploads 目录不存在，跳过文件备份" >&2
@@ -73,6 +78,13 @@ if command -v ls &>/dev/null; then
       rm -f "$f"
     done || true
   done
+fi
+
+# cron 场景下失败必须响亮：非零退出 + alert 关键字（alert-watch.sh 已收录 alert=backup_failed
+# 与 alert=backup_uploads_failed，由上方具体失败分支输出），否则备份静默断供、永不更新也无告警。
+if [[ "$failed" != "0" ]]; then
+  echo "备份未完成" >&2
+  exit 1
 fi
 
 echo "备份完成（保留最近 $KEEP 份）"

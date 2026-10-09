@@ -53,14 +53,18 @@
   </view>
 </view>
 
-<ConfirmDialog
-  visible="{{confirmDialog.visible}}"
-  title="{{confirmDialog.title || ''}}"
-  content="{{confirmDialog.content || ''}}"
-  cancelText="{{confirmDialog.cancelText || ''}}"
-  confirmText="{{confirmDialog.confirmText || ''}}"
-  confirmType="{{confirmDialog.confirmType}}"
-  bind:cancel="onConfirmDialogCancel"
-  bind:confirm="onConfirmDialogConfirm"
-  bind:close="onConfirmDialogCancel"
-/>
+<!-- 宿主在 enhanced scroll-view 内，其内部 transform 机制会劫持 fixed 包含块；
+     root-portal 把弹窗搬出滚动渲染树，遮罩/弹窗恢复相对视口全屏居中 -->
+<root-portal wx:if="{{confirmDialog.visible}}">
+  <ConfirmDialog
+    visible="{{confirmDialog.visible}}"
+    title="{{confirmDialog.title || ''}}"
+    content="{{confirmDialog.content || ''}}"
+    cancelText="{{confirmDialog.cancelText || ''}}"
+    confirmText="{{confirmDialog.confirmText || ''}}"
+    confirmType="{{confirmDialog.confirmType}}"
+    bind:cancel="onConfirmDialogCancel"
+    bind:confirm="onConfirmDialogConfirm"
+    bind:close="onConfirmDialogCancel"
+  />
+</root-portal>

@@ -1,5 +1,5 @@
 /**
- * About 注销本地清理（PPJ-A03）：页面隐藏/销毁时也须执行 closeAutoRecord/clearUserData，
+ * About 注销本地清理：页面隐藏/销毁时也须执行 closeAutoRecord/clearUserData，
  * 仅成功 toast 受可见性约束；成功后 reLaunch 首页。
  */
 import { beforeEach, describe, expect, it, jest } from '@jest/globals';
@@ -13,13 +13,14 @@ jest.mock('../miniprogram/utils/request', () => ({
 jest.mock('../miniprogram/utils/storage', () => ({
   clearUserData: jest.fn(),
   getBackendMode: jest.fn(() => 'saas'),
+  setLoggedOut: jest.fn(),
 }));
 jest.mock('../miniprogram/utils/autoRecord', () => ({
   closeAutoRecord: jest.fn(async () => undefined),
 }));
 
 import request from '../miniprogram/utils/request';
-import { clearUserData } from '../miniprogram/utils/storage';
+import { clearUserData, setLoggedOut } from '../miniprogram/utils/storage';
 import { closeAutoRecord } from '../miniprogram/utils/autoRecord';
 import '../miniprogram/pages/sub/About/About';
 
@@ -70,8 +71,10 @@ describe('About 注销清理', () => {
 
     expect(closeAutoRecord).toHaveBeenCalled();
     expect(clearUserData).toHaveBeenCalled();
+    expect(setLoggedOut).toHaveBeenCalledWith(true);
     expect((globalThis as any).wx.showToast).not.toHaveBeenCalled();
-    expect((globalThis as any).wx.reLaunch).toHaveBeenCalled();
+    // 注销后落登录停留页（不再回首页静默重登新账号）
+    expect((globalThis as any).wx.reLaunch).toHaveBeenCalledWith({ url: '/pages/Login/Login' });
   });
 
   it('可见态执行清理并弹成功 toast', async () => {
@@ -80,8 +83,9 @@ describe('About 注销清理', () => {
     await flush();
 
     expect(clearUserData).toHaveBeenCalled();
+    expect(setLoggedOut).toHaveBeenCalledWith(true);
     expect((globalThis as any).wx.showToast).toHaveBeenCalled();
-    expect((globalThis as any).wx.reLaunch).toHaveBeenCalled();
+    expect((globalThis as any).wx.reLaunch).toHaveBeenCalledWith({ url: '/pages/Login/Login' });
   });
 
   it('空确认名时不发起请求', () => {

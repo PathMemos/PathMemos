@@ -2,7 +2,7 @@ package autorecord
 
 import "testing"
 
-// R-01：候选游标推进与回绕（纯逻辑，避免 DB 依赖）。
+// 候选游标推进与回绕（纯逻辑，避免 DB 依赖）。
 func TestNextCursor(t *testing.T) {
 	cases := []struct {
 		name     string

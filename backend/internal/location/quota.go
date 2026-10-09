@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	// MaxReversePerUserPerDay 每用户每日逆地理编码配额（R2-06 供 diary CreateAutoEntry 复用）。
+	// MaxReversePerUserPerDay 每用户每日逆地理编码配额（供 diary CreateAutoEntry 复用）。
 	MaxReversePerUserPerDay = 200
 	reverseQuotaKeyPrefix   = "location:reverse"
 	reverseQuotaTTL         = 24 * time.Hour

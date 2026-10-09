@@ -18,12 +18,12 @@ STATE="${ALERT_STATE_FILE:-/var/lib/papafeiji/alert-state}"
 DRY="${ALERT_DRY_RUN:-0}"
 
 # 资金/数据完整性/可用性相关关键字（命中即告警，全集见 docs/DEPLOYMENT.md §10 告警关键字表）。
-# job_stale / watchdog_circuit_open 由 R-03/R-07 产出；
-# redis_mem_high / backup_* / ai_upstream_error / auto_record_failed / cert_expiry_soon 由 R-09 加固批次产出。
+# 告警关键字还包括：job_stale / watchdog_circuit_open；
+# redis_mem_high / backup_* / ai_upstream_error / auto_record_failed / cert_expiry_soon。
 # "alert":"redis_down"：main.go JSON 日志里 alert 属性（docs 关键字 alert=redis_down）的实际渲染形态，
 #   Redis 故障健康降级 200 后唯一兜底触达通道；wx mp kf：wxmp/handler.go 的 msg 带 [ALERT] 前缀，
 #   grep BRE 中 [ALERT] 是字符组，故去掉方括号前缀取 msg 主体匹配。
-KEYWORDS='payment_notify_missing_msg_signature|payment_notify_bad_signature|payment_notify_decrypt_failed|payment_notify_plaintext_rejected|payment_notify_receive_id_mismatch|payment_notify_amount_missing|payment_notify_amount_invalid|payment_notify_amount_mismatch|payment_notify_business_rejected|payment_notify_closed_order_reissued|payment_notify_transient_retry|alert:payment_parse_failed|alert:ai_quota_refund_failed|alert=ai_upstream_error|alert=auto_record_failed|alert=backup_failed|alert=backup_uploads_failed|alert=backup_stale|alert=redis_mem_high|alert=papafeiji_cpu_high|alert=papafeiji_cpu_recovered|alert=uptime_down|alert=uptime_recovered|"alert":"redis_down"|wx mp all kf segments failed|cert_expiry_soon|job_stale|watchdog_circuit_open'
+KEYWORDS='payment_notify_missing_msg_signature|payment_notify_bad_signature|payment_notify_decrypt_failed|payment_notify_plaintext_rejected|payment_notify_receive_id_mismatch|payment_notify_amount_missing|payment_notify_amount_invalid|payment_notify_amount_mismatch|payment_notify_business_rejected|payment_notify_closed_order_reissued|payment_notify_transient_retry|payment_notify_read_failed|payment_notify_body_too_large|alert:payment_parse_failed|alert:ai_quota_refund_failed|alert=ai_upstream_error|alert=auto_record_failed|alert=invite_reward_failed|auto_record_backlog_warn|alert=backup_failed|alert=backup_uploads_failed|alert=backup_stale|alert=redis_mem_high|alert=disk_high|alert=papafeiji_cpu_high|alert=papafeiji_cpu_recovered|alert=uptime_down|alert=uptime_recovered|"alert":"redis_down"|wx mp all kf segments failed|cert_expiry_soon|job_stale|watchdog_circuit_open|watchdog_recovered|record deleted url for purge failed'
 
 mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
 exec 9>"${STATE}.lock" 2>/dev/null || true
@@ -48,6 +48,7 @@ while IFS= read -r kw; do
   sample=$(grep -m1 -- "$kw" <<< "$INPUT" | cut -c1-500)
   hits=$((hits + 1))
   if [[ "$DRY" == "1" || -z "$WEBHOOK" ]]; then
+    sent=1
     echo "[ALERT] $kw :: $sample"
   else
     payload=$(python3 - "$kw" "$sample" <<'PY'
@@ -55,13 +56,19 @@ import json, sys
 print(json.dumps({"msg_type": "text", "content": {"text": f"[papafeiji] 告警关键字: {sys.argv[1]}\n{sys.argv[2]}"}}))
 PY
 )
+    sent=1
     if curl -fsS -m 10 -H 'Content-Type: application/json' -d "$payload" "$WEBHOOK" >/dev/null 2>&1; then
       echo "[ALERT-SENT] $kw"
     else
+      sent=0
       echo "[ALERT-FAIL] $kw" >&2
     fi
   fi
-  printf '%s %s\n' "$kw" "$now" >> "$STATE"
+  # 仅在告警已送达（或 WEBHOOK 未配置、无需送达）时记录去重状态；
+  # webhook 失败时留空，下一扫描周期（服务器侧 cron 每 2 分钟）重试，避免 300s 窗口内告警被压制。
+  if [[ "$sent" == "1" ]]; then
+    printf '%s %s\n' "$kw" "$now" >> "$STATE"
+  fi
 done < <(tr '|' '\n' <<< "$KEYWORDS")
 
 # 状态文件去重记录保留最近 1000 行。

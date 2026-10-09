@@ -21,7 +21,7 @@
 
 ### 正面
 
-- 隐藏源站 IP，获得全球边缘接入与边缘缓存/限流。
+- Worker 域名（`mcp.pathmemos.com`/`api.pathmemos.com`，回源经 Cloudflare）隐藏源站 IP，获得全球边缘接入与边缘缓存/限流。注意：API 与官网域名（`pro.papafeiji.cn`/`papafeiji.cn`）为 certbot webroot 签发要求走 **DNS-only A 记录直连**，源站 IP 对外可查——威胁模型不应假设全站 IP 隐藏。
 - 源站连接与协议解析开销下降。
 
 ### 负面 / 代价

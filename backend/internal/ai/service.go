@@ -28,7 +28,8 @@ import (
 )
 
 // dailyQuotaLua 对 Redis 辅助缓存做原子 check+incr，并在超出 limit 时自动回退。
-// 用于 AI 配额消费的 Redis 前置闸门：Redis 异常时失败关闭，避免触碰数据库。
+// 用于 AI 配额消费的 Redis 前置闸门：Redis 异常时按未超限放行（fail-open）,
+// 由 DB 权威条件更新兜底拒绝（02f D3），避免 Redis 抖动直接拒绝全部用户。
 var dailyQuotaLua = redis.NewScript(`
 local key = KEYS[1]
 local limit = tonumber(ARGV[1])
@@ -106,8 +107,9 @@ func streamReplay(reply string, onChunk func(string) error) error {
 	return nil
 }
 
-// dailyQuotaCacheTTLFor 返回指定日期对应的 Redis 缓存 TTL：到次日 0 点上海时区的剩余时间 + 60 秒缓冲。
-// 保证配额缓存按自然日过期，避免 24 小时固定 TTL 导致的跨天计数偏差。
+// dailyQuotaCacheTTLFor 返回配额 Redis 缓存 TTL。当前两个调用点均传入当天 0 点
+// （quotaDate），返回值恒为 24h+60s 常量——自当日首次 incr 起算、随首聊时刻漂移，
+// 不与次日 0 点对齐（跨天残留窗口由 DB 权威扣减兜底，见 02f AI-4 登记口径）。
 func dailyQuotaCacheTTLFor(t time.Time) time.Duration {
 	tz := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location()).Add(24 * time.Hour)
 	return tz.Sub(t) + 60*time.Second
@@ -140,7 +142,7 @@ func (s *Service) sysCfg(ctx context.Context) (*config.SysConfig, error) {
 }
 
 // logUpstreamAlert 限频输出 AI 上游告警关键字（5 分钟一次），由 alert-watch 捕获推送。
-// 上游故障在此前完全不可见（用户只看到对话失败），这是其唯一观测面（R-19）。
+// 上游故障用户侧仅表现为对话失败，此告警是其唯一观测面。
 var lastUpstreamAlertUnixMilli atomic.Int64
 
 func logUpstreamAlert(ctx context.Context, err error) {
@@ -156,39 +158,43 @@ func logUpstreamAlert(ctx context.Context, err error) {
 }
 
 // Chat runs a complete AI chat turn. If onChunk is non-nil it is called for each streamed chunk.
-// It returns the full assistant reply. Quota is consumed at the start and refunded automatically
+// It returns the full assistant reply and whether the reply was cut by AIStreamTimeout with
+// partial content (truncated replies are billed and logged as normal; the SSE handler emits a
+// notice event before done — 02f AI-6). Quota is consumed at the start and refunded automatically
 // if no reply could be produced due to timeout or upstream error.
 // requestID 为客户端每轮生成的幂等标识（重连重发复用同一值），为空时回退消息内容哈希。
-func (s *Service) Chat(ctx context.Context, userID, message, requestID string, onChunk func(string) error) (string, error) {
+func (s *Service) Chat(ctx context.Context, userID, message, requestID string, onChunk func(string) error) (string, bool, error) {
 	sysCfg, err := s.sysCfg(ctx)
 	if err != nil {
-		return "", fmt.Errorf("load sys config: %w", err)
+		return "", false, fmt.Errorf("load sys config: %w", err)
 	}
 	return s.chatWithPrompt(ctx, userID, message, onChunk, sysCfg.AIPrompt, sysCfg, requestID)
 }
 
 // ChatWithPromptUsingConfig runs ChatWithPrompt using an already loaded config to avoid duplicate DB loads.
+// 公众号被动回复无 notice 通道，截断标志在此丢弃（部分回复原样下发——02f AI-6）。
 func (s *Service) ChatWithPromptUsingConfig(ctx context.Context, userID, message string, onChunk func(string) error, systemPrompt string, sysCfg *config.SysConfig) (string, error) {
 	if systemPrompt == "" {
 		systemPrompt = sysCfg.AIPrompt
 	}
-	return s.chatWithPrompt(ctx, userID, message, onChunk, systemPrompt, sysCfg, "")
+	reply, _, err := s.chatWithPrompt(ctx, userID, message, onChunk, systemPrompt, sysCfg, "")
+	return reply, err
 }
 
-func (s *Service) chatWithPrompt(ctx context.Context, userID, message string, onChunk func(string) error, systemPrompt string, sysCfg *config.SysConfig, requestID string) (reply string, err error) {
+func (s *Service) chatWithPrompt(ctx context.Context, userID, message string, onChunk func(string) error, systemPrompt string, sysCfg *config.SysConfig, requestID string) (reply string, truncated bool, err error) {
 	if userID == "" {
-		return "", fmt.Errorf("user_id is empty")
+		return "", false, fmt.Errorf("user_id is empty")
 	}
 
 	msg := strings.TrimSpace(message)
 	if msg == "" {
-		return "", fmt.Errorf("message is empty")
+		return "", false, fmt.Errorf("message is empty")
 	}
 	if utf8.RuneCountInString(msg) > maxMessageCodePoints {
-		return "", fmt.Errorf("message too long")
+		return "", false, fmt.Errorf("message too long")
 	}
 
-	// —— 重连幂等（R3）：客户端断线自动重连会重发同一轮消息，
+	// —— 重连幂等：客户端断线自动重连会重发同一轮消息，
 	// 此处避免重复调用上游、重复扣每日配额、重复落库——
 	turnKey, replyKey := aiTurnKeys(userID, msg, requestID)
 	complete := false
@@ -198,14 +204,14 @@ func (s *Service) chatWithPrompt(ctx context.Context, userID, message string, on
 		if cached, gErr := s.rdb.Get(ctx, replyKey).Result(); gErr == nil && cached != "" {
 			slog.InfoContext(ctx, "ai chat replay from cache", slog.String("user_id", userID))
 			_ = streamReplay(cached, onChunk) //nolint:errcheck // 客户端停止接收时中止回放即可
-			return cached, nil
+			return cached, false, nil
 		}
 		// 2) 同一轮消息正在处理中（重连竞态）：短暂等待在途请求完成，尽量复用其回复。
 		if ok, sErr := s.rdb.SetNX(ctx, turnKey, "1", aiTurnKeyTTL).Result(); sErr == nil && ok {
 			acquired = true
 		} else if sErr == nil && !ok {
 			// 在途请求可能流式生成最长 AIStreamTimeout(180s)；等待窗口对齐 turnKey TTL(240s)：
-			// 在途完成写 replyKey 即回放。R2：等待超时或在途失败绝不回落生成——
+			// 在途完成写 replyKey 即回放。等待超时或在途失败绝不回落生成——
 			// 否则同一 request_id 会二次调用上游、二次扣配额、二次落库；统一返回
 			// OPERATION_IN_PROGRESS，由客户端稍后重试（残留标记由 TTL 兜底）。
 			deadline := time.Now().Add(aiTurnKeyTTL)
@@ -213,24 +219,28 @@ func (s *Service) chatWithPrompt(ctx context.Context, userID, message string, on
 				if cached, gErr := s.rdb.Get(ctx, replyKey).Result(); gErr == nil && cached != "" {
 					slog.InfoContext(ctx, "ai chat replay after in-flight turn", slog.String("user_id", userID))
 					_ = streamReplay(cached, onChunk) //nolint:errcheck
-					return cached, nil
+					return cached, false, nil
 				}
-				if _, gErr := s.rdb.Get(ctx, turnKey).Result(); gErr != nil {
+				if _, gErr := s.rdb.Get(ctx, turnKey).Result(); gErr != nil && !stderrors.Is(gErr, redis.Nil) {
+					// Redis 抖动不等于「标记已释放」：在途请求可能仍在生成，
+					// 继续轮询直到拿到回复或 TTL 到期，避免误拒重连用户。
+					slog.WarnContext(ctx, "ai turn key check failed, keep waiting", slog.String("user_id", userID), slog.Any("error", gErr))
+				} else if stderrors.Is(gErr, redis.Nil) {
 					// 在途标记已释放但无回复缓存：在途请求失败（含空回复）。
-					return "", errAITurnInProgress
+					return "", false, errAITurnInProgress
 				}
 				select {
 				case <-ctx.Done():
-					// AI-P2-06：在途等待期间 ctx 到期属请求超时，返回 timeout 语义，
+					// 在途等待期间 ctx 到期属请求超时，返回 timeout 语义，
 					// 避免 handler 误报为 upstream error；客户端主动取消仍为 cancelled。
 					if stderrors.Is(ctx.Err(), context.DeadlineExceeded) {
-						return "", errAIChatTimeout
+						return "", false, errAIChatTimeout
 					}
-					return "", fmt.Errorf("stream context cancelled")
+					return "", false, fmt.Errorf("stream context cancelled")
 				case <-time.After(aiTurnPollInterval):
 				}
 			}
-			return "", errAITurnInProgress
+			return "", false, errAITurnInProgress
 		}
 		// Redis 异常（SetNX 报错）时按未获取处理，走正常路径，绝不阻断对话。
 	}
@@ -253,7 +263,7 @@ func (s *Service) chatWithPrompt(ctx context.Context, userID, message string, on
 
 	user, err := s.pool.Queries().GetUserByID(ctx, userID)
 	if err != nil {
-		return "", fmt.Errorf("get user: %w", err)
+		return "", false, fmt.Errorf("get user: %w", err)
 	}
 
 	familyID := ""
@@ -263,17 +273,17 @@ func (s *Service) chatWithPrompt(ctx context.Context, userID, message string, on
 
 	background, err := s.buildBackground(ctx, userID, familyID)
 	if err != nil {
-		return "", fmt.Errorf("build background: %w", err)
+		return "", false, fmt.Errorf("build background: %w", err)
 	}
 
 	dialogLogs, err := s.pool.Queries().ListRecentDialogLogs(ctx, sqlcArg(userID, 20))
 	if err != nil {
-		return "", fmt.Errorf("list recent dialog logs: %w", err)
+		return "", false, fmt.Errorf("list recent dialog logs: %w", err)
 	}
 
 	info, err := s.vipService.GetVIPInfo(ctx, userID)
 	if err != nil {
-		return "", fmt.Errorf("get vip info for quota check: %w", err)
+		return "", false, fmt.Errorf("get vip info for quota check: %w", err)
 	}
 	quota := dailyQuotaNonVIP
 	if info.IsVIP {
@@ -283,10 +293,10 @@ func (s *Service) chatWithPrompt(ctx context.Context, userID, message string, on
 	quotaDate := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, today.Location())
 	quotaOK, quotaErr := s.tryConsumeDailyQuota(ctx, userID, quota, quotaDate)
 	if quotaErr != nil {
-		return "", fmt.Errorf("consume quota: %w", quotaErr)
+		return "", false, fmt.Errorf("consume quota: %w", quotaErr)
 	}
 	if !quotaOK {
-		return "", ErrAIDailyQuotaExceeded
+		return "", false, ErrAIDailyQuotaExceeded
 	}
 
 	nickname := ""
@@ -306,7 +316,7 @@ func (s *Service) chatWithPrompt(ctx context.Context, userID, message string, on
 		// 连接失败/非 200：上游不可用的第一现场，限频告警。
 		logUpstreamAlert(ctx, err)
 		safe.Go(ctx, nil, func() { s.refundDailyQuota(userID, quotaDate) })
-		return "", fmt.Errorf("upstream stream: %w", err)
+		return "", false, fmt.Errorf("upstream stream: %w", err)
 	}
 	//nolint:errcheck
 	defer stream.Close()
@@ -321,17 +331,19 @@ func (s *Service) chatWithPrompt(ctx context.Context, userID, message string, on
 			if fullReply.Len() > 0 {
 				reply := fullReply.String()
 				s.saveLogAsync(ctx, userID, msg, reply)
-				return reply, nil
+				// 流上下文到期但有部分回复：保存并照常计费（02f AI-6），truncated 供 SSE notice 提示。
+				truncated = true
+				return reply, truncated, nil
 			}
 			if stderrors.Is(err, context.DeadlineExceeded) {
-				return "", errAIChatTimeout
+				return "", false, errAIChatTimeout
 			}
-			return "", fmt.Errorf("stream context cancelled")
+			return "", false, fmt.Errorf("stream context cancelled")
 		}
 
 		chunk, err := stream.Next()
 		if err != nil {
-			// R2-L02：流正常结束（[DONE] 或连接关闭）直接跳出，不再进入错误分支。
+			// 流正常结束（[DONE] 或连接关闭）直接跳出，不再进入错误分支。
 			if stderrors.Is(err, io.EOF) {
 				complete = true
 				break
@@ -343,13 +355,15 @@ func (s *Service) chatWithPrompt(ctx context.Context, userID, message string, on
 				if fullReply.Len() > 0 {
 					reply := fullReply.String()
 					s.saveLogAsync(ctx, userID, msg, reply)
-					return reply, nil
+					// 超时/取消截断且有部分回复：同上，保存计费并标记 truncated（02f AI-6）。
+					truncated = true
+					return reply, truncated, nil
 				}
 				// 区分超时与客户端主动断开：Canceled 不是超时，避免下发语义错误的 timeout SSE 事件。
 				if stderrors.Is(err, context.DeadlineExceeded) {
-					return "", errAIChatTimeout
+					return "", false, errAIChatTimeout
 				}
-				return "", fmt.Errorf("stream context cancelled")
+				return "", false, fmt.Errorf("stream context cancelled")
 			}
 
 			if fullReply.Len() == 0 {
@@ -360,11 +374,13 @@ func (s *Service) chatWithPrompt(ctx context.Context, userID, message string, on
 			if fullReply.Len() > 0 {
 				reply := fullReply.String()
 				s.saveLogAsync(ctx, userID, msg, reply)
-				return reply, nil
+				// 上游中途流错误且有部分回复：保存计费并标记 truncated（02f AI-6）。
+				truncated = true
+				return reply, truncated, nil
 			}
-			return "", fmt.Errorf("upstream error: %w", err)
+			return "", false, fmt.Errorf("upstream error: %w", err)
 		}
-		// R2-L02：空 chunk（上游心跳/占位）跳过，不再误判为流结束。
+		// 空 chunk（上游心跳/占位）跳过，不再误判为流结束。
 		if chunk == "" {
 			continue
 		}
@@ -395,7 +411,7 @@ func (s *Service) chatWithPrompt(ctx context.Context, userID, message string, on
 		safe.Go(ctx, nil, func() { s.refundDailyQuota(userID, quotaDate) })
 	}
 
-	return reply, nil
+	return reply, truncated, nil
 }
 
 func (s *Service) buildBackground(ctx context.Context, userID, familyID string) (string, error) {
@@ -418,8 +434,8 @@ func (s *Service) buildBackground(ctx context.Context, userID, familyID string) 
 		return "暂无日记记录", nil
 	}
 
-	// PD-1：背景上下文按 rune 截断。原 10 万 runes 在活跃家庭可拼出 5~10 万 token，
-	// 超过上游 DeepSeek 窗口导致 400/upstream error；收敛到与审计一致的 2 万 runes
+	// 背景上下文按 rune 截断。原 10 万 runes 在活跃家庭可拼出 5~10 万 token，
+	// 超过上游 DeepSeek 窗口导致 400/upstream error；收敛到 2 万 runes
 	//（约 2 万 token），为 system prompt、历史与输出留足窗口；截断保留最新记录。
 	const maxBackgroundLen = 20000
 

@@ -121,7 +121,7 @@ func decryptMsg(cipherMsg, encodingAESKey string, zeroIV bool) (string, string, 
 
 	// 微信消息加解密的填充按 32 字节对齐（腾讯官方加解密实现如此，并非 AES 块大小的 16）。
 	// 例如明文长度 % 32 == 3 时填充 29 个 0x1d 字节；按 16 字节 PKCS7 校验会把
-	// 填充长度 29 误判为 "invalid padding size"（2026-08-15 真实回调踩坑，线上已复现）。
+	// 填充长度 29 误判为 "invalid padding size"（线上真实回调踩坑）。
 	const wechatPadBlockSize = 32
 	plainData, err = pkcs7Unpad(plainData, wechatPadBlockSize)
 	if err != nil {

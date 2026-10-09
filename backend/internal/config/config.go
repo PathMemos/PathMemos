@@ -41,12 +41,18 @@ func sharedHTTPClientTransport() *http.Transport {
 }
 
 type Config struct {
-	DatabaseURL                string
-	RedisAddr                  string
-	WechatAppID                string
-	WechatSecret               string
-	WechatMPAppID              string
-	WechatMPSecret             string
+	DatabaseURL    string
+	RedisAddr      string
+	WechatAppID    string
+	WechatSecret   string
+	WechatMPAppID  string
+	WechatMPSecret string
+	// DonutAppID/DonutAppSecret 微信「多端应用」的 AppID/Secret（Donut 控制台应用
+	// 详情页获取；注意不是小程序、也不是移动应用的凭据）。供多端 App 微信登录：
+	// 客户端 wx.weixinAppLogin 的 code 经 donut/code2verifyinfo 换取用户标识。
+	// 未配置时 /auth/login/app 返回 500。
+	DonutAppID                 string
+	DonutAppSecret             string
 	WechatMPGhID               string
 	WechatMiniLinkEnvVersion   string
 	WechatVirtualOfferID       string
@@ -112,12 +118,12 @@ type Config struct {
 	// 可选：未配置时回退为源站地址（APIHost）。
 	MCPPublicURL string
 
-	// MCPEnabled 是否对外开启 MCP 功能（/system/config features.mcp，B6a-15）。
+	// MCPEnabled 是否对外开启 MCP 功能（/system/config features.mcp）。
 	// 默认开启，可用 MCP_ENABLED=0 显式关闭。
 	MCPEnabled bool
 
 	// FreeVipEnabled 控制 /system/config 的 features.freeVip（小程序 VIP 页免费领取入口）。
-	// 默认开启；免费活动下线用 FREE_VIP_ENABLED=0，无需发版（VP-13）。
+	// 默认开启；免费活动下线用 FREE_VIP_ENABLED=0，无需发版。
 	FreeVipEnabled bool
 
 	// OpenAPIKey 是开源版与 Cloudflare Worker 之间的共享密钥。
@@ -142,7 +148,7 @@ type Config struct {
 	JobIntervalCleanupClientOpsLogs  time.Duration
 	JobIntervalPurgeDeletedObjects   time.Duration
 
-	// CDNRefreshEnabled 开启已删对象边缘缓存批量收敛（ADR-0013）：删除 OSS 对象时
+	// CDNRefreshEnabled 开启已删对象边缘缓存批量收敛：删除 OSS 对象时
 	// 记录公开 URL，后台任务定期调用阿里云 CDN 刷新接口。默认关闭。
 	CDNRefreshEnabled bool
 }
@@ -215,6 +221,8 @@ func Load() (*Config, error) {
 		WechatSecret:                wechatSecret,
 		WechatMPAppID:               os.Getenv("WECHAT_MP_APPID"),
 		WechatMPSecret:              os.Getenv("WECHAT_MP_SECRET"),
+		DonutAppID:                  os.Getenv("DONUT_APPID"),
+		DonutAppSecret:              os.Getenv("DONUT_APPSECRET"),
 		WechatMPGhID:                os.Getenv("WECHAT_MP_GHID"),
 		WechatMiniLinkEnvVersion:    defaultEnv("WECHAT_MINI_LINK_ENV_VERSION", "release"),
 		WechatVirtualOfferID:        os.Getenv("WECHAT_VIRTUAL_OFFER_ID"),
@@ -371,11 +379,11 @@ func (c *Config) validate() error {
 		if c.WorkerSecret == "" {
 			return fmt.Errorf("WORKER_SECRET is required in saas mode")
 		}
-		// R-14：MCP Worker 共享密钥与 WORKER_SECRET 对齐，saas 缺省时启动即失败，避免运行时 500。
+		// MCP Worker 共享密钥与 WORKER_SECRET 对齐，saas 缺省时启动即失败，避免运行时 500。
 		if c.MCPWorkerSecret == "" {
 			return fmt.Errorf("MCP_WORKER_SECRET is required in saas mode")
 		}
-		// SaaS 模式禁止静默回退内置微信凭据（B1-03）：必须显式配置 WECHAT_APPID/WECHAT_SECRET。
+		// SaaS 模式禁止静默回退内置微信凭据：必须显式配置 WECHAT_APPID/WECHAT_SECRET。
 		// 开源版仍可使用 wechatsecrets 内置凭据，机制保留。
 		if os.Getenv("WECHAT_APPID") == "" {
 			return fmt.Errorf("WECHAT_APPID is required in saas mode (内置凭据仅限开源版)")

@@ -1,6 +1,6 @@
 # PP-04 数据库 Schema（L4）
 
-> 层级：L4 数据库 Schema｜版本：V2.0｜状态：定稿（以当前代码为唯一事实源）
+> 层级：L4 数据库 Schema｜版本：当前（以代码为唯一事实源）
 > 上游：PP-01 产品总览｜关联 ADR：无
 > 说明：本文件按当前代码实现整理，描述当前数据库 schema。章节遵循 docs/spec-standards.md 第二节 L4 必含小节（ER 概览 / 字段级表定义 / 数据归属说明 / 数据字典 / 迁移变更流程）。
 > **代码内唯一事实源**：backend/migrations/*.up.sql（尤其 000001_baseline.up.sql）与 backend/internal/db/sqlc/models.go。
@@ -8,11 +8,11 @@
 
 ## 1. 概述
 
-- 数据库：PostgreSQL；主键为 text 或 text+date 复合（无自增整数主键）。
+- 数据库：PostgreSQL；主键为 text 单列或 text+date / text+text 复合（无自增整数主键）。
 - 无软删除列：全部业务表使用**物理删除**（多为 ON DELETE CASCADE / SET NULL），没有 deleted_at / is_deleted 字段。
 - 时间列统一 timestamptz，数据库会话时区设为 Asia/Shanghai（db/db.go 连接级 RuntimeParams）。
 - 唯一约束与部分唯一索引共同承担幂等（支付回调、VIP 领取、邀请、家庭成员）。
-- 迁移文件成对 up/down（spec-standards 第九节阻断级 3）。
+- 迁移文件成对 up/down（spec-standards §八 阻断级 2）。
 
 ## 2. ER 概览（ASCII）
 
@@ -59,7 +59,7 @@
 | 字段 | 类型 | NULL | 默认 / 约束 | 说明 |
 |------|------|------|-------------|------|
 | id | text | N | PK | 用户 UUID |
-| open_id | text | N | 唯一索引 idx_users_openid | 微信小程序 openid |
+| open_id | text | N | 唯一索引 idx_users_openid | 首次注册渠道标识：小程序渠道=微信小程序 openid，多端 App 渠道=多端侧 openid（ADR-0016）；跨端归一靠 unionid（见 02a A-1/A-9） |
 | unionid | text | Y | 部分唯一 idx_users_unionid | 微信 unionid |
 | phone_number | text | Y | 部分唯一 idx_users_phone_number | 手机号 |
 | avatar | text | Y | CHECK length <= 2048 | 头像 URL |
@@ -86,6 +86,7 @@
 |------|------|------|-------------|------|
 | id | text | N | PK | 家庭 UUID |
 | is_personal | boolean | N | default false | 是否个人家庭 |
+| removed_members | jsonb | N | default '{}' | `{userID: 移除时间 RFC3339}` 移除冷却（000014，ADR-0019） |
 | created_at | timestamptz | N | now() | |
 
 ### 3.3 family_members（家庭成员）
@@ -181,7 +182,7 @@
 | suffix | text | N | CHECK length <= 32 | |
 | size_bytes | bigint | N | default 0 | |
 | file_type | text | N | default 'image'；CHECK image/system | |
-| metadata | jsonb | Y | GIN 索引 idx_files_metadata；部分索引 idx_files_metadata_family_record | 系统文件存 family_id/record_date |
+| metadata | jsonb | Y | GIN 索引 idx_files_metadata；部分索引 idx_files_metadata_family_record | 系统文件存 family_id/record_date；邀请二维码文件另存 `raw`（"true"/"false"，`ListUserInviteQRCodeFiles` 按其区分 raw/合成图） |
 | created_at | timestamptz | N | now() | |
 | updated_at | timestamptz | N | now() | |
 | storage_type | text | N | default 'local'；CHECK local/oss；索引 idx_files_storage_type | |
@@ -197,7 +198,7 @@
 | name | text | N | | |
 | time_limit_mark | text | N | CHECK day/month/year | |
 | time_limit_number | integer | N | CHECK > 0 | |
-| product_id | text | Y | | 微信虚拟支付商品 ID |
+| product_id | text | Y | | 微信虚拟支付商品 ID；写入来源除 000003 种子外，还有 deploy.sh 迁移后按环境变量回填 `UPDATE vips SET product_id=…`（month/year 两行） |
 | sort | integer | N | default 0 | |
 | is_active | boolean | N | default true；索引 idx_vips_is_active | |
 | prices | jsonb | N | default '[]' | |
@@ -226,6 +227,8 @@
 
 索引：idx_user_vip_claims_user_created、idx_user_vip_claims_vip_id、**uq_user_vip_claims_open_id_vip_id**（部分唯一 `(open_id, vip_id) WHERE open_id IS NOT NULL`）。
 
+> 防重链路依赖 PostgreSQL「UNIQUE 约束对 NULL 不判重」：墓碑行 `user_id` 为 NULL 时 `UNIQUE(user_id,vip_id)` 不生效，防重完全由 open_id 部分唯一索引承担（openid 也为空的行无防重锚点——当前注册路径 openid 恒非空）。
+
 ### 3.13 orders（支付订单）
 
 | 字段 | 类型 | NULL | 默认 / 约束 | 说明 |
@@ -237,8 +240,7 @@
 | channel | text | N | CHECK = 'virtual_pay' | 仅微信虚拟支付 |
 | state | text | N | default 'pending'；CHECK pending/paid/closed | |
 | amount | integer | N | CHECK > 0 | 单位分 |
-| prepay_id | text | Y | CHECK length <= 128 | （预留：后端不访问微信下单，当前无写入点，恒 NULL） |
-| transaction_id | text | Y | UNIQUE orders_transaction_id_key + 部分唯一 uq_orders_transaction_id_not_null；CHECK length <= 128 | 微信支付单号，幂等键 |
+| transaction_id | text | Y | UNIQUE orders_transaction_id_key（000012 摘除冗余部分唯一 uq_orders_transaction_id_not_null）；CHECK length <= 128 | 微信支付单号，幂等键 |
 | paid_at | timestamptz | Y | | |
 | created_at | timestamptz | N | now() | |
 | updated_at | timestamptz | N | now() | |
@@ -270,6 +272,8 @@
 | updated_at | timestamptz | N | now() | |
 
 主键 (user_id, quota_date)；索引 idx_ai_daily_quota_usage_date。无 FK 到 users，删除用户需依赖应用层清理（见 §4.1）。
+>
+> 保留策略豁免：不设清理任务——每用户每日至多 1 行、量级=用户数×保留期，属微表；注销用户由应用层清理。量级显著增长时挂入既有 cleanup_ai_logs 任务即可。
 
 ### 3.16 api_keys（MCP API Key）
 
@@ -320,8 +324,8 @@
 | user_id | text | N | PK；FK users(id) ON DELETE CASCADE | |
 | short_code | text | N | UNIQUE user_invite_codes_short_code_key；索引 idx_user_invite_codes_short_code_lookup | 8 位大写字母数字（去易混字符） |
 | created_at | timestamptz | N | now() | |
-| expires_at | timestamptz | Y | | |
-| used_at | timestamptz | Y | | |
+| expires_at | timestamptz | Y | | 预留：当前无写入点，恒 NULL（读取过滤 `expires_at IS NULL OR > now()` 恒真） |
+| used_at | timestamptz | Y | | 预留：`/invite/resolve` 已转纯读（不写 used_at），当前无写入点（见 02d F-9） |
 
 ### 3.20 wx_mp_accounts（公众号账号绑定）
 
@@ -379,7 +383,7 @@
 
 > 保留策略：仅保留 30 天，由后台任务 `cleanup_client_ops_logs` 定期删除（任务总数 10）。
 >
-> 全库保留窗口汇总：ai_dialog_logs 90 天、auto_record_trajectories 7 天、client_ops_logs 30 天；孤儿文件扫描窗口为图片创建超 1 天且无引用、系统文件创建/更新均超 7 天且无封面引用、无 `user_avatar_markers.marker_path` 引用（file.sql ScanOrphanFiles / ScanOldSystemFiles）。
+> 全库保留窗口汇总：ai_dialog_logs 90 天、auto_record_trajectories 7 天、client_ops_logs 30 天；孤儿文件扫描窗口为图片创建超 7 天且无引用、系统文件创建/更新均超 7 天且无封面引用、无 `user_avatar_markers.marker_path` 引用（file.sql ScanOrphanFiles / ScanOldSystemFiles；图片与系统文件统一 7 天宽限窗）。
 
 ## 4. 数据归属说明
 
@@ -392,7 +396,7 @@
 | diary_entries | created_by | users(id) CASCADE | 级联删 |
 | memories | user_id | users(id) CASCADE | 级联删 |
 | user_vips | user_id | users(id) CASCADE | 级联删 |
-| user_vip_claims | user_id（可空） | users(id) SET NULL（000008） | 置空保留墓碑行 |
+| user_vip_claims | user_id（可空） | users(id) SET NULL（000008；NOT NULL 放开由 000010 补齐，见 §7） | 置空保留墓碑行 |
 | api_keys | user_id | users(id) CASCADE | 级联删 |
 | auto_record_trajectories | user_id | users(id) CASCADE | 级联删 |
 | ai_dialog_logs | user_id | users(id) CASCADE | 级联删 |
@@ -450,11 +454,11 @@
 
     closed --(支付回调补记)--> paid    (MarkClosedOrderPaid，补发 VIP)
 
-- 只有 pending 可被 CloseOrder 关闭；已 closed/paid 的并发 cancel 返回 200（payment/handler.go:125-152）。
+- 只有 pending 可被 CloseOrder 关闭；已 closed/paid 的并发 cancel 返回 200（payment/handler.go `Cancel`）。
 - 已 closed 订单收到支付回调时由 `MarkClosedOrderPaid` 补记为 paid 并补发（payment/service.go `handleNotify`）。
 - 后台关单（24h 未支付）`runOrderClose`：先用 `CloseOwnerlessPendingOrders` 循环关闭 `user_id IS NULL` 的无主 pending 订单（每批 ≤1000），再按 `id ASC` 游标分批关闭有主 pending 订单（jobs/runner.go `runOrderClose`）。
 - 创建新订单前 `ClosePendingOrdersByUserAndVIP` 会先关闭同用户同 VIP、创建超 5 分钟的 pending 单（order.sql），防止重复挂单。
-- 支付回调以 transaction_id 唯一约束保证幂等（orders_transaction_id_key + 部分唯一索引）。
+- 支付回调以 transaction_id 唯一约束保证幂等（orders_transaction_id_key；000012 前另有部分唯一索引 uq_orders_transaction_id_not_null，已随 000012 摘除）。
 
 ### 5.3 状态机：家庭 / 成员
 
@@ -468,7 +472,7 @@
 - **无软删除**：所有表均为物理删除，无 deleted_at / is_deleted。
 - 删除用户走 family.DeleteAccount 事务 + 后台清理；orders.user_id 与 files.created_by 因 SET NULL 而保留孤儿记录。
 - ai_daily_quota_usage、user_common_addresses 无 FK，用户删除后需应用层显式清理（见 §4.1）。
-- 注销事务除 FK 级联外还**显式执行** NullifyOrdersByUser、DeleteAPIKeyByUser、DeleteUserInviteCodeByUserID（family/service.go:822-830）——api_keys/邀请码的清理不单靠 CASCADE。
+- 注销事务除 FK 级联外还**显式执行** NullifyOrdersByUser、DeleteAPIKeyByUser、DeleteUserInviteCodeByUserID、DeleteUserCommonAddresses、DeleteAIDailyQuotaUsageByUserID（`family/service.go DeleteAccount`）——api_keys/邀请码的清理不单靠 CASCADE；后两项即 §4.1 所述两张无 FK 表的应用层清理点。
 
 ### 5.5 并发控制（DB/Redis 侧一览，详见各 L2 分册）
 
@@ -477,14 +481,13 @@
 | PG session 级 advisory lock（迁移互斥） | 常量 `0x6d6967726174696f`（ASCII "migratio"） | internal/migration/migrate.go |
 | PG advisory try lock / unlock（业务互斥，无 TTL） | `hashtextextended("lock:family:{id}" / "lock:delete_account:{uid}" / "lock:auto_record:{uid}" / "lock:background:{task}" / "lock:covers:{family}:{date}" 等)` | internal/db/advisory_lock.go + 各域 |
 | PG 事务级 advisory lock | `hashtext('inviter_reward:' || inviterID)` | db/sqlc/invite.sql |
-| Redis SETNX（去重/节流/幂等标记，非互斥锁） | `wxmp:msgid:{msgID}`（60s）、`lock:covers:refresh:{familyID}:{date}`（30s）、AI turn key | wxmp、diary、ai 各域 |
+| Redis SETNX（去重/节流/幂等标记，非互斥锁） | `wxmp:msgid:{msgID}`（300s，覆盖微信重试窗口）、`lock:covers:refresh:{familyID}:{date}`（30s）、AI turn key | wxmp、diary、ai 各域 |
 
 ## 6. 索引与约束要点
 
 - users 其他索引：idx_users_avatar_file_id（avatar_file_id 非空部分索引）、idx_users_personal_family（personal_family_id）。
 - 部分索引（含部分唯一索引）：
   - idx_users_phone_number、idx_users_unionid、idx_wx_mp_accounts_unionid（仅非空值唯一）。
-  - uq_orders_transaction_id_not_null（transaction_id 非空且非空串时唯一）。
   - idx_orders_null_user（user_id IS NULL）。
   - idx_orders_pending_created_at（state='pending'）。
   - idx_family_daily_covers_cover_file_id / manual_cover_file_id。
@@ -496,33 +499,38 @@
 - 延迟约束：uq_family_members_user_id UNIQUE DEFERRABLE INITIALLY DEFERRED。
 - 函数与触发器：fix_cover_type_on_null_fk() + trg_family_daily_covers_fix_type（000002 重定义函数体）。
 
-## 7. 迁移变更记录（000001 ~ 000011）
+## 7. 迁移清单（000001 ~ 000014）
+
+> 000001 ~ 000014 已全部应用。
 
 | 编号 | 文件 | 变更 | down 行为 | 可逆性 |
 |------|------|------|-----------|--------|
-| 000001 | 000001_baseline.up.sql / .down.sql | 合并基线（2026-08-15）：将历史 000001-000020 squash 为单一 baseline，内容以生产库 pg_dump --schema-only 为准。创建 23 张表（含 sys_configs）、1 个函数 fix_cover_type_on_null_fk、1 个触发器、全部主键/唯一约束/索引/外键；不含 schema_migrations | DROP SCHEMA public CASCADE; CREATE SCHEMA public | 破坏性（清空整库），仅用于全新环境 |
+| 000001 | 000001_baseline.up.sql / .down.sql | 合并基线（squash 产物，仓库无更早迁移文件）：内容以生产库 pg_dump --schema-only 为准。创建 23 张表（含 sys_configs）、1 个函数 fix_cover_type_on_null_fk、1 个触发器、全部主键/唯一约束/索引/外键；不含 schema_migrations | DROP SCHEMA public CASCADE; CREATE SCHEMA public | 破坏性（清空整库），仅用于全新环境 |
 | 000002 | 000002_fix_cover_trigger_preserve_file_id.up.sql / .down.sql | CREATE OR REPLACE FUNCTION fix_cover_type_on_null_fk：manual→default 回退时保留 cover_file_id。注：baseline 的函数体已含相同保留逻辑，全新环境按序执行 000001→000002 时本迁移为 no-op；仅对 squash 前的存量库有实际差异 | 恢复旧函数体（manual→default 时清空 cover_file_id） | 可逆 |
 | 000003 | 000003_seed.up.sql / .down.sql | 种子数据：INSERT sys_configs('default')（ai_config model=deepseek-v4-flash、baseUrl=https://api.deepseek.com；sys_config 默认封面/轨迹图标/头像/文件基址；ai_prompt 系统提示词）；INSERT 4 个 vips（vip-trial-0001 trial/day/7、vip-free-0001 free/day/30、vip-month-0001 month/month/1 product_id=month_vip 价格 600/原价 1200、vip-year-0001 year/year/1 product_id=year_vip 价格 6000/原价 12000）。全部 ON CONFLICT DO NOTHING | DELETE 上述 vips 与 sys_configs('default')（有业务数据时慎用） | 可逆但会丢种子 |
 | 000004 | 000004_client_ops_logs.up.sql / .down.sql | CREATE TABLE IF NOT EXISTS client_ops_logs + 索引 idx_client_ops_logs_user_created | DROP TABLE IF EXISTS client_ops_logs | 可逆 |
 | 000005 | 000005_trajectory_idempotency.up.sql / .down.sql | 轨迹上报幂等：清理历史重复后建唯一索引 uq_auto_record_trajectories_point (user_id, recorded_at, lat, lon) | DROP INDEX IF EXISTS uq_auto_record_trajectories_point | 可逆 |
 | 000006 | 000006_drop_sys_configs.up.sql / .down.sql | 删除 `sys_configs` 表：配置改为环境变量（见 `ARCHITECTURE-INVARIANTS.md` §5） | 仅重建表结构（不回填种子；回滚到读 sys_configs 的旧代码前需按 000003 手工回填种子行） | 可逆 |
-| 000007 | 000007_enable_pg_stat_statements.up.sql / .down.sql | 创建 `pg_stat_statements` 扩展（供 `scripts/sql-top.sh` 慢 SQL 榜单） | 无表/数据变更；需 postgres command 含 `shared_preload_libraries`（deploy.sh 渲染）才有统计数据，扩展本身无前置 | 可逆 |
-| 000008 | 000008_vip_claim_openid_guard.up.sql / .down.sql | 注销循环权益收口（评审定稿）：`user_vip_claims` 加 `open_id`（回填存量）+ 部分唯一索引 `(open_id, vip_id) WHERE open_id IS NOT NULL`；`user_invites` 加 `user_open_id`（回填）+ 部分唯一索引 `(user_open_id) WHERE reward_invitee_at IS NOT NULL`（历史重复标记保留最早一条）；两表 `user_id` FK 由 CASCADE 改 **SET NULL**（注销保留领取/邀请墓碑行，`user_invites.user_id` 同时放开 NOT NULL） | down 恢复 CASCADE + NOT NULL；若墓碑行已存在需先人工清理，否则 SET NOT NULL 失败 | 可逆（墓碑行存在时 down 需人工） |
+| 000007 | 000007_enable_pg_stat_statements.up.sql / .down.sql | 创建 `pg_stat_statements` 扩展（供 `scripts/sql-top.sh` 慢 SQL 榜单） | `DROP EXTENSION IF EXISTS pg_stat_statements`（无表/数据变更；需 postgres command 含 `shared_preload_libraries`（deploy.sh 渲染）才有统计数据，扩展本身无前置） | 可逆 |
+| 000008 | 000008_vip_claim_openid_guard.up.sql / .down.sql | 注销循环权益收口：`user_vip_claims` 加 `open_id`（回填存量）+ 部分唯一索引 `(open_id, vip_id) WHERE open_id IS NOT NULL`；`user_invites` 加 `user_open_id`（回填）+ 部分唯一索引 `(user_open_id) WHERE reward_invitee_at IS NOT NULL`（历史重复标记保留最早一条）；两表 `user_id` FK 由 CASCADE 改 **SET NULL**（注销保留领取/邀请墓碑行，`user_invites.user_id` 同时放开 NOT NULL） | down 恢复 CASCADE（仅 `user_invites` 侧另执行 `SET NOT NULL`——该表墓碑行已存在时失败需先人工清理；`user_vip_claims` 侧无此步骤，其 NOT NULL 放开由 000010 承担） | 可逆（user_invites 墓碑行存在时 down 需人工） |
 | 000009 | 000009_family_covers_fk.up.sql / .down.sql | `family_daily_covers.family_id` 补外键（先防御性清孤儿行，`ON DELETE CASCADE`） | down 仅移除约束；CASCADE 已删行不恢复 | 可逆 |
-| 000010 | 000010_user_vip_claims_user_id_nullable.up.sql / .down.sql | 补 000008 遗漏：`user_vip_claims.user_id` DROP NOT NULL（否则注销触发 23502、领取墓碑行无法保留；逐文件扫描发现） | down 恢复 NOT NULL；若墓碑行已存在需先人工清理 | 可逆（墓碑行存在时 down 需人工） |
-| 000011 | 000011_user_invites_inviter_set_null.up.sql / .down.sql | `user_invites.inviter_id` FK CASCADE→SET NULL（列改可空）：被邀请奖励墓碑行与邀请人存续解耦，邀请人注销不再连带删除、「终身一次」持续成立（第三方评审发现） | down 先人工清理 `inviter_id IS NULL` 行再恢复 NOT NULL + CASCADE | 可逆（需人工清理墓碑行） |
+| 000010 | 000010_user_vip_claims_user_id_nullable.up.sql / .down.sql | 补 000008 遗漏：`user_vip_claims.user_id` DROP NOT NULL（否则注销触发 23502、领取墓碑行无法保留） | down 恢复 NOT NULL；若墓碑行已存在需先人工清理 | 可逆（墓碑行存在时 down 需人工） |
+| 000011 | 000011_user_invites_inviter_set_null.up.sql / .down.sql | `user_invites.inviter_id` FK CASCADE→SET NULL（列改可空）：被邀请奖励墓碑行与邀请人存续解耦，邀请人注销不再连带删除、「终身一次」持续成立 | down 先人工清理 `inviter_id IS NULL` 行再恢复 NOT NULL + CASCADE | 可逆（需人工清理墓碑行） |
+| 000012 | 000012_drop_dead_order_structures.up.sql / .down.sql | schema 卫生：DROP 冗余部分唯一索引 `uq_orders_transaction_id_not_null`（与 `orders_transaction_id_key` 约束同列完全覆盖）；DROP `orders.prepay_id`（无写入点恒 NULL，微信上游 DTO 不落库）；sqlc 摘除无调用的 `DeleteExpiredAPIKeys` 查询 | down 恢复 prepay_id 列（text 可空）、连带重建 `orders_prepay_id_check`（DROP COLUMN 自动删除仅引用该列的表级 CHECK）并按 000001 原定义重建条件唯一索引 | 可逆 |
+| 000013 | 000013_user_invite_codes_permanent.up.sql / .down.sql | 个人邀请短码转永久：存量行 `expires_at` 置 NULL（短码为用户稳定分享标识，不再过期；与 000008/000011 的 openid 墓碑语义一致） | down 为有说明的 no-op（无法回填旧过期语义） | — | |
+| 000014 | 000014_family_removed_members_cooldown.up.sql / .down.sql | `families` 加 `removed_members` jsonb（默认 `'{}'`，`{userID: 移除时间 RFC3339}`）——移除冷却（ADR-0019） | drop 该列 | 可逆 |
 
 并行撞号规则（spec-standards 第六节）：同号不同名允许（slug 全局唯一），改同一张表需 rebase 确认顺序。
 
 ## 8. 迁移变更流程
 
-1. 分配迁移号：取 backend/migrations/ 当前最大 +1，命名 NNN_<slug>.up.sql / .down.sql。
+1. 分配迁移号：取 backend/migrations/ 当前最大 +1，命名 NNNNNN_<slug>.up.sql / .down.sql（6 位编号，与 spec-check.sh 校验一致）。
 2. down 可逆性：不可逆操作在文件头声明「不可逆：<原因>」。
 3. 同步 L4 文档：同次提交回写本文件第 3 节字段定义与第 7 节变更记录。
-4. 机械校验：scripts/spec-check.sh 比对 migrations 编号与 L4 文档登记（spec-standards 第九节阻断级 4）。
+4. 机械校验：scripts/spec-check.sh 比对 migrations 编号与 L4 文档登记（spec-standards §八 阻断级 4）。
 5. 改 sqlc SQL 后必须 make sqlc-generate + make check-sqlc-sync。
-6. 部署顺序：先 migration 后代码。生产回滚**不以 down migration 为常规手段**：新代码有问题时回滚旧代码 + 用部署前备份恢复数据库；结构变更采用 expand → 兼容旧代码 → contract。`down` 脚本手工使用仅限本地/全新环境。唯一例外：deploy.sh **部署失败窗口内**的自动 `migrate goto/down`——它与旧代码/旧配置成对回退，是原子部署回滚的一部分，不作为数据回退手段。
+6. 部署顺序：先 migration 后代码。生产回滚**不以 down migration 为常规手段**：新代码有问题时回滚旧代码 + 用部署前备份恢复数据库；结构变更采用 expand → 兼容旧代码 → contract。`down` 脚本手工使用仅限本地/全新环境。唯一例外：deploy.sh **部署失败窗口内**的自动 `migrate goto/down`——它与旧代码/旧配置成对回退，是原子部署回滚的一部分，不作为数据回退手段。窗口内 down 自身失败（含不可逆迁移）**不阻断回滚**：仅输出警告，继续恢复 `.env`/nginx/override/migrations/compose 的 `.prev` 快照并重建旧容器——系统停留在「旧代码 + 新 schema」——其可运行性**仅在本次部署的迁移相对旧代码为 expand-only 时成立**（contract 延迟到旧代码彻底下线后的后续部署是回滚安全性的硬纪律，见 spec-standards §五；若某次部署迁移已含 contract DDL 且窗口内 down 失败，旧代码将面对缺列 schema 报错，此时唯一出路是 `scripts/restore-backup.sh` 恢复部署前备份），人工处置=评估后恢复部署前备份或补跑 down。大表 DDL 当前无 CONCURRENTLY 约定——数据量小的现状下可容忍；表规模增长后新迁移须采用非阻塞 DDL 并在 rehearse-migration 验证锁时长。
 
-环境相关：DEPLOYMENT_MODE=open 时应用启动自动执行未应用迁移（main.go:107-115）；SaaS 由 deploy/deploy.sh 显式控制迁移时机。注意两套迁移记账**同名不同构、不可混用**：open 启动器自建 `schema_migrations(version TEXT PK, applied_at)`，而 golang-migrate CLI 使用 `schema_migrations(version BIGINT, dirty)`——同一数据库只能用其中一种机制管理迁移（migration/migrate.go:35-45）。
+环境相关：DEPLOYMENT_MODE=open 时应用启动自动执行未应用迁移（cmd/server/main.go `run` open 分支）；SaaS 由 deploy/deploy.sh 显式控制迁移时机。注意两套迁移记账**同名不同构、不可混用**：open 启动器自建 `schema_migrations(version TEXT PK, applied_at)`，而 golang-migrate CLI 使用 `schema_migrations(version BIGINT, dirty)`——同一数据库只能用其中一种机制管理迁移（migration/migrate.go `Run`）。
 
 

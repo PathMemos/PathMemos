@@ -1,8 +1,9 @@
 {
   "miniVersion": "v2",
-  "name": "pathmemos",
-  "version": "0.0.1",
-  "versionCode": 100,
+  "miniModuleId": "wx17450acc0bfb40f7",
+  "name": "%name%",
+  "version": "0.0.55",
+  "versionCode": 159,
   "i18nFilePath": "i18n",
   "mini-ohos": {
     "sdkVersion": "0.5.1"
@@ -12,11 +13,28 @@
     "sdkVersion": "1.7.0",
     "toolkitVersion": "0.11.0",
     "useExtendedSdk": {
-      "media": false,
+      "media": true,
       "bluetooth": false,
       "network": false,
       "scanner": false,
-      "xweb": false
+      "xweb": false,
+      "lbs": true
+    },
+    "permissions": [
+      "android.permission.ACCESS_BACKGROUND_LOCATION"
+    ],
+    "uselessPermissions": [
+      "android.permission.BLUETOOTH",
+      "android.permission.BLUETOOTH_ADMIN",
+      "android.permission.RECORD_AUDIO"
+    ],
+    "privateDescriptions": {
+      "ACCESS_FINE_LOCATION": "申请精确定位权限用于记录日记位置与后台自动记录轨迹",
+      "ACCESS_COARSE_LOCATION": "申请粗略定位权限用于记录日记位置与后台自动记录轨迹",
+      "ACCESS_BACKGROUND_LOCATION": "申请后台定位权限用于在后台自动记录行走轨迹",
+      "CAMERA": "申请相机权限用于拍摄照片添加到日记",
+      "WRITE_EXTERNAL_STORAGE": "申请存储权限用于保存日记封面与分享图片",
+      "READ_EXTERNAL_STORAGE": "申请存储权限用于读取图片上传到日记"
     },
     "icons": {
       "hdpi": "resources/android/icon-hdpi.png",
@@ -25,13 +43,21 @@
       "xxxhdpi": "resources/android/icon-xxxhdpi.png"
     },
     "splashscreen": {
-      "hdpi": "resources/android/splash-hdpi.png",
-      "xhdpi": "resources/android/splash-xhdpi.png",
-      "xxhdpi": "resources/android/splash-xxhdpi.png"
+      "hdpi": "",
+      "xhdpi": "",
+      "xxhdpi": ""
     },
     "enableVConsole": "close",
     "privacy": {
-      "enable": true
+      "enable": true,
+      "template": "miniapp-privacy.json"
+    },
+    "qmapAPIKey": "KO4BZ-VYPWW-23XRV-YWDLS-ZOALZ-53BTC",
+    "usePluginSdk": {
+      "map": "1.2.7"
+    },
+    "map": {
+      "qmapAPIKey": "KO4BZ-VYPWW-23XRV-YWDLS-ZOALZ-53BTC"
     }
   },
   "mini-ios": {
@@ -58,11 +84,12 @@
       "appStore1024": "resources/ios/icon-appStore1024.png"
     },
     "splashScreen": {
-      "customImage": "resources/ios/splash.png"
+      "customImage": ""
     },
     "privacy": {
       "enable": true
     },
-    "enableOpenUrlNavigate": true
+    "enableOpenUrlNavigate": true,
+    "qmapAPIKey": "KO4BZ-VYPWW-23XRV-YWDLS-ZOALZ-53BTC"
   }
 }

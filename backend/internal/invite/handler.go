@@ -80,9 +80,15 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 
 	items := make([]map[string]interface{}, 0, len(rows))
 	for _, row := range rows {
+		// 受邀人注销（user_id 置 NULL，000011）的行：昵称/头像无归属，
+		// 以"已注销"占位展示，关系记录保留在邀请人列表中。
+		nickName := "已注销"
+		if row.Nickname.Valid {
+			nickName = row.Nickname.String
+		}
 		items = append(items, map[string]interface{}{
-			"userId":    row.UserID,
-			"nickName":  util.ToInterface(row.Nickname),
+			"userId":    util.ToInterface(row.UserID),
+			"nickName":  nickName,
 			"avatarUrl": util.ToInterface(row.Avatar),
 			"joined":    row.Joined.Valid && row.Joined.Bool,
 		})
@@ -105,12 +111,12 @@ func (h *Handler) QRCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var url string
+	var qr InviteQR
 	var err error
 	if req.Raw {
-		url, err = h.qrGenerator.GenerateRaw(ctx, h.rdb, userID)
+		qr, err = h.qrGenerator.GenerateRaw(ctx, h.rdb, userID)
 	} else {
-		url, err = h.qrGenerator.Generate(ctx, h.rdb, userID)
+		qr, err = h.qrGenerator.Generate(ctx, h.rdb, userID)
 	}
 	if err != nil {
 		if ctx.Err() != nil {
@@ -127,7 +133,8 @@ func (h *Handler) QRCode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	middleware.JSON(w, r, http.StatusOK, map[string]interface{}{
-		"url": url,
+		"url":      qr.URL,
+		"thumbUrl": qr.ThumbURL,
 	})
 }
 

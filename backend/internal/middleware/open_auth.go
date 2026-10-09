@@ -30,7 +30,7 @@ type OpenAuthMiddleware struct {
 	sessions        *SessionManager
 	pool            *db.Pool
 	expectedKeyHash string
-	// B6a-09：连续失败计数——达到阈值才延时，避免每次失败都占用请求 goroutine 500ms。
+	// 连续失败计数——达到阈值才延时，避免每次失败都占用请求 goroutine 500ms。
 	failCount atomic.Int32
 }
 
@@ -81,7 +81,7 @@ func (m *OpenAuthMiddleware) Handler(next http.Handler) http.Handler {
 				if err != nil && !stderrors.Is(err, pgx.ErrNoRows) {
 					slog.Warn("open api key lookup failed", slog.Any("error", err))
 				}
-				// B6a-09：连续失败达到阈值才延时，压低暴力穷举速率且不拖慢偶发错误请求。
+				// 连续失败达到阈值才延时，压低暴力穷举速率且不拖慢偶发错误请求。
 				if m.failCount.Add(1) >= 3 {
 					time.Sleep(500 * time.Millisecond)
 					m.failCount.Store(0)

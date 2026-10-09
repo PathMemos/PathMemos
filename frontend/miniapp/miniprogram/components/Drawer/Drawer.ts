@@ -40,7 +40,7 @@ Component({
       const { bottomSafeHeight } = info;
       const safeHeight = info.windowHeight || info.safeArea?.height || 0;
       (this as any)._safeAreaHeight = safeHeight;
-      // 回归修复（R2-F12 回滚）：initMainHeight 若为无单位数字（如 "320"），
+      // initMainHeight 若为无单位数字（如 "320"），
       // 原样拼接会让 height 声明无效而被渲染器忽略、回退为 CSS 默认高度——
       // 强制补 px 反而会覆盖默认高度导致抽屉布局错乱。保持原始行为。
       const height = this.data.initMainHeight || `${Math.floor(safeHeight * 0.8)}px`;
@@ -63,7 +63,7 @@ Component({
       const now = Date.now();
       if ((this as any)._lastTouchMoveAt && now - (this as any)._lastTouchMoveAt < 16) return;
       (this as any)._lastTouchMoveAt = now;
-      // R2-F07：优先使用缓存的 _safeAreaHeight，未缓存时才调用 getSystemInfo。
+      // 优先使用缓存的 _safeAreaHeight，未缓存时才调用 getSystemInfo。
       let safeAreaHeight = (this as any)._safeAreaHeight;
       if (!safeAreaHeight) {
         const sysInfo = getSystemInfo();

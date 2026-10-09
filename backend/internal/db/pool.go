@@ -65,7 +65,7 @@ func WithTxDeferrable(ctx context.Context, pool TxBeginner, fn TxFn) error {
 		lastErr = err
 		time.Sleep(retryBackoff)
 	}
-	return fmt.Errorf("deferrable tx failed after %d retries: %w", maxRetries, lastErr)
+	return fmt.Errorf("deferrable tx failed after %d attempts: %w", maxRetries, lastErr)
 }
 
 func runTxDeferrableOnce(ctx context.Context, pool TxBeginner, fn TxFn) error {

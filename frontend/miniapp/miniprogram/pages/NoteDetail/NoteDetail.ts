@@ -6,7 +6,8 @@ import { logger } from '../../utils/logger';
 import themeBehavior from '../../behaviors/theme';
 import i18nBehavior from '../../behaviors/i18n';
 import { i18n } from '../../utils/i18n';
-import { generateShareImage, ShareData } from './shareCanvas';
+import { opsLog, flushOpsLog } from '../../utils/opslog';
+import { ensureThumbUnderLimit, toUserPath } from '../../utils/appShare';
 
 function extractFamilyId(virtualID: string): string {
   const m = virtualID?.match(/^family:([^:]+):date:/);
@@ -236,7 +237,7 @@ Page({
     this._isDestroyed = true;
     (this as any)._loggingIn = false;
     if (this._coverPollTimer) {
-      clearInterval(this._coverPollTimer);
+      clearTimeout(this._coverPollTimer);
       this._coverPollTimer = null;
     }
     if ((this as any)._coverPollFallbackTimer) {
@@ -401,7 +402,9 @@ Page({
       if (didShowLoading && !this._isDestroyed && !this._isHidden) wx.hideLoading();
     } catch (e: any) {
       if (e?.message === 'request:abort') {
-        this._safeSetData({ _loading: false });
+        // abort（onHide 取消在途 loadMore）同样要回退页码：fetch 开始即已写入目标页，
+        // 不回退会让下次 loadMore 跳过该页造成整页条目丢失。
+        this._safeSetData({ _loading: false, page: Math.max(1, page - 1) });
         if (didShowLoading && !this._isDestroyed && !this._isHidden) wx.hideLoading();
         return;
       }
@@ -625,8 +628,12 @@ Page({
     return ok;
   },
 
-  async reloadAfterEdit() {
+  async reloadAfterEdit(e?: any) {
     if (this._isDestroyed) return;
+    // 编辑改了日期 → 后端已把条目迁移到目标日期；本页（源日期）reload 后条目消失，提示去向。
+    // 仅编辑（isUpdate）且日期变化才算迁移；页内「添加」新建时选了别的日期是正常创建，不提示。
+    const movedDate: string = e?.detail?.recordDate || '';
+    const moved = e?.detail?.isUpdate === true && !!movedDate && movedDate !== this.data.baseInfo.recordDate;
     (getApp() as any).globalData._needRefreshIndexList = true;
     if (this._isHidden) {
       (this as any)._needReloadOnShow = true;
@@ -634,13 +641,24 @@ Page({
     }
     const ok = await this.reload();
     if (!ok) return;
+    if (moved) {
+      const d = safeDayjs(movedDate);
+      if (d) {
+        wx.showToast({
+          title: i18n.t('noteDetail.entryMoved', { year: d.year(), month: d.month() + 1, day: d.date() }),
+          icon: 'none',
+          duration: 2000,
+        });
+      }
+    }
     this._startCoverPolling();
-    // 存待轮询数据，首页 onShow 时直接启动封面轮询
-    const recordDate = this.data.baseInfo.recordDate;
-    const cardID = this.data.baseInfo.id;
+    // 存待轮询数据，首页 onShow 时直接启动封面轮询。本页 _startCoverPolling 轮询的仍是本页
+    // （源）日期封面；_pendingCoverPoll 指向条目现所在日期（跨天迁移/新建选日期时即目标日期）。
+    const recordDate = movedDate || this.data.baseInfo.recordDate;
+    const cardID = (e?.detail?.card?.id as string) || this.data.baseInfo.id;
     (getApp() as any).globalData._pendingCoverPoll = { recordDate, cardID };
     // 10s 兜底清理：用户可能不返回首页（切后台/杀进程/跳其他页）。
-    // F4-11：句柄必须保存并在二次编辑/销毁时先清掉旧定时器，否则旧句柄到期会
+    // 句柄必须保存并在二次编辑/销毁时先清掉旧定时器，否则旧句柄到期会
     // 误删新编辑设置的 _pendingCoverPoll（同 recordDate 场景）。
     if ((this as any)._coverPollFallbackTimer) {
       clearTimeout((this as any)._coverPollFallbackTimer);
@@ -663,17 +681,17 @@ Page({
     const initialCover = baseInfo.coverImg;
     let polls = 0;
     if (this._coverPollTimer) clearTimeout(this._coverPollTimer);
-    // R2-F14：setTimeout 链式调度，弱网不并发叠加。
+    // setTimeout 链式调度，弱网不并发叠加。
     const tick = async () => {
       if (++polls > 12 || this._isDestroyed || this._isHidden) {
         this._coverPollTimer = null;
         return;
       }
       try {
-        // R3：封面轮询属后台请求，偶发 401 不踢登录态（由 catch 静默处理）。
+        // 封面轮询属后台请求，偶发 401 不踢登录态（由 catch 静默处理）。
         const res: any = await request.get('/diary/cover-url', { params: { familyId, recordDate } }, true, true);
         const newCover = res?.data?.coverImg;
-        // R2-F11：封面被清空（空串）同样视为变更，提前停止轮询。
+        // 封面被清空（空串）同样视为变更，提前停止轮询。
         if (newCover !== undefined && newCover !== initialCover) {
           this._safeSetData({ 'baseInfo.coverImg': newCover });
           (getApp() as any).globalData._needRefreshIndexList = true;
@@ -826,7 +844,7 @@ Page({
 
   _ensureQRCode() {
     if (this._isDestroyed || this._isHidden || this.data.qrCodeUrl || !this.data.isLogin) return;
-    // F4-10：生成进行中时复用同一个 in-flight Promise，避免分享点击等重复调用
+    // 生成进行中时复用同一个 in-flight Promise，避免分享点击等重复调用
     // 因 _generatingQR 早退而误报"二维码未生成"。
     if (this._qrPromise) return this._qrPromise;
     if (this._qrCancelToken) {
@@ -868,6 +886,58 @@ Page({
     }
   },
 
+  _buildShareCardRequest(qrCodeUrl: string) {
+    const d = this.data;
+    const daySuffix = i18n.t('noteDetail.daySuffix');
+    const hasName = !!d.baseInfo.dateName;
+    const fullDate = `${d.headerDate.yearMonth}${d.headerDate.day}${daySuffix}`;
+    // 展示串全部按当前 locale 在客户端格式化（服务端是纯「文本→像素」引擎），
+    // 契约见 backend/internal/sharecard/render.go ShareCardRequest。
+    const title = hasName
+      ? d.baseInfo.dateName
+      : i18n.t('noteDetail.shareTitleNoName', { yearMonth: d.headerDate.yearMonth, day: d.headerDate.day, daySuffix });
+    const subtitle = hasName
+      ? i18n.t('noteDetail.shareSubtitle', { date: fullDate, weekday: d.headerDate.weekDay })
+      : d.headerDate.weekDay;
+    const records = (d.filteredList || []).slice(0, 50).map((item: any) => ({
+      timeText: item.recordTime ? (item.recordTime.split(' ')[1] || '').slice(0, 5) : '',
+      memberName: item.familyMemberUserId && item.familyMemberUserId !== d.currentUserId ? item.familyMemberNickName || '' : '',
+      text: typeof item.recordText === 'string' ? item.recordText : '',
+      address: typeof item.diaryAddress === 'string' ? item.diaryAddress : '',
+      images: (item.recordImages || [])
+        .map((im: any) => im?.filePath || '')
+        .filter(Boolean)
+        .slice(0, 9),
+    }));
+    const memberPills = [i18n.t('noteDetail.shareAll'), ...(d.tabList || []).map((t: any) => t.nickName || '')].filter(Boolean);
+    return {
+      header: { title, subtitle },
+      brand: i18n.t('noteDetail.shareBrand'),
+      memberPills,
+      coverImg: d.baseInfo.coverImg || d.baseInfo.coverImage || '',
+      countLabel: i18n.t('noteDetail.shareCountLabel', { count: records.length }),
+      records,
+      emptyTitle: i18n.t('noteDetail.shareEmptyTitle'),
+      emptyTip: i18n.t('noteDetail.shareEmptyTip'),
+      slogan: i18n.t('noteDetail.shareSlogan'),
+      subSlogan: i18n.t('noteDetail.shareSubSlogan'),
+      qr: { url: qrCodeUrl, label: i18n.t('noteDetail.qrLabel') },
+    };
+  },
+
+  _downloadTemp(url: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      wx.downloadFile({
+        url,
+        success: (res: any) => {
+          if (res.statusCode === 200 && res.tempFilePath) resolve(res.tempFilePath);
+          else reject(new Error(`download fail: ${res.statusCode}`));
+        },
+        fail: (err: any) => reject(new Error(err?.errMsg || 'download fail')),
+      });
+    });
+  },
+
   async onShareMoment() {
     if (this._isDestroyed || this.data._generatingShare) return;
     this._safeSetData({ _generatingShare: true });
@@ -892,34 +962,91 @@ Page({
         this._safeSetData({ _generatingShare: false });
         return;
       }
-      const shareData: ShareData = {
-        baseInfo: this.data.baseInfo,
-        headerDate: this.data.headerDate,
-        tabList: this.data.tabList,
-        activeTabId: this.data.activeTabId,
-        filteredList: this.data.filteredList,
-        currentUserId: this.data.currentUserId,
-        qrCodeUrl,
-      };
-      const tempPath = await generateShareImage(this, shareData);
+      // 服务端出图（方案 A）：客户端不再走 canvas（Android 端 canvas 依赖 XWEB
+      // 扩展 SDK，是基座瘦身的唯一阻碍），两端下载同一张服务端渲染图。
+      const res = await request.post('/diary/share-card', { data: this._buildShareCardRequest(qrCodeUrl) }, false, 70000);
+      const posterUrl: string = res?.data?.poster || '';
+      const thumbUrl: string = res?.data?.thumb || '';
+      if (!posterUrl) throw new Error('empty poster url');
+      const posterPath = await this._downloadTemp(posterUrl);
+      let thumbPath = posterPath;
+      if (thumbUrl && thumbUrl !== posterUrl) {
+        try {
+          thumbPath = await this._downloadTemp(thumbUrl);
+        } catch {
+          thumbPath = posterPath; // 缩略图失败回退原图，客户端 ensureThumb 仍可压到 64KB 内
+        }
+      }
       if (this._isDestroyed || this._isHidden) {
         wx.hideLoading();
         return;
       }
       wx.hideLoading();
+      // 多端 App：showShareImageMenu 不支持（SDK 暂不支持此 API），走官方
+      // wx.miniapp.shareImageMessage（需 OpenSDK，图片+缩略图+场景）。
+      // E-3 分享前预览：小程序 showShareImageMenu 自带原生预览，App 补
+      // previewImage 全屏预览 + 确认弹窗，对齐小程序体验。
+      if ((wx as any).miniapp) {
+        await new Promise<void>((resolve) => {
+          wx.previewImage({ urls: [posterPath], complete: () => resolve() });
+        });
+        if (this._isDestroyed || this._isHidden) return;
+        const confirmed = await new Promise<boolean>((resolve) => {
+          wx.showModal({
+            title: (this as any).$t('noteDetail.shareConfirmTitle'),
+            success: (r: any) => resolve(!!r.confirm),
+            fail: () => resolve(false),
+          });
+        });
+        if (!confirmed) return;
+        const scene = await new Promise<number>((resolveSheet) => {
+          wx.showActionSheet({
+            itemList: [
+              (this as any).$t('noteDetail.shareToChat'),
+              (this as any).$t('noteDetail.shareToMoments'),
+              (this as any).$t('noteDetail.addToFavorite'),
+            ],
+            success: (res: any) => resolveSheet([0, 1, 2][res.tapIndex] ?? 0),
+            fail: () => resolveSheet(-1),
+          });
+        });
+        if (scene < 0) return; // 用户取消选择
+        // OpenSDK 缩略图 64KB 硬约束 + 朋友圈要求用户路径，见 utils/appShare。
+        const thumbLimited = await ensureThumbUnderLimit(thumbPath);
+        const imagePathShared = await toUserPath(posterPath, 'share-image.jpg');
+        const thumbShared = await toUserPath(thumbLimited, 'share-thumb.jpg');
+        (wx as any).miniapp.shareImageMessage({
+          imagePath: imagePathShared,
+          thumbPath: thumbShared,
+          scene,
+          success: () => wx.showToast({ title: (this as any).$t('invite.sharedOk'), icon: 'success' }),
+          fail: (err: any) => {
+            if (err?.errMsg?.includes('cancel')) return;
+            console.log('[share_diag] shareImageMessage fail:', JSON.stringify(err));
+            opsLog('share_diag', { step: 'share-fail', errMsg: err?.errMsg });
+            void flushOpsLog();
+            wx.showToast({ title: (this as any).$t('noteDetail.shareFail'), icon: 'none' });
+          },
+        });
+        return;
+      }
       wx.showShareImageMenu({
-        path: tempPath,
+        path: posterPath,
         success: () => {},
         fail: (err: any) => {
           if (err?.errMsg?.includes('cancel')) return;
           wx.showToast({ title: (this as any).$t('noteDetail.shareFail'), icon: 'none' });
         },
       });
-    } catch (e) {
+    } catch (e: any) {
       if (this._isDestroyed || this._isHidden) return;
       wx.hideLoading();
+      const detail = String(e?.message || e?.errMsg || e).slice(0, 80);
+      console.log('[share_diag] generate fail:', detail);
+      opsLog('share_diag', { step: 'generate-fail', errMsg: detail });
+      void flushOpsLog();
       logger.error('生成分享图失败', e);
-      wx.showToast({ title: (this as any).$t('noteDetail.generateFail'), icon: 'none' });
+      wx.showToast({ title: `${(this as any).$t('noteDetail.generateFail')}[${detail}]`, icon: 'none', duration: 3000 });
     } finally {
       this._safeSetData({ _generatingShare: false });
     }

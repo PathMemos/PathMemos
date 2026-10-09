@@ -2,7 +2,8 @@
  * miniprogram/config/index.ts 的 getBaseURL 模式判定单元测试。
  *
  * 事实源（当前实现）：
- * - envVersion=develop  → DEV_BASE_URL（本地联调）；
+ * - envVersion=develop 默认 → SAAS_BASE_URL（开发者工具联调线上；Storage 写
+ *   'dev_use_local_backend'=true 才回落 DEV_BASE_URL 本地联调）；
  * - envVersion=release 且 storage 'backend_mode'='private' → WORKER_BASE_URL（Cloudflare Worker 路由私有后端起）；
  * - 其余情况 → SaaS 源站 https://pro.papafeiji.cn。
  *
@@ -16,18 +17,24 @@ const SAAS_BASE_URL = 'https://pro.papafeiji.cn';
 const WORKER_BASE_URL = 'https://api.pathmemos.com';
 const DEV_BASE_URL = 'http://localhost:8080';
 const STORAGE_KEY_MODE = 'backend_mode';
+const DEV_LOCAL_KEY = 'dev_use_local_backend';
 
 function wx(): any {
   return (globalThis as any).wx;
 }
 
-async function loadConfig(envVersion: string, mode?: string) {
+async function loadConfig(envVersion: string, mode?: string, devLocal?: boolean) {
   const w = wx();
   w.getAccountInfoSync = () => ({ miniProgram: { appId: 'wxtest', envVersion } });
   if (mode === undefined) {
     w.removeStorageSync(STORAGE_KEY_MODE);
   } else {
     w.setStorageSync(STORAGE_KEY_MODE, mode);
+  }
+  if (devLocal === undefined) {
+    w.removeStorageSync(DEV_LOCAL_KEY);
+  } else {
+    w.setStorageSync(DEV_LOCAL_KEY, devLocal);
   }
   jest.resetModules();
   return await import('../miniprogram/config/index');
@@ -38,8 +45,14 @@ describe('config.getBaseURL 模式判定', () => {
     wx().getAccountInfoSync = () => ({ miniProgram: { appId: 'wxtest', envVersion: 'release' } });
   });
 
-  it('develop 环境恒用本地 DEV_BASE_URL（即使 mode=private）', async () => {
-    const config = await loadConfig('develop', 'private');
+  it('develop 默认走 SaaS 源站（开发者工具联调线上）', async () => {
+    const config = await loadConfig('develop');
+    expect(config.getBaseURL()).toBe(SAAS_BASE_URL);
+    expect(config.getSSEBaseURL()).toBe(SAAS_BASE_URL);
+  });
+
+  it('develop + dev_use_local_backend=true 回落本地 DEV_BASE_URL（即使 mode=private）', async () => {
+    const config = await loadConfig('develop', 'private', true);
     expect(config.getBaseURL()).toBe(DEV_BASE_URL);
     expect(config.getSSEBaseURL()).toBe(DEV_BASE_URL);
   });

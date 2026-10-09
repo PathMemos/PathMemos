@@ -3,6 +3,7 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -38,7 +39,7 @@ const (
 	lockPurgeDeletedObjects   = "lock:background:purge_deleted_objects"
 )
 
-// 任务运行观测（R-03）：Redis 记录最近成功/失败时间与连续失败次数；失联阈值为周期 × jobStaleMultiplier。
+// 任务运行观测：Redis 记录最近成功/失败时间与连续失败次数；失联阈值为周期 × jobStaleMultiplier。
 const (
 	jobLastSuccessPrefix = "job:last_success:"
 	jobLastFailurePrefix = "job:last_failure:"
@@ -51,7 +52,6 @@ const (
 const maxPurgeBatchesPerRun = 20
 
 type Runner struct {
-	pool        *db.Pool
 	bgPool      *db.Pool
 	lock        db.Locker
 	autoService *autorecord.Service
@@ -69,9 +69,8 @@ type Runner struct {
 	tickers     []*time.Ticker
 }
 
-func NewRunner(pool, bgPool *db.Pool, autoService *autorecord.Service, storage *file.Storage, pushService *push.Service, cfg *config.Config, purgeQueue *purge.Queue, purger *purge.Purger, rdb *redis.Client) *Runner {
+func NewRunner(bgPool *db.Pool, autoService *autorecord.Service, storage *file.Storage, pushService *push.Service, cfg *config.Config, purgeQueue *purge.Queue, purger *purge.Purger, rdb *redis.Client) *Runner {
 	return &Runner{
-		pool:        pool,
 		bgPool:      bgPool,
 		lock:        db.NewAdvisoryLock(bgPool.PGX()),
 		autoService: autoService,
@@ -106,7 +105,7 @@ func (r *Runner) Start(ctx context.Context) {
 	})
 }
 
-// jobSpec 描述一个后台任务；注册表同时用于调度、失联检测与人工补跑（R-03）。
+// jobSpec 描述一个后台任务；注册表同时用于调度、失联检测与人工补跑。
 type jobSpec struct {
 	name        string
 	interval    time.Duration
@@ -174,6 +173,11 @@ func (r *Runner) schedule(ctx context.Context, interval, maxDuration time.Durati
 	r.wg.Add(1)
 	safe.GoWithRecover(ctx, nil, func() error {
 		defer r.wg.Done()
+		// 重启饥饿保护：ticker 以容器启动为基准，任务间隔内若发生多次部署重启，
+		// 触发点被反复重置，任务可能无限期得不到执行（cleanup_trajectories 曾在
+		// 频繁发版日连饿 3 个周期、只剩 job_stale 告警）。启动时若最近一个应触发
+		// 时刻已过而此后无成功记录，立即补跑；advisory lock 保证双容器只有一个执行。
+		r.catchUpIfOverdue(ctx, jobName(lockKey), time.Now().Add(-interval), lockKey, maxDuration, fn)
 		for {
 			select {
 			case <-ctx.Done():
@@ -200,6 +204,35 @@ func (r *Runner) schedule(ctx context.Context, interval, maxDuration time.Durati
 	})
 }
 
+// lastSuccessTime 返回任务最近成功时间（recordJobSuccess 写入的 RFC3339 UTC）；无记录返回 false。
+func (r *Runner) lastSuccessTime(ctx context.Context, name string) (time.Time, bool) {
+	if r.rdb == nil {
+		return time.Time{}, false
+	}
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	val, err := r.rdb.Get(wctx, jobLastSuccessPrefix+name).Result()
+	if err != nil {
+		return time.Time{}, false
+	}
+	ts, err := time.Parse(time.RFC3339, val)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return ts, true
+}
+
+// catchUpIfOverdue：lastDue（最近一个应触发时刻）已过而此后无成功记录时立即补跑。
+// 无成功记录（新装、状态键丢失/过期）同样补跑一次——宁可多跑一次幂等任务，
+// 也不让任务在无人察觉的情况下停摆。
+func (r *Runner) catchUpIfOverdue(ctx context.Context, name string, lastDue time.Time, lockKey string, maxDuration time.Duration, fn func(context.Context) error) {
+	if last, ok := r.lastSuccessTime(ctx, name); ok && !last.Before(lastDue) {
+		return
+	}
+	slog.InfoContext(ctx, "job catch-up after restart", slog.String("task", name))
+	r.runTask(ctx, lockKey, maxDuration, fn)
+}
+
 // scheduleDailyAt 在每天指定时刻触发任务，首次会等待到下一个触发点。
 func (r *Runner) scheduleDailyAt(ctx context.Context, hour, min int, maxDuration time.Duration, lockKey string, fn func(context.Context) error) {
 	// 按上海时区计算触发点：容器时区常为 UTC，直接 now.Location() 会偏移 8 小时。
@@ -212,6 +245,10 @@ func (r *Runner) scheduleDailyAt(ctx context.Context, hour, min int, maxDuration
 	r.wg.Add(1)
 	safe.GoWithRecover(ctx, nil, func() error {
 		defer r.wg.Done()
+		// 重启饥饿保护：若「今天/昨晚的触发点」已过而无成功记录，启动即补跑。
+		// prev = 最近一个已过去的触发时刻（next 为未来时即昨天同时刻，next 已推进
+		// 到明天时即今天同时刻）。
+		r.catchUpIfOverdue(ctx, jobName(lockKey), next.Add(-24*time.Hour), lockKey, maxDuration, fn)
 		select {
 		case <-ctx.Done():
 			return nil
@@ -240,6 +277,14 @@ func (r *Runner) scheduleDailyAt(ctx context.Context, hour, min int, maxDuration
 					}()
 					r.runTask(ctx, lockKey, maxDuration, fn)
 				}()
+				// 按上海时区绝对时刻重算下一个触发点并 Reset：任务耗时（如 30 分钟的汇总）
+				// 不再通过固定 24h ticker 逐日累积漂移。
+				now := timeutil.NowShanghai()
+				next := time.Date(now.Year(), now.Month(), now.Day(), hour, min, 0, 0, timeutil.Shanghai)
+				for !next.After(now) {
+					next = next.Add(24 * time.Hour)
+				}
+				ticker.Reset(time.Until(next))
 			}
 		}
 	}, func(err error) {
@@ -262,6 +307,9 @@ func (r *Runner) runTask(ctx context.Context, lockKey string, maxDuration time.D
 			return
 		}
 		if !ok {
+			// 双容器同 tick 或补跑并发时另一容器已持锁：静默跳过会让任务停摆不可见
+			// 留 INFO 轨迹。
+			slog.InfoContext(ctx, "background job lock busy, skip", slog.String("task", jobName(lockKey)))
 			return
 		}
 		defer func() {
@@ -311,16 +359,16 @@ func KnownJobNames() []string {
 	}
 }
 
-// JobLastSuccessKey 返回任务最近成功时间的 Redis 键（R-03）。
+// JobLastSuccessKey 返回任务最近成功时间的 Redis 键。
 func JobLastSuccessKey(name string) string { return jobLastSuccessPrefix + name }
 
-// JobLastFailureKey 返回任务最近失败时间的 Redis 键（R-03）。
+// JobLastFailureKey 返回任务最近失败时间的 Redis 键。
 func JobLastFailureKey(name string) string { return jobLastFailurePrefix + name }
 
-// JobFailStreakKey 返回任务连续失败次数的 Redis 键（R-03）。
+// JobFailStreakKey 返回任务连续失败次数的 Redis 键。
 func JobFailStreakKey(name string) string { return jobFailStreakPrefix + name }
 
-// JobTriggerKey 返回人工补跑触发键（R-03）。
+// JobTriggerKey 返回人工补跑触发键。
 func JobTriggerKey(name string) string { return jobTriggerPrefix + name }
 
 func (r *Runner) recordJobSuccess(ctx context.Context, name string, elapsed time.Duration) {
@@ -354,7 +402,7 @@ func (r *Runner) recordJobFailure(ctx context.Context, name string, elapsed time
 	}
 }
 
-// watchJobHealth 每分钟检查任务失联（>3× 周期未成功）与人工补跑触发键（R-03）。
+// watchJobHealth 每分钟检查任务失联（>3× 周期未成功）与人工补跑触发键。
 func (r *Runner) watchJobHealth(ctx context.Context) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
@@ -456,7 +504,7 @@ func (r *Runner) runCommonAddressSummary(ctx context.Context) error {
 		safe.Go(ctx, nil, func() {
 			defer wg.Done()
 			for userID := range jobs {
-				if err := db.SummarizeUserCommonAddresses(ctx, r.pool, userID); err != nil {
+				if err := db.SummarizeUserCommonAddresses(ctx, r.bgPool, userID); err != nil {
 					slog.ErrorContext(ctx, "common address summary user failed",
 						slog.String("user_id", userID),
 						slog.Any("error", err))
@@ -468,7 +516,7 @@ func (r *Runner) runCommonAddressSummary(ctx context.Context) error {
 
 	cursor := ""
 	for {
-		userIDs, err := r.pool.Queries().ListUsersWithDiaryChangesSince(ctx, sqlc.ListUsersWithDiaryChangesSinceParams{
+		userIDs, err := r.bgPool.Queries().ListUsersWithDiaryChangesSince(ctx, sqlc.ListUsersWithDiaryChangesSinceParams{
 			UpdatedAt:  pgtype.Timestamptz{Time: start.UTC(), Valid: true},
 			UpdatedAt2: pgtype.Timestamptz{Time: end.UTC(), Valid: true},
 			Cursor:     cursor,
@@ -575,7 +623,7 @@ func (r *Runner) runOrderClose(ctx context.Context) error {
 
 	cutoff := time.Now().Add(-24 * time.Hour)
 
-	// R-17：先收敛无主（user_id IS NULL，注销产生）的过期 pending 订单。
+	// 先收敛无主（user_id IS NULL，注销产生）的过期 pending 订单。
 	for {
 		n, err := r.bgPool.Queries().CloseOwnerlessPendingOrders(ctx, pgtype.Timestamptz{Time: cutoff, Valid: true})
 		if err != nil {
@@ -602,7 +650,7 @@ func (r *Runner) runOrderClose(ctx context.Context) error {
 		outTradeNos := make([]string, 0, len(orders))
 		userIDs := make([]string, 0, len(orders))
 		for _, order := range orders {
-			// ListPendingOrdersBefore 已过滤 user_id IS NOT NULL；无主订单由上方 R-17 单独收敛。
+			// ListPendingOrdersBefore 已过滤 user_id IS NOT NULL；无主订单由上方 CloseStalePendingOrders 单独收敛。
 			outTradeNos = append(outTradeNos, order.OutTradeNo)
 			userIDs = append(userIDs, order.UserID.String)
 		}
@@ -677,35 +725,16 @@ func (r *Runner) runCleanupOrphanFiles(ctx context.Context) error {
 			return nil
 		}
 		for _, f := range rows {
-			fileRecord, err := r.bgPool.Queries().GetFileByID(ctx, f.ID)
-			if err != nil {
-				slog.ErrorContext(ctx, "get orphan file record failed", slog.String("file_id", f.ID), slog.Any("error", err))
-				lastID = f.ID
-				continue
-			}
-			if err := r.storage.DeleteFile(fileRecord.Path, fileRecord.StorageType); err != nil {
-				slog.ErrorContext(ctx, "delete orphan physical file failed", slog.String("file_id", f.ID), slog.String("path", fileRecord.Path), slog.String("storage_type", fileRecord.StorageType), slog.Any("error", err))
-				lastID = f.ID
-				continue
-			}
-			if err := r.bgPool.Queries().DeleteFile(ctx, f.ID); err != nil {
-				slog.ErrorContext(ctx, "delete orphan file record failed", slog.String("file_id", f.ID), slog.Any("error", err))
-				lastID = f.ID
-				continue
-			}
-			// 孤儿图片删除后回退用户图片配额（上传时已 IncrementUserImageStorage 计费），
-			// 否则配额被幽灵字节永久占用，最终 checkStorageLimit 拒绝后续上传。
-			if fileRecord.FileType == "image" && fileRecord.CreatedBy.Valid && fileRecord.CreatedBy.String != "" {
-				if decErr := r.bgPool.Queries().DecrementUserImageStorage(ctx, sqlc.DecrementUserImageStorageParams{
-					ID:                fileRecord.CreatedBy.String,
-					ImageStorageBytes: fileRecord.SizeBytes,
-				}); decErr != nil {
-					slog.ErrorContext(ctx, "decrement user image storage failed for orphan file",
-						slog.String("file_id", f.ID),
-						slog.String("user_id", fileRecord.CreatedBy.String),
-						slog.Int64("size", fileRecord.SizeBytes),
-						slog.Any("error", decErr))
+			// 事务版删除（file.DeletePhysicalIfUnreferenced）：FOR UPDATE 行锁 + 引用复核 +
+			// 删记录/回退配额同一事务，物理删除在提交后。替代旧三步非事务流程——
+			// 任一步失败不再留下「记录已删、配额未回退」的幽灵字节；同时消除
+			// 「扫描为孤儿后刚被引用即被误删」的 TOCTOU 窗口。
+			if err := file.DeletePhysicalIfUnreferenced(ctx, r.bgPool, r.storage, f.ID); err != nil {
+				if !errors.Is(err, file.ErrFileNotFound) {
+					slog.ErrorContext(ctx, "delete orphan file failed", slog.String("file_id", f.ID), slog.Any("error", err))
 				}
+				lastID = f.ID
+				continue
 			}
 			lastID = f.ID
 		}
@@ -719,6 +748,11 @@ func (r *Runner) runCleanupOrphanTrajMaps(ctx context.Context) error {
 	if r.storage == nil {
 		return nil
 	}
+	// ScanOldSystemFiles 带 invite 资产豁免（NOT metadata ? 'raw'）：邀请二维码/分享海报
+	// 已分发到微信会话，不能按 7 天窗口回收成 404。其回收由两条替代路径覆盖：
+	// ①重生成替换——invite/qrcode.go generate 事务内删旧记录（ListUserInviteQRCodeFiles +
+	// BatchDeleteFiles）、提交后删旧物理文件；②注销清理——family/service.go DeleteAccount
+	// 经 ListFilesByCreator 按 created_by 收集全部 files 路径后物理删除，含 invite 海报行。
 	lastID := ""
 	for {
 		rows, err := r.bgPool.Queries().ScanOldSystemFiles(ctx, lastID)
@@ -750,7 +784,7 @@ func (r *Runner) runCleanupOrphanTrajMaps(ctx context.Context) error {
 	}
 }
 
-// runPurgeDeletedObjects 已删对象边缘缓存批量收敛（ADR-0013）：
+// runPurgeDeletedObjects 已删对象边缘缓存批量收敛：
 // 从 Redis 队列分批取 URL 调阿里云 CDN 刷新；未启用（CDNRefreshEnabled=false）时空跑。
 func (r *Runner) runPurgeDeletedObjects(ctx context.Context) error {
 	if r.purgeQueue == nil || r.purger == nil {

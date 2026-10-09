@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// R-08：SSE 连接上限（单用户与全局）与释放复用。
+// SSE 连接上限（单用户与全局）与释放复用。
 func TestSSEConnLimiter(t *testing.T) {
 	l := newSSEConnLimiter(3)
 	if !l.acquire("u1") || !l.acquire("u1") {
@@ -27,7 +27,7 @@ func TestSSEConnLimiter(t *testing.T) {
 	}
 }
 
-// R-08：心跳写入 `: heartbeat`，且 done 之后不再发心跳。
+// 心跳写入 `: heartbeat`，且 done 之后不再发心跳。
 func TestLockedSSEWriterHeartbeat(t *testing.T) {
 	rec := httptest.NewRecorder()
 	lw := &lockedSSEWriter{w: rec, f: rec}

@@ -39,6 +39,7 @@ const (
 	BizInvalidCoordinates            = "INVALID_COORDINATES"
 	BizAIDailyQuotaExceeded          = "AI_DAILY_QUOTA_EXCEEDED"
 	BizRateLimited                   = "RATE_LIMITED"
+	BizRemovedRejoinCooldown         = "REMOVED_REJOIN_COOLDOWN"
 )
 
 // HTTPStatus 是 biz_code 到 HTTP 状态的唯一映射。
@@ -49,7 +50,7 @@ func HTTPStatus(bizCode string) int {
 	case BizSessionInvalid:
 		// 凭证过期语义统一映射 401。
 		return http.StatusUnauthorized
-	case BizTargetIsPersonalFamily, BizOwnerCannotLeaveFamily, BizCannotRemoveSelf, BizCannotRemoveOwner, BizNotVip:
+	case BizTargetIsPersonalFamily, BizOwnerCannotLeaveFamily, BizCannotRemoveSelf, BizCannotRemoveOwner, BizNotVip, BizRemovedRejoinCooldown:
 		return http.StatusForbidden
 	case BizPhoneAlreadyBound, BizAlreadyInFamily, BizFamilyFull, BizFreeVipAlreadyClaimed, BizTrialVipAlreadyClaimed:
 		return http.StatusConflict
@@ -68,7 +69,7 @@ func CodeForBiz(bizCode string) string {
 		return CodeUnauthorized
 	case BizFamilyNotFound, BizOrderNotFound:
 		return CodeNotFound
-	case BizTargetIsPersonalFamily, BizOwnerCannotLeaveFamily, BizCannotRemoveSelf, BizCannotRemoveOwner, BizNotVip:
+	case BizTargetIsPersonalFamily, BizOwnerCannotLeaveFamily, BizCannotRemoveSelf, BizCannotRemoveOwner, BizNotVip, BizRemovedRejoinCooldown:
 		return CodeForbidden
 	case BizPhoneAlreadyBound, BizAlreadyInFamily, BizFamilyFull, BizFreeVipAlreadyClaimed, BizTrialVipAlreadyClaimed:
 		return CodeConflict

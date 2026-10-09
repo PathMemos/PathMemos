@@ -1,7 +1,11 @@
 import i18nBehavior from '../../behaviors/i18n';
+import themeBehavior from '../../behaviors/theme';
 
+// root-portal 场景（滚动列表组件内嵌使用）下，本组件被搬到页面根、继承不到
+// page/.BasePage 的主题变量，故挂 themeBehavior 自持主题：根节点 data-theme +
+// less 内置变量定义，与页面主题经 themeManager 全局同步。
 Component({
-  behaviors: [i18nBehavior],
+  behaviors: [themeBehavior, i18nBehavior],
   properties: {
     visible: {
       type: Boolean,

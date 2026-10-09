@@ -14,7 +14,7 @@ DELETE FROM ai_dialog_logs
 WHERE id IN (
     SELECT id FROM ai_dialog_logs
     WHERE created_at < now() - interval '90 days'
-    -- R2-L04：按创建时间最旧优先删除，而非随机 UUID 顺序。
+    -- 按创建时间最旧优先删除，而非随机 UUID 顺序。
     ORDER BY created_at ASC
     LIMIT $1::bigint
 );
