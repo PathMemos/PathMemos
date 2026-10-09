@@ -88,8 +88,7 @@ func (h *Handler) RegisterProtected(router chi.Router) {
 	router.Get("/auth/phone", h.GetPhone)
 	router.Post("/auth/inviter", h.BindInviter)
 	// POST /auth/phone/bind 由 main.go 单独注册（含 IP 限流，A-FIX-04）；DELETE /auth/account 同理。
-	// 手机号解绑端点已移除：产品规则「手机号只可更换不可解除」，前端无入口，
-	// 保留只会多一个可被任意会话持有者直调的解绑面（02a A-4）。
+	// 手机号只可更换不可解除，无解绑端点（02a D5）。
 }
 
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {

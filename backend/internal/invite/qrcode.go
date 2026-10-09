@@ -39,8 +39,7 @@ type InviteQR struct {
 	ThumbURL string `json:"thumbUrl"`
 }
 
-// parseInviteQRCache 解析 Redis 缓存值；旧版缓存是纯 URL 字符串（无缩略图），
-// 解析失败视为过期，由调用方重新生成。
+// parseInviteQRCache 解析 Redis 缓存值；解析失败视为过期，由调用方重新生成。
 func parseInviteQRCache(cached string) (InviteQR, bool) {
 	var qr InviteQR
 	if err := json.Unmarshal([]byte(cached), &qr); err != nil || qr.URL == "" {
@@ -102,7 +101,6 @@ func (g *QRCodeGenerator) generate(ctx context.Context, rdb *redis.Client, userI
 			if qr, ok := parseInviteQRCache(cached); ok {
 				return qr, nil
 			}
-			// 旧版纯 URL 缓存（无缩略图）：视为过期，走重新生成补齐 thumbUrl
 		}
 		if err != nil && err != redis.Nil {
 			slog.WarnContext(ctx, "read invite qrcode cache failed", slog.String("user_id", userID), slog.Bool("raw", raw), slog.Any("error", err))

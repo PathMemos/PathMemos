@@ -60,8 +60,7 @@ SELECT short_code FROM user_invite_codes WHERE user_id = $1;
 
 -- name: ResolveInviterFromCode :one
 -- 邀请码是邀请人的稳定分享码，可被多个被邀请人多次解析（不限制一次性）。
--- 解析为纯读；短码自 000013 起永久有效（expires_at 全量为 NULL），
--- 恒真过期谓词已移除（列保留，将来重启过期策略时再加回）。
+-- 解析为纯读；短码永久有效（expires_at 恒 NULL，为重启过期策略预留）。
 SELECT user_id
 FROM user_invite_codes
 WHERE short_code = $1;

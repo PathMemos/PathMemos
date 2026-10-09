@@ -70,7 +70,7 @@ func (q *Queries) CreateUserInvite(ctx context.Context, arg CreateUserInvitePara
 const createUserInviteCode = `-- name: CreateUserInviteCode :one
 INSERT INTO user_invite_codes (user_id, short_code, created_at)
 VALUES ($1, $2, now())
-RETURNING user_id, short_code, created_at, expires_at, used_at
+RETURNING user_id, short_code, created_at, expires_at
 `
 
 type CreateUserInviteCodeParams struct {
@@ -86,7 +86,6 @@ func (q *Queries) CreateUserInviteCode(ctx context.Context, arg CreateUserInvite
 		&i.ShortCode,
 		&i.CreatedAt,
 		&i.ExpiresAt,
-		&i.UsedAt,
 	)
 	return i, err
 }
@@ -240,8 +239,7 @@ WHERE short_code = $1
 `
 
 // 邀请码是邀请人的稳定分享码，可被多个被邀请人多次解析（不限制一次性）。
-// 解析为纯读；短码自 000013 起永久有效（expires_at 全量为 NULL），
-// 恒真过期谓词已移除（列保留，将来重启过期策略时再加回）。
+// 解析为纯读；短码永久有效（expires_at 恒 NULL，为重启过期策略预留）。
 func (q *Queries) ResolveInviterFromCode(ctx context.Context, shortCode string) (string, error) {
 	row := q.db.QueryRow(ctx, resolveInviterFromCode, shortCode)
 	var user_id string

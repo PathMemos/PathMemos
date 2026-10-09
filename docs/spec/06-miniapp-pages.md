@@ -154,7 +154,7 @@
 - 头像：`onChooseAvatar` → `updateAvatar`（`POST /file/upload?type=avatar` → `PUT /user/avatar {fileId}`）。
 - 主题 `onThemeTap`：auto/light/dark（`themeManager`，storage `ppfj_theme_mode`）。
 - 语言 `onLanguageTap`：auto/zh/en/zh-Hant（`i18n`，storage `ppfj_lang_mode`），选择后 `PUT /user/lang`。
-- 手机号：`getPhoneNumber` → `POST /auth/phone/bind {code}`；已绑定且当天已改 → toast 日限；产品规则「手机号只可更换不可解除」——无解绑入口，后端解绑端点已移除。
+- 手机号：`getPhoneNumber` → `POST /auth/phone/bind {code}`；已绑定且当天已改 → toast 日限；产品规则「手机号只可更换不可解除」——无解绑入口，后端亦无解绑接口。
 - 服务号：未订阅显示二维码弹窗（`getHelpBaseURL()/follow.png`）。
 - 桌面快捷：Android 且 `canIUse('addToDesktop')` 直接添加，否则引导；可跳 `wx.openAppAuthorizeSetting`。
 - 私有模式（`backend_mode==='private'`）隐藏手机号绑定/更换与服务号入口（服务号行 `Set.wxml` 的 `wx:if="{{!isPrivateBackend}}"`；手机号行叠加 App 环境条件 `wx:if="{{!isPrivateBackend && !isAppEnv}}"`，App 端隐藏见 §3.11 差异表）；头像行不按私有模式隐藏（仅 App 环境隐藏 `open-type=chooseAvatar` 按钮，见 §3.11 多端差异表）。
@@ -216,7 +216,7 @@
 | 登录 | 静默 `wx.login` → `/auth/login` | `wx.weixinAppLogin` → `/auth/login/app`（donut/code2verifyinfo，无中间页） |
 | 修改头像（open-type=chooseAvatar） | 支持 | **隐藏入口**——头像由微信登录资料带出（code2verifyinfo headimgurl）与默认 marker 并发写入、无先后协调（最终头像取决于完成顺序，权威口径 02a A-9） |
 | 绑定/更换手机号（open-type=getPhoneNumber） | 支持 | **隐藏入口**——官方替代为本机号码一键登录/短信验证码组件（身份服务手机号体系，待接入） |
-| 解绑手机号 | 已移除入口 | 同左（产品规则：手机号不可解除，只可更换；后端解绑端点已移除） |
+| 解绑手机号 | 无入口 | 同左（产品规则：手机号不可解除，只可更换） |
 | 转发（open-type=share） | 支持 | `wx.miniapp.shareMiniProgramMessage`（Family 邀请卡/Invite 两种卡片，参数与 onShareAppMessage 同构） |
 
 已知其余差异（待验证/待适配）：`type="nickname"` 输入在 App 端退化为普通输入；`show-menu-by-longpress` 不支持；web-view 需 jssdk ≥1.6.2。定位与虚拟支付的 App 端适配已落地：`utils/appPermission.ts` 兼容层替代不可用的 `wx.getSetting/openSetting/authorize`——`getAppAuthorizeSetting` 查态**仅作 `location_diag` 诊断日志、不做流程门卫**（前置查态在真机上会导致链路悬挂），流程门卫是前台 `getLocation` 触发系统授权弹窗，`openAppAuthorizeSetting` 引导系统设置用于 NoteEdit 定位请求与 Set 页；`NoteEdit` 定位请求、确认弹窗与自动记录开启流程均按 App/小程序双轨分发；支付跳转小程序（02e VP-13-AC6）。

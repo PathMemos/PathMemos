@@ -33,7 +33,6 @@ type CreateAPIKeyRow struct {
 	CreatedAt pgtype.Timestamptz `json:"createdAt"`
 }
 
-// expires_at 由列 DEFAULT 填充（恒 9999-12-31，000015），代码不再显式写入。
 func (q *Queries) CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (CreateAPIKeyRow, error) {
 	row := q.db.QueryRow(ctx, createAPIKey,
 		arg.ID,

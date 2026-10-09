@@ -28,7 +28,6 @@ type ApiKey struct {
 	ID        string             `json:"id"`
 	UserID    string             `json:"userId"`
 	KeyHash   string             `json:"keyHash"`
-	ExpiresAt pgtype.Timestamptz `json:"expiresAt"`
 	CreatedAt pgtype.Timestamptz `json:"createdAt"`
 	ApiKey    string             `json:"apiKey"`
 }
@@ -203,7 +202,6 @@ type UserInviteCode struct {
 	ShortCode string             `json:"shortCode"`
 	CreatedAt pgtype.Timestamptz `json:"createdAt"`
 	ExpiresAt pgtype.Timestamptz `json:"expiresAt"`
-	UsedAt    pgtype.Timestamptz `json:"usedAt"`
 }
 
 type UserVip struct {

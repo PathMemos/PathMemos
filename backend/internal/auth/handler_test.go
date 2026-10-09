@@ -527,8 +527,8 @@ func TestLogin_ValidCode_NewUser(t *testing.T) {
 	mock.ExpectQuery("INSERT INTO user_invite_codes").
 		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows([]string{
-			"user_id", "short_code", "created_at", "expires_at", "used_at",
-		}).AddRow("u-new", "ABCD1234", time.Now(), nil, nil))
+			"user_id", "short_code", "created_at", "expires_at",
+		}).AddRow("u-new", "ABCD1234", time.Now(), nil))
 	mock.ExpectCommit()
 	mock.ExpectQuery("FROM users WHERE id = \\$1").
 		WithArgs(pgxmock.AnyArg()).

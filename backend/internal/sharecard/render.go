@@ -120,7 +120,7 @@ type CardQR struct {
 // ShareCardRequest POST /diary/share-card 请求体。
 type ShareCardRequest struct {
 	Header     CardHeader   `json:"header"`
-	Brand      string       `json:"brand"` // 已不展示（封面右上品牌已移除），保留字段兼容客户端
+	Brand      string       `json:"brand"` // 不展示，保留字段兼容客户端契约
 	MemberPill []string     `json:"memberPills"`
 	CoverImg   string       `json:"coverImg"`
 	CountLabel string       `json:"countLabel"`

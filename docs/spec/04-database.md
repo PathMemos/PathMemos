@@ -324,7 +324,7 @@
 | user_id | text | N | PK；FK users(id) ON DELETE CASCADE | |
 | short_code | text | N | UNIQUE user_invite_codes_short_code_key；索引 idx_user_invite_codes_short_code_lookup | 8 位大写字母数字（去易混字符） |
 | created_at | timestamptz | N | now() | |
-| expires_at | timestamptz | Y | | 预留：当前无写入点，恒 NULL（000013 起永久有效；解析查询的恒真过期谓词已移除） |
+| expires_at | timestamptz | Y | | 预留：无写入点，恒 NULL（短码永久有效，解析不过滤过期；重启过期策略的锚点） |
 | used_at | timestamptz | Y | | 预留：`/invite/resolve` 已转纯读（不写 used_at），当前无写入点（见 02d F-9） |
 
 ### 3.20 wx_mp_accounts（公众号账号绑定）
@@ -519,8 +519,8 @@
 | 000012 | 000012_drop_dead_order_structures.up.sql / .down.sql | schema 卫生：DROP 冗余部分唯一索引 `uq_orders_transaction_id_not_null`（与 `orders_transaction_id_key` 约束同列完全覆盖）；DROP `orders.prepay_id`（无写入点恒 NULL，微信上游 DTO 不落库）；sqlc 摘除无调用的 `DeleteExpiredAPIKeys` 查询 | down 恢复 prepay_id 列（text 可空）、连带重建 `orders_prepay_id_check`（DROP COLUMN 自动删除仅引用该列的表级 CHECK）并按 000001 原定义重建条件唯一索引 | 可逆 |
 | 000013 | 000013_user_invite_codes_permanent.up.sql / .down.sql | 个人邀请短码转永久：存量行 `expires_at` 置 NULL（短码为用户稳定分享标识，不再过期；与 000008/000011 的 openid 墓碑语义一致） | down 为有说明的 no-op（无法回填旧过期语义） | — | |
 | 000014 | 000014_family_removed_members_cooldown.up.sql / .down.sql | `families` 加 `removed_members` jsonb（默认 `'{}'`，`{userID: 移除时间 RFC3339}`）——移除冷却（ADR-0019） | drop 该列 | 可逆 |
-| 000015 | 000015_api_key_expires_default.up.sql / .down.sql | `api_keys.expires_at` 补 DEFAULT 9999-12-31——死列清理第一步的 expand 前置（代码停显式写入；列与死索引的 drop 见第二步） | 移除该 DEFAULT | 可逆 |
-| 000016 | 000016_drop_dead_columns.up.sql / .down.sql | 死列清理第二步（contract，第一步代码已上线后执行）：drop `api_keys.expires_at`、`idx_api_keys_expires_at`、`user_invite_codes.used_at` | 重建列与索引（值为恒值/空，语义可完整恢复） | 可逆 |
+| 000015 | 000015_api_key_expires_default.up.sql / .down.sql | `api_keys.expires_at` 补 DEFAULT 9999-12-31（expand/contract 序列的 expand 步：代码不显式写入该列，为 000016 的 drop 前置） | 移除该 DEFAULT | 可逆 |
+| 000016 | 000016_drop_dead_columns.up.sql / .down.sql | contract 步（前置 000015）：drop `api_keys.expires_at`、`idx_api_keys_expires_at`、`user_invite_codes.used_at` | 重建列与索引（值为恒值/空，语义可完整恢复） | 可逆 |
 
 并行撞号规则（spec-standards 第六节）：同号不同名允许（slug 全局唯一），改同一张表需 rebase 确认顺序。
 

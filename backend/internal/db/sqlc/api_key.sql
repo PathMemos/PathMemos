@@ -1,5 +1,4 @@
 -- name: CreateAPIKey :one
--- expires_at 由列 DEFAULT 填充（恒 9999-12-31，000015），代码不再显式写入。
 INSERT INTO api_keys (id, user_id, key_hash, api_key, created_at)
 VALUES ($1, $2, $3, $4, now())
 ON CONFLICT (user_id) DO NOTHING

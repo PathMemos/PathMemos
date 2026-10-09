@@ -13,8 +13,8 @@ import (
 )
 
 func inviteCodeRows(shortCode string) *pgxmock.Rows {
-	return pgxmock.NewRows([]string{"user_id", "short_code", "created_at", "expires_at", "used_at"}).
-		AddRow("u1", shortCode, time.Now(), nil, nil)
+	return pgxmock.NewRows([]string{"user_id", "short_code", "created_at", "expires_at"}).
+		AddRow("u1", shortCode, time.Now(), nil)
 }
 
 func uniqueViolation() error {

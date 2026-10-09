@@ -24,7 +24,7 @@ const compressOnce = (src: string, quality: number): Promise<string> =>
   });
 
 // 迭代压缩，返回 ≤64KB 的缩略图路径；已达标则原样返回，压缩链路失败时回退原图
-// （交由分享层按既有 fail 分支报错，与历史行为一致）。
+//（错误交由分享层 fail 分支报错）。
 export async function ensureThumbUnderLimit(src: string): Promise<string> {
   try {
     if ((await fileSize(src)) <= THUMB_LIMIT) return src;

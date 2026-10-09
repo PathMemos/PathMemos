@@ -10,9 +10,8 @@ import (
 
 const outTradeNoAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
-// GenerateOutTradeNo 生成 32 位随机订单号。不携带 userID/vipID 语义（曾以弃用参数
-// 暗示「仅日志用途」，实为误导性签名，已清理）；归属关系由 orders 行自身的
-// user_id/vip_id 列承载。
+// GenerateOutTradeNo 生成 32 位随机订单号，不携带 userID/vipID 语义；
+// 归属关系由 orders 行自身的 user_id/vip_id 列承载。
 func GenerateOutTradeNo() (string, error) {
 	// 随机不可预测性保留纵深防御价值（回声/撞单探测面），
 	// 当前防伪主边界为安全模式验签解密 + DB 幂等（02e D2/D3）。

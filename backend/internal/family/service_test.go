@@ -72,9 +72,9 @@ func TestRejoinBlocked(t *testing.T) {
 	}
 }
 
-// TestJoinFamilyTx_MergeArraysAligned 防「冷却检查与成员装配两段循环重复 append」
-// 回归：owner 整家合并路径 BatchUpsertFamilyMembership 的 Ids 与 UserIds 必须等长
-// 且与成员一一对应（不等长时 unnest 锁步补 NULL，必然违反 family_members.id NOT NULL）。
+// TestJoinFamilyTx_MergeArraysAligned 断言 owner 整家合并路径
+// BatchUpsertFamilyMembership 的 Ids 与 UserIds 等长且与成员一一对应
+//（不等长时 unnest 锁步补 NULL，违反 family_members.id NOT NULL）。
 func TestJoinFamilyTx_MergeArraysAligned(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {

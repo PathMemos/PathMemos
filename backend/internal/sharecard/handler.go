@@ -52,7 +52,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	middleware.JSON(w, r, http.StatusOK, map[string]string{"poster": posterURL, "thumb": thumbURL})
 }
 
-// validate 契约上限校验：与客户端 canvas 侧历史上限一致（50 条/3000 字/9 图每条）。
+// validate 契约上限校验：与客户端前置裁剪一致（50 条/3000 字/9 图每条）。
 func validate(req *ShareCardRequest) string {
 	req.Header.Title = strings.TrimSpace(req.Header.Title)
 	req.Header.Subtitle = strings.TrimSpace(req.Header.Subtitle)

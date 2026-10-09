@@ -259,7 +259,7 @@
 6. `raw=true` 直接保存 PNG；否则 `composite` 合成到背景图 `/app/assets/invite-share-cover.png`（二维码边长 = 背景宽 × 0.20，最小 120px；margin 40、右下内缩 300；JPEG quality 90）。
 7. `storage.SaveSystemWithName(..., 短码)` 保存；事务内查询同 raw 类型的旧文件记录 → `CreateFile(file_type='system', metadata={family_id, raw})`（`family_id` 取 `current_family_id`，为空时回退 `personal_family_id`——open 模式默认用户等无当前家庭场景海报仍带归属）→ `BatchDeleteFiles` 删除旧记录；提交后删除旧物理文件（跳过与新建同路径的文件）。
 8. 合成图（非 raw）追加生成**分享缩略图** `makeInviteThumb`：240px 宽起步（180/140 逐档降宽），JPEG 质量 80/65/50/40 逐档降质，取首个 ≤60KB 的产物（微信 OpenSDK `shareImageMessage` 的 thumbData ≤64KB 硬约束，超限报 `sendOpenReq:fail:check args fail`）；`SaveSystemWithName(..., 短码-thumb)` 确定性命名保存（不建文件记录，当月覆盖写），返回 `thumbUrl`。缩略图生成失败降级为 `thumbUrl` 为空（客户端回退压缩原图），不影响海报生成。
-9. 写回 Redis JSON 缓存 `{url, thumbUrl}`（6 天；旧版纯 URL 缓存解析失败视为过期重新生成）；返回 `{url, thumbUrl}`。
+9. 写回 Redis JSON 缓存 `{url, thumbUrl}`（6 天）；返回 `{url, thumbUrl}`。
 
 **AC**
 
@@ -325,7 +325,7 @@
 
 字段定义与约束见 PP-02A §4.2 / §4.3（同一批迁移）。本域使用要点：
 
-- `user_invite_codes`：一人一码、`short_code` 唯一、`expires_at` 恒 NULL（列保留作重启过期策略的锚点）、`used_at` 已移除（000016 死列清理）。
+- `user_invite_codes`：一人一码、`short_code` 唯一、`expires_at` 恒 NULL（重启过期策略的锚点）。
 - `user_invites`：`user_id` 唯一（一人一个邀请人；000008 起可空、FK `SET NULL`——被邀请人注销保留 openid 墓碑行），`reward_inviter_at` / `reward_invitee_at` 控制奖励幂等；`inviter_id` 可空、FK `SET NULL`（000011：邀请人注销保留被邀请人墓碑行，`user_open_id` 部分唯一索引继续阻断重复领取被邀请奖励；跨渠道删号重注册可绕过的边界见 ADR-0016）。
 
 ### 4.5 `files`（邀请二维码使用）
